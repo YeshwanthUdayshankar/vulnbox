@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import shutil
 import sys
+import webbrowser
 from pathlib import Path
 
 import typer
@@ -16,6 +17,7 @@ from vulnbox.engine import VulnBoxEngine
 from vulnbox.llm import GuardrailPolicy, LLMConfig
 from vulnbox.remediation import load_probe_specs
 from vulnbox.sandbox import DockerSandboxBackend, LocalSandboxBackend
+from vulnbox.ui import create_ui_server
 
 app = typer.Typer(
     name="vulnbox",
@@ -217,6 +219,28 @@ def verify_patch_cmd(
 
     if not result.verified:
         raise typer.Exit(code=1)
+
+
+@app.command()
+def ui(
+    host: str = typer.Option("127.0.0.1", "--host", help="Bind host (loopback 127.0.0.1 recommended)"),
+    port: int = typer.Option(8787, "--port", min=0, max=65535, help="Port to serve the local Web UI"),
+    no_browser: bool = typer.Option(False, "--no-browser", help="Do not open a browser automatically"),
+) -> None:
+    """Launch the local CSRF-protected Web UI for all VulnBox workflows."""
+    server = create_ui_server(host=host, port=port)
+    bound_host, bound_port = server.server_address[:2]
+    url = f"http://{bound_host}:{bound_port}"
+    console.print(f"[bold green]VulnBox Web UI running[/bold green] at [bold]{url}[/bold]")
+    console.print("Press Ctrl+C to stop.")
+    if not no_browser:
+        webbrowser.open(url)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        console.print("\nShutting down VulnBox Web UI.")
+    finally:
+        server.server_close()
 
 
 if __name__ == "__main__":

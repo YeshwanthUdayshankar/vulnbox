@@ -1,0 +1,914 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>VulnBox — Sandboxed Security Verification Console</title>
+  <style>
+    :root {
+      --bg: #0b101b;
+      --surface: #121929;
+      --surface-2: #192338;
+      --border: #26344f;
+      --text: #e6edf7;
+      --muted: #8ea1c0;
+      --accent: #38bdf8;
+      --accent-strong: #0284c7;
+      --green: #22c55e;
+      --green-bg: rgba(34, 197, 94, 0.14);
+      --red: #f87171;
+      --red-bg: rgba(248, 113, 113, 0.14);
+      --amber: #fbbf24;
+      --amber-bg: rgba(251, 191, 36, 0.14);
+      --purple: #a78bfa;
+      --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      --sans: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: var(--sans);
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.5;
+    }
+    header {
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      padding: 14px 24px;
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }
+    .brand { display: flex; align-items: center; gap: 10px; }
+    .brand h1 { margin: 0; font-size: 1.2rem; letter-spacing: 0.02em; }
+    .version {
+      font-family: var(--mono);
+      font-size: 0.75rem;
+      color: var(--accent);
+      background: rgba(56, 189, 248, 0.12);
+      border: 1px solid rgba(56, 189, 248, 0.35);
+      border-radius: 999px;
+      padding: 2px 8px;
+    }
+    .doctor-bar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 0.76rem;
+      font-family: var(--mono);
+      padding: 3px 9px;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      background: var(--surface-2);
+      color: var(--muted);
+    }
+    .pill.ok { color: var(--green); border-color: rgba(34, 197, 94, 0.4); background: var(--green-bg); }
+    .pill.warn { color: var(--amber); border-color: rgba(251, 191, 36, 0.4); background: var(--amber-bg); }
+    .pill.err { color: var(--red); border-color: rgba(248, 113, 113, 0.4); background: var(--red-bg); }
+    .pill.info { color: var(--accent); border-color: rgba(56, 189, 248, 0.4); background: rgba(56, 189, 248, 0.12); }
+
+    main { max-width: 1220px; margin: 0 auto; padding: 20px 24px 60px; }
+
+    .tabs {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      border-bottom: 1px solid var(--border);
+      padding-bottom: 12px;
+      margin-bottom: 20px;
+    }
+    .tab-btn {
+      background: var(--surface);
+      color: var(--muted);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 8px 16px;
+      font-size: 0.9rem;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    .tab-btn:hover { color: var(--text); border-color: var(--accent); }
+    .tab-btn.active {
+      background: var(--accent-strong);
+      color: #fff;
+      border-color: var(--accent);
+    }
+
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 18px 20px;
+      margin-bottom: 18px;
+    }
+    .card h2, .card h3 { margin-top: 0; }
+    .grid-2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 14px; }
+    .grid-3 { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; }
+
+    label { display: block; font-size: 0.82rem; color: var(--muted); margin-bottom: 5px; font-weight: 600; }
+    input[type="text"], input[type="number"], select, textarea {
+      width: 100%;
+      background: var(--bg);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 7px;
+      padding: 9px 11px;
+      font-size: 0.88rem;
+      font-family: var(--mono);
+    }
+    textarea { min-height: 110px; resize: vertical; }
+    input:focus, select:focus, textarea:focus { outline: none; border-color: var(--accent); }
+
+    .row-actions { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-top: 14px; }
+    .btn {
+      background: var(--accent-strong);
+      color: #fff;
+      border: 1px solid var(--accent);
+      border-radius: 7px;
+      padding: 9px 16px;
+      font-size: 0.88rem;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    .btn:disabled { opacity: 0.55; cursor: not-allowed; }
+    .btn.secondary {
+      background: var(--surface-2);
+      color: var(--text);
+      border-color: var(--border);
+    }
+    .btn.secondary:hover { border-color: var(--accent); }
+    .btn.small { padding: 5px 10px; font-size: 0.78rem; }
+
+    .checkbox-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-top: 10px;
+      font-size: 0.88rem;
+    }
+    .checkbox-row input { width: auto; }
+
+    .samples-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+      margin-bottom: 14px;
+      font-size: 0.82rem;
+      color: var(--muted);
+    }
+
+    .kpi-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; margin-bottom: 18px; }
+    .kpi {
+      background: var(--surface-2);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 12px 14px;
+    }
+    .kpi .label { font-size: 0.75rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
+    .kpi .val { font-size: 1.45rem; font-weight: 700; margin-top: 4px; font-family: var(--mono); }
+
+    table { width: 100%; border-collapse: collapse; font-size: 0.84rem; }
+    th, td {
+      text-align: left;
+      padding: 9px 10px;
+      border-bottom: 1px solid var(--border);
+      vertical-align: top;
+    }
+    th { color: var(--muted); font-size: 0.76rem; text-transform: uppercase; letter-spacing: 0.04em; }
+
+    pre {
+      background: #080c14;
+      border: 1px solid var(--border);
+      border-radius: 7px;
+      padding: 10px 12px;
+      overflow-x: auto;
+      font-family: var(--mono);
+      font-size: 0.8rem;
+      margin: 8px 0;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .diff-line-add { color: #4ade80; display: block; }
+    .diff-line-del { color: #f87171; display: block; }
+    .diff-line-hunk { color: #38bdf8; display: block; }
+    .diff-line-ctx { color: #cbd5e1; display: block; }
+
+    .finding-card {
+      background: var(--surface-2);
+      border: 1px solid var(--border);
+      border-radius: 9px;
+      padding: 14px 16px;
+      margin-bottom: 14px;
+    }
+    .finding-header {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: space-between;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 8px;
+    }
+    .probe-compare { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 12px; margin-top: 8px; }
+    .probe-box { background: var(--bg); border: 1px solid var(--border); border-radius: 7px; padding: 10px 12px; }
+    .status-banner {
+      padding: 10px 14px;
+      border-radius: 8px;
+      margin-bottom: 14px;
+      font-size: 0.88rem;
+      border: 1px solid var(--border);
+    }
+    .status-banner.error { background: var(--red-bg); border-color: rgba(248, 113, 113, 0.45); color: #fecaca; }
+    .status-banner.loading { background: rgba(56, 189, 248, 0.12); border-color: rgba(56, 189, 248, 0.4); color: #bae6fd; }
+    .hidden { display: none !important; }
+    details summary { cursor: pointer; color: var(--accent); font-size: 0.84rem; margin-top: 8px; }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="brand">
+      <h1>VulnBox</h1>
+      <span class="version">v__VULNBOX_VERSION__</span>
+      <span class="pill info">127.0.0.1 Local Sandbox UI</span>
+    </div>
+    <div id="doctor-bar" class="doctor-bar">
+      <span class="pill">Checking environment...</span>
+    </div>
+  </header>
+
+  <main>
+    <div class="tabs" role="tablist">
+      <button class="tab-btn active" data-tab="remediate">Remediate (Full Loop)</button>
+      <button class="tab-btn" data-tab="scan">Scan Only</button>
+      <button class="tab-btn" data-tab="profile">Profile Repo</button>
+      <button class="tab-btn" data-tab="probe">Active curl Probe</button>
+      <button class="tab-btn" data-tab="verify">Verify Custom Patch</button>
+    </div>
+
+    <div id="global-status" class="status-banner hidden"></div>
+
+    <div id="samples-bar" class="samples-row hidden">
+      <span>Quick-load sample repo:</span>
+    </div>
+
+    <!-- TAB: REMEDIATE -->
+    <section id="tab-remediate" class="tab-panel">
+      <div class="card">
+        <h2>End-to-End Sandboxed Remediation</h2>
+        <p style="color:var(--muted); margin-top:-6px; font-size:0.86rem;">
+          Scrubs secrets into an ephemeral copy, scans across SAST/Config/CVE reachability, confirms live via loopback <code>curl</code>, synthesizes patches &amp; regression tests, and dual-verifies in a fresh sandbox—never mutating your repo.
+        </p>
+        <div class="grid-2">
+          <div>
+            <label for="rem-repo">Local Repository Path</label>
+            <input id="rem-repo" type="text" placeholder="/path/to/local/repo" />
+          </div>
+          <div>
+            <label for="rem-backend">Sandbox Backend</label>
+            <select id="rem-backend">
+              <option value="auto">auto (Docker if ready, else local)</option>
+              <option value="docker">docker (hardened --network=none)</option>
+              <option value="local">local (isolated subprocess)</option>
+            </select>
+          </div>
+          <div>
+            <label for="rem-start">Start Command Override (optional)</label>
+            <input id="rem-start" type="text" placeholder="auto-detected (e.g. python3 app.py)" />
+          </div>
+          <div>
+            <label for="rem-health">Healthcheck Path</label>
+            <input id="rem-health" type="text" value="/health" />
+          </div>
+          <div>
+            <label for="rem-advisories">Custom Advisories JSON Path (optional)</label>
+            <input id="rem-advisories" type="text" placeholder="/path/to/advisories.json" />
+          </div>
+          <div>
+            <label for="rem-out">Save Output Bundle To Directory (optional)</label>
+            <input id="rem-out" type="text" placeholder="Leave blank for in-memory download" />
+          </div>
+        </div>
+
+        <div style="margin-top:12px;">
+          <label for="rem-probe">Custom Loopback Probe JSON (optional)</label>
+          <textarea id="rem-probe" placeholder='Optional DynamicProbeSpec JSON (inferred automatically for standard routes)'></textarea>
+        </div>
+
+        <div class="checkbox-row">
+          <input id="rem-llm-toggle" type="checkbox" />
+          <label for="rem-llm-toggle" style="margin:0; color:var(--text);">Enable Guarded LLM Synthesis (<code>--llm</code>) for findings without deterministic built-in patches</label>
+        </div>
+
+        <div id="rem-llm-opts" class="grid-3 hidden" style="margin-top:12px;">
+          <div>
+            <label for="rem-llm-provider">LLM Provider</label>
+            <select id="rem-llm-provider">
+              <option value="ollama">ollama (local 127.0.0.1:11434)</option>
+              <option value="gemini">gemini (GEMINI_API_KEY)</option>
+              <option value="openai">openai (OPENAI_API_KEY)</option>
+              <option value="custom">custom OpenAI-compatible URL</option>
+            </select>
+          </div>
+          <div>
+            <label for="rem-llm-model">Model Name (optional)</label>
+            <input id="rem-llm-model" type="text" placeholder="e.g. qwen2.5:7b" />
+          </div>
+          <div>
+            <label for="rem-llm-retries">Max Guarded Retries</label>
+            <input id="rem-llm-retries" type="number" min="0" max="5" value="2" />
+          </div>
+          <div style="grid-column: 1 / -1;">
+            <label for="rem-llm-url">Base URL Override (optional)</label>
+            <input id="rem-llm-url" type="text" placeholder="http://127.0.0.1:11434/v1" />
+          </div>
+        </div>
+
+        <div class="row-actions">
+          <button id="btn-remediate" class="btn">Run Sandboxed Remediation</button>
+        </div>
+      </div>
+      <div id="remediate-results"></div>
+    </section>
+
+    <!-- TAB: SCAN -->
+    <section id="tab-scan" class="tab-panel hidden">
+      <div class="card">
+        <h2>Sandboxed Security Scan</h2>
+        <div class="grid-3">
+          <div>
+            <label for="scan-repo">Local Repository Path</label>
+            <input id="scan-repo" type="text" placeholder="/path/to/local/repo" />
+          </div>
+          <div>
+            <label for="scan-backend">Sandbox Backend</label>
+            <select id="scan-backend">
+              <option value="auto">auto</option>
+              <option value="docker">docker</option>
+              <option value="local">local</option>
+            </select>
+          </div>
+          <div>
+            <label for="scan-advisories">Custom Advisories JSON Path (optional)</label>
+            <input id="scan-advisories" type="text" placeholder="/path/to/advisories.json" />
+          </div>
+        </div>
+        <div class="row-actions">
+          <button id="btn-scan" class="btn">Run Scan</button>
+        </div>
+      </div>
+      <div id="scan-results"></div>
+    </section>
+
+    <!-- TAB: PROFILE -->
+    <section id="tab-profile" class="tab-panel hidden">
+      <div class="card">
+        <h2>Profile Repository (Read-Only)</h2>
+        <label for="prof-repo">Local Repository Path</label>
+        <input id="prof-repo" type="text" placeholder="/path/to/local/repo" />
+        <div class="row-actions">
+          <button id="btn-profile" class="btn">Profile Repo</button>
+        </div>
+      </div>
+      <div id="profile-results"></div>
+    </section>
+
+    <!-- TAB: PROBE -->
+    <section id="tab-probe" class="tab-panel hidden">
+      <div class="card">
+        <h2>Active Loopback <code>curl</code> Probe</h2>
+        <div class="grid-3">
+          <div>
+            <label for="probe-repo">Local Repository Path</label>
+            <input id="probe-repo" type="text" placeholder="/path/to/local/repo" />
+          </div>
+          <div>
+            <label for="probe-start">Start Command Override (optional)</label>
+            <input id="probe-start" type="text" placeholder="auto-detected" />
+          </div>
+          <div>
+            <label for="probe-backend">Sandbox Backend</label>
+            <select id="probe-backend">
+              <option value="auto">auto</option>
+              <option value="docker">docker</option>
+              <option value="local">local</option>
+            </select>
+          </div>
+        </div>
+        <div style="margin-top:12px;">
+          <label for="probe-json">Declarative Probe JSON (<code>DynamicProbeSpec</code>)</label>
+          <textarea id="probe-json"></textarea>
+        </div>
+        <div class="row-actions">
+          <button id="btn-probe" class="btn">Run Active Probe</button>
+          <button id="btn-preset-yaml" class="btn secondary small" type="button">Preset: YAML Tag</button>
+          <button id="btn-preset-path" class="btn secondary small" type="button">Preset: Path Boundary</button>
+          <button id="btn-preset-cors" class="btn secondary small" type="button">Preset: CORS Origin</button>
+        </div>
+      </div>
+      <div id="probe-results"></div>
+    </section>
+
+    <!-- TAB: VERIFY PATCH -->
+    <section id="tab-verify" class="tab-panel hidden">
+      <div class="card">
+        <h2>Verify Custom / Agent-Authored Patch</h2>
+        <div class="grid-3">
+          <div>
+            <label for="ver-repo">Local Repository Path</label>
+            <input id="ver-repo" type="text" placeholder="/path/to/local/repo" />
+          </div>
+          <div>
+            <label for="ver-finding-id">Finding ID</label>
+            <input id="ver-finding-id" type="text" value="CUSTOM-001" />
+          </div>
+          <div>
+            <label for="ver-rule-id">Rule ID</label>
+            <input id="ver-rule-id" type="text" value="CUSTOM" />
+          </div>
+          <div>
+            <label for="ver-backend">Sandbox Backend</label>
+            <select id="ver-backend">
+              <option value="auto">auto</option>
+              <option value="docker">docker</option>
+              <option value="local">local</option>
+            </select>
+          </div>
+          <div>
+            <label for="ver-start">Start Command Override (optional)</label>
+            <input id="ver-start" type="text" placeholder="auto-detected" />
+          </div>
+          <div>
+            <label for="ver-reg-path">Regression Test Path (optional)</label>
+            <input id="ver-reg-path" type="text" placeholder="tests/test_security_custom.py" />
+          </div>
+        </div>
+        <div style="margin-top:12px;">
+          <label for="ver-diff">Unified Diff (<code>.patch</code>)</label>
+          <textarea id="ver-diff" placeholder="--- a/app.py&#10;+++ b/app.py&#10;@@ ... @@"></textarea>
+        </div>
+        <div class="grid-2" style="margin-top:12px;">
+          <div>
+            <label for="ver-reg-code">Regression Test Code (optional)</label>
+            <textarea id="ver-reg-code" placeholder="def test_security_property(): ..."></textarea>
+          </div>
+          <div>
+            <label for="ver-probe-json">Active Probe JSON (optional)</label>
+            <textarea id="ver-probe-json" placeholder="Optional DynamicProbeSpec JSON"></textarea>
+          </div>
+        </div>
+        <div class="row-actions">
+          <button id="btn-verify" class="btn">Verify Patch in Sandbox</button>
+        </div>
+      </div>
+      <div id="verify-results"></div>
+    </section>
+  </main>
+
+  <script>
+    const CSRF_TOKEN = "__VULNBOX_CSRF_TOKEN__";
+
+    function el(tag, attrs = {}, children = []) {
+      const node = document.createElement(tag);
+      for (const [k, v] of Object.entries(attrs)) {
+        if (k === "class") node.className = v;
+        else if (k === "text") node.textContent = v;
+        else if (k.startsWith("on") && typeof v === "function") node.addEventListener(k.slice(2), v);
+        else node.setAttribute(k, v);
+      }
+      for (const child of children) {
+        if (typeof child === "string") node.appendChild(document.createTextNode(child));
+        else if (child) node.appendChild(child);
+      }
+      return node;
+    }
+
+    function setStatus(kind, msg) {
+      const box = document.getElementById("global-status");
+      if (!msg) {
+        box.className = "status-banner hidden";
+        box.textContent = "";
+        return;
+      }
+      box.className = `status-banner ${kind}`;
+      box.textContent = msg;
+    }
+
+    async function apiPost(path, payload) {
+      const resp = await fetch(path, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-VulnBox-Token": CSRF_TOKEN,
+        },
+        body: JSON.stringify(payload),
+      });
+      const data = await resp.json();
+      if (!resp.ok) {
+        throw new Error(data.error || `HTTP ${resp.status}`);
+      }
+      return data;
+    }
+
+    function sevClass(sev) {
+      const s = String(sev || "").toLowerCase();
+      if (s === "critical" || s === "high") return "err";
+      if (s === "medium") return "warn";
+      return "info";
+    }
+
+    function renderDiffPre(diffText) {
+      const pre = el("pre");
+      for (const line of String(diffText || "").split("\n")) {
+        let cls = "diff-line-ctx";
+        if (line.startsWith("+") && !line.startsWith("+++")) cls = "diff-line-add";
+        else if (line.startsWith("-") && !line.startsWith("---")) cls = "diff-line-del";
+        else if (line.startsWith("@@") || line.startsWith("---") || line.startsWith("+++")) cls = "diff-line-hunk";
+        pre.appendChild(el("span", { class: cls, text: line }));
+      }
+      return pre;
+    }
+
+    function renderReportView(container, data) {
+      container.replaceChildren();
+      const report = data.report;
+      const runId = data.run_id;
+      const findings = report.findings || [];
+      const patches = report.patches || [];
+      const verifications = report.verifications || [];
+      const guardrails = report.guardrail_events || [];
+
+      const verById = Object.fromEntries(verifications.map((v) => [v.finding_id, v]));
+      const patchById = Object.fromEntries(patches.map((p) => [p.finding_id, p]));
+      const verifiedCount = verifications.filter((v) => v.verified).length;
+      const activeCount = verifications.filter((v) => v.dynamic_confirmed_and_fixed === true).length;
+      const blockedCount = guardrails.filter((g) => g.decision === "block").length;
+
+      const summaryCard = el("div", { class: "card" }, [
+        el("div", { class: "finding-header" }, [
+          el("h2", { text: "Sandbox Report Summary" }),
+          el("div", { class: "row-actions", style: "margin-top:0" }, [
+            el("a", { class: "btn secondary small", href: `/api/artifact/${runId}/report.md`, download: "report.md", text: "Download report.md" }),
+            el("a", { class: "btn secondary small", href: `/api/artifact/${runId}/findings.sarif.json`, download: "findings.sarif.json", text: "Download SARIF 2.1.0" }),
+            el("a", { class: "btn secondary small", href: `/api/artifact/${runId}/manifest.json`, download: "manifest.json", text: "Download manifest.json" }),
+          ]),
+        ]),
+        el("div", { class: "kpi-grid" }, [
+          el("div", { class: "kpi" }, [el("div", { class: "label", text: "Total Findings" }), el("div", { class: "val", text: String(findings.length) })]),
+          el("div", { class: "kpi" }, [el("div", { class: "label", text: "Verified Patches" }), el("div", { class: "val", text: `${verifiedCount} / ${patches.length}` })]),
+          el("div", { class: "kpi" }, [el("div", { class: "label", text: "Live curl Confirmed -> Fixed" }), el("div", { class: "val", text: String(activeCount) })]),
+          el("div", { class: "kpi" }, [el("div", { class: "label", text: "Secrets Scrubbed" }), el("div", { class: "val", text: String(report.scrub_summary.secrets_redacted || 0) })]),
+          el("div", { class: "kpi" }, [el("div", { class: "label", text: "Backend / LLM" }), el("div", { class: "val", style: "font-size:1rem", text: report.llm_enabled ? `${report.sandbox_backend} + ${report.llm_model}` : report.sandbox_backend })]),
+          el("div", { class: "kpi" }, [el("div", { class: "label", text: "Guardrail Blocks" }), el("div", { class: "val", text: String(blockedCount) })]),
+        ]),
+      ]);
+      container.appendChild(summaryCard);
+
+      if (findings.length === 0) {
+        container.appendChild(el("div", { class: "card" }, [el("p", { text: "No vulnerabilities or hygiene issues detected." })]));
+        return;
+      }
+
+      const detailsWrap = el("div", { class: "card" }, [el("h3", { text: "Findings & Verification Evidence" })]);
+      for (const f of findings) {
+        const ver = verById[f.finding_id];
+        const patch = patchById[f.finding_id];
+        const badges = [
+          el("span", { class: `pill ${sevClass(f.severity)}`, text: f.severity.toUpperCase() }),
+          el("span", { class: "pill", text: `${f.rule_id} (${f.cwe_id})` }),
+          el("span", { class: "pill", text: `${f.file_path}:${f.start_line}` }),
+          el("span", { class: "pill", text: `reachability: ${f.reachability}` }),
+        ];
+        if (ver) {
+          badges.push(el("span", { class: `pill ${ver.verified ? "ok" : "err"}`, text: ver.verified ? "VERIFIED" : "UNVERIFIED" }));
+          if (ver.dynamic_confirmed_and_fixed === true) {
+            badges.push(el("span", { class: "pill ok", text: "LIVE CURL: CONFIRMED -> FIXED" }));
+          }
+        }
+
+        const fCard = el("div", { class: "finding-card" }, [
+          el("div", { class: "finding-header" }, [
+            el("strong", { text: f.title }),
+            el("div", { class: "doctor-bar" }, badges),
+          ]),
+          el("p", { style: "margin:6px 0; font-size:0.86rem; color:var(--muted)", text: f.message }),
+        ]);
+
+        if (f.snippet) {
+          fCard.appendChild(el("pre", { text: f.snippet }));
+        }
+
+        if (ver && ver.dynamic_probe_before) {
+          const before = ver.dynamic_probe_before;
+          const after = ver.dynamic_probe_after;
+          fCard.appendChild(el("div", { style: "margin-top:8px; font-size:0.82rem; font-weight:600; color:var(--accent)", text: "Active Loopback curl Verification" }));
+          fCard.appendChild(el("pre", { text: before.curl_command }));
+          const cmp = el("div", { class: "probe-compare" }, [
+            el("div", { class: "probe-box" }, [
+              el("div", { class: "pill err", text: `BEFORE PATCH: HTTP ${before.status_code ?? "ERR"} (vulnerable=${before.matched_vulnerable})` }),
+              el("pre", { text: before.response_body_excerpt || JSON.stringify(before.response_headers, null, 2) }),
+            ]),
+          ]);
+          if (after) {
+            cmp.appendChild(
+              el("div", { class: "probe-box" }, [
+                el("div", { class: `pill ${after.matched_fixed ? "ok" : "err"}`, text: `AFTER PATCH: HTTP ${after.status_code ?? "ERR"} (fixed=${after.matched_fixed})` }),
+                el("pre", { text: after.response_body_excerpt || JSON.stringify(after.response_headers, null, 2) }),
+              ])
+            );
+          }
+          fCard.appendChild(cmp);
+        }
+
+        if (patch) {
+          if (patch.root_cause_explanation) {
+            fCard.appendChild(el("p", { style: "font-size:0.84rem; margin:6px 0", text: `Core Issue: ${patch.root_cause_explanation}` }));
+          }
+          if (patch.fix_explanation) {
+            fCard.appendChild(el("p", { style: "font-size:0.84rem; margin:6px 0", text: `Fix: ${patch.fix_explanation}` }));
+          }
+          fCard.appendChild(
+            el("div", { class: "finding-header", style: "margin-top:10px" }, [
+              el("span", { style: "font-size:0.82rem; font-weight:600; color:var(--muted)", text: `Unified Diff (${patch.strategy})` }),
+              el("button", {
+                class: "btn secondary small",
+                type: "button",
+                text: "Copy Patch",
+                onclick: () => navigator.clipboard && navigator.clipboard.writeText(patch.unified_diff),
+              }),
+            ])
+          );
+          fCard.appendChild(renderDiffPre(patch.unified_diff));
+
+          if (patch.regression_test_code) {
+            const det = el("details", {}, [
+              el("summary", { text: `View Generated Regression Test (${patch.regression_test_path})` }),
+              el("pre", { text: patch.regression_test_code }),
+            ]);
+            fCard.appendChild(det);
+          }
+        }
+        detailsWrap.appendChild(fCard);
+      }
+      container.appendChild(detailsWrap);
+
+      if (guardrails.length > 0) {
+        const tbl = el("table", {}, [
+          el("thead", {}, [
+            el("tr", {}, [
+              el("th", { text: "Gate" }),
+              el("th", { text: "Decision" }),
+              el("th", { text: "Finding" }),
+              el("th", { text: "Reason" }),
+            ]),
+          ]),
+          el(
+            "tbody",
+            {},
+            guardrails.map((g) =>
+              el("tr", {}, [
+                el("td", { style: "font-family:var(--mono)", text: g.gate }),
+                el("td", {}, [
+                  el("span", {
+                    class: `pill ${g.decision === "allow" ? "ok" : g.decision === "warn" ? "warn" : "err"}`,
+                    text: g.decision.toUpperCase(),
+                  }),
+                ]),
+                el("td", { style: "font-family:var(--mono)", text: g.finding_id || "-" }),
+                el("td", { text: g.reason }),
+              ])
+            )
+          ),
+        ]);
+        container.appendChild(el("div", { class: "card" }, [el("h3", { text: "Guardrail Audit Trail" }), tbl]));
+      }
+    }
+
+    // Tab switching
+    document.querySelectorAll(".tab-btn").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        document.querySelectorAll(".tab-btn").forEach((b) => b.classList.remove("active"));
+        document.querySelectorAll(".tab-panel").forEach((p) => p.classList.add("hidden"));
+        btn.classList.add("active");
+        document.getElementById(`tab-${btn.dataset.tab}`).classList.remove("hidden");
+        setStatus("", "");
+      });
+    });
+
+    // LLM options toggle
+    document.getElementById("rem-llm-toggle").addEventListener("change", (e) => {
+      document.getElementById("rem-llm-opts").classList.toggle("hidden", !e.target.checked);
+    });
+
+    // Load environment doctor + sample quick-loaders
+    async function loadDoctor() {
+      try {
+        const resp = await fetch("/api/doctor");
+        const doc = await resp.json();
+        const bar = document.getElementById("doctor-bar");
+        bar.replaceChildren(
+          el("span", { class: "pill ok", text: `Python ${doc.python}` }),
+          el("span", { class: `pill ${doc.node ? "ok" : "warn"}`, text: doc.node ? "Node OK" : "Node Missing" }),
+          el("span", { class: `pill ${doc.curl ? "ok" : "warn"}`, text: doc.curl ? "curl OK" : "urllib Fallback" }),
+          el("span", { class: `pill ${doc.docker_ready ? "ok" : "warn"}`, text: doc.docker_ready ? "Docker READY" : "Docker Unavailable" }),
+          el("span", { class: "pill ok", text: "Local Sandbox READY" })
+        );
+
+        if (doc.samples && doc.samples.length > 0) {
+          const sbar = document.getElementById("samples-bar");
+          sbar.classList.remove("hidden");
+          for (const s of doc.samples) {
+            sbar.appendChild(
+              el("button", {
+                class: "btn secondary small",
+                type: "button",
+                text: s.label,
+                onclick: () => {
+                  for (const id of ["rem-repo", "scan-repo", "prof-repo", "probe-repo", "ver-repo"]) {
+                    document.getElementById(id).value = s.path;
+                  }
+                  if (s.probe_json) {
+                    document.getElementById("rem-probe").value = s.probe_json;
+                    document.getElementById("probe-json").value = s.probe_json;
+                  } else {
+                    document.getElementById("rem-probe").value = "";
+                  }
+                },
+              })
+            );
+          }
+        }
+      } catch (err) {
+        setStatus("error", `Failed to load environment status: ${err.message}`);
+      }
+    }
+
+    // Presets for Active Probe tab
+    const PROBE_PRESETS = {
+      yaml: {
+        probe_id: "probe-yaml-tag",
+        rule_id: "PY-YAML-001",
+        description: "Test POST /parse rejects benign Python YAML tag after safe_load fix",
+        method: "POST",
+        path: "/parse",
+        headers: { "Content-Type": "text/plain" },
+        body: "!!python/tuple [1, 2]",
+        vulnerable_expectation: { status_codes: [200] },
+        fixed_expectation: { status_codes: [400, 422] },
+      },
+      path: {
+        probe_id: "probe-path-boundary",
+        rule_id: "PY-PATH-001",
+        description: "Test GET /files denies synthetic marker outside public root",
+        method: "GET",
+        path: "/files?name=../vulnbox_boundary_marker.txt",
+        setup_marker_file: "vulnbox_boundary_marker.txt",
+        setup_marker_content: "VULNBOX_BOUNDARY_MARKER_9F3A",
+        vulnerable_expectation: { status_codes: [200], body_contains: ["VULNBOX_BOUNDARY_MARKER_9F3A"] },
+        fixed_expectation: { status_codes: [400, 403, 404], body_not_contains: ["VULNBOX_BOUNDARY_MARKER_9F3A"] },
+      },
+      cors: {
+        probe_id: "probe-cors-origin",
+        rule_id: "JS-CORS-001",
+        description: "Test GET /api/data does not reflect untrusted Origin with credentials",
+        method: "GET",
+        path: "/api/data",
+        headers: { Origin: "https://untrusted.example" },
+        vulnerable_expectation: { status_codes: [200], headers_contain: { "access-control-allow-credentials": "true" } },
+        fixed_expectation: { status_codes: [200], headers_not_contain: { "access-control-allow-origin": "https://untrusted.example" } },
+      },
+    };
+    document.getElementById("probe-json").value = JSON.stringify(PROBE_PRESETS.yaml, null, 2);
+    document.getElementById("btn-preset-yaml").addEventListener("click", () => {
+      document.getElementById("probe-json").value = JSON.stringify(PROBE_PRESETS.yaml, null, 2);
+    });
+    document.getElementById("btn-preset-path").addEventListener("click", () => {
+      document.getElementById("probe-json").value = JSON.stringify(PROBE_PRESETS.path, null, 2);
+    });
+    document.getElementById("btn-preset-cors").addEventListener("click", () => {
+      document.getElementById("probe-json").value = JSON.stringify(PROBE_PRESETS.cors, null, 2);
+    });
+
+    // Action handlers
+    document.getElementById("btn-profile").addEventListener("click", async () => {
+      setStatus("loading", "Profiling repository...");
+      try {
+        const data = await apiPost("/api/profile", { repo_path: document.getElementById("prof-repo").value });
+        setStatus("", "");
+        const out = document.getElementById("profile-results");
+        out.replaceChildren(el("div", { class: "card" }, [el("h3", { text: "Detected Profile" }), el("pre", { text: JSON.stringify(data.profile, null, 2) })]));
+      } catch (err) {
+        setStatus("error", err.message);
+      }
+    });
+
+    document.getElementById("btn-scan").addEventListener("click", async () => {
+      setStatus("loading", "Scrubbing workspace and running sandboxed analyzers...");
+      try {
+        const data = await apiPost("/api/scan", {
+          repo_path: document.getElementById("scan-repo").value,
+          backend: document.getElementById("scan-backend").value,
+          advisories_path: document.getElementById("scan-advisories").value,
+        });
+        setStatus("", "");
+        renderReportView(document.getElementById("scan-results"), data);
+      } catch (err) {
+        setStatus("error", err.message);
+      }
+    });
+
+    document.getElementById("btn-remediate").addEventListener("click", async () => {
+      setStatus("loading", "Running end-to-end sandbox scan, active curl probing, patching, and dual verification...");
+      try {
+        const data = await apiPost("/api/remediate", {
+          repo_path: document.getElementById("rem-repo").value,
+          backend: document.getElementById("rem-backend").value,
+          start_cmd: document.getElementById("rem-start").value,
+          health_path: document.getElementById("rem-health").value,
+          advisories_path: document.getElementById("rem-advisories").value,
+          out_dir: document.getElementById("rem-out").value,
+          probe_json: document.getElementById("rem-probe").value,
+          llm_enabled: document.getElementById("rem-llm-toggle").checked,
+          llm_provider: document.getElementById("rem-llm-provider").value,
+          llm_model: document.getElementById("rem-llm-model").value,
+          llm_base_url: document.getElementById("rem-llm-url").value,
+          llm_max_retries: Number(document.getElementById("rem-llm-retries").value || 2),
+        });
+        setStatus("", "");
+        renderReportView(document.getElementById("remediate-results"), data);
+      } catch (err) {
+        setStatus("error", err.message);
+      }
+    });
+
+    document.getElementById("btn-probe").addEventListener("click", async () => {
+      setStatus("loading", "Booting target app on 127.0.0.1 inside sandbox and running curl probe...");
+      try {
+        const data = await apiPost("/api/probe", {
+          repo_path: document.getElementById("probe-repo").value,
+          start_cmd: document.getElementById("probe-start").value,
+          backend: document.getElementById("probe-backend").value,
+          probe_json: document.getElementById("probe-json").value,
+        });
+        setStatus("", "");
+        const out = document.getElementById("probe-results");
+        out.replaceChildren(
+          ...(data.results || []).map((r) =>
+            el("div", { class: "card" }, [
+              el("div", { class: "finding-header" }, [
+                el("strong", { text: `Probe: ${r.probe_id}` }),
+                el("div", { class: "doctor-bar" }, [
+                  el("span", { class: `pill ${r.matched_vulnerable ? "err" : "ok"}`, text: `HTTP ${r.status_code ?? "ERR"}` }),
+                  el("span", { class: `pill ${r.matched_vulnerable ? "err" : "info"}`, text: `vulnerable=${r.matched_vulnerable}` }),
+                  el("span", { class: `pill ${r.matched_fixed ? "ok" : "warn"}`, text: `fixed=${r.matched_fixed}` }),
+                ]),
+              ]),
+              el("pre", { text: r.curl_command }),
+              el("pre", { text: r.error || r.response_body_excerpt || JSON.stringify(r.response_headers, null, 2) }),
+            ])
+          )
+        );
+      } catch (err) {
+        setStatus("error", err.message);
+      }
+    });
+
+    document.getElementById("btn-verify").addEventListener("click", async () => {
+      setStatus("loading", "Applying patch in fresh scrubbed sandbox and running dual verification...");
+      try {
+        const data = await apiPost("/api/verify-patch", {
+          repo_path: document.getElementById("ver-repo").value,
+          finding_id: document.getElementById("ver-finding-id").value,
+          rule_id: document.getElementById("ver-rule-id").value,
+          backend: document.getElementById("ver-backend").value,
+          start_cmd: document.getElementById("ver-start").value,
+          unified_diff: document.getElementById("ver-diff").value,
+          regression_test_path: document.getElementById("ver-reg-path").value,
+          regression_test_code: document.getElementById("ver-reg-code").value,
+          probe_json: document.getElementById("ver-probe-json").value,
+        });
+        setStatus("", "");
+        const v = data.verification;
+        const out = document.getElementById("verify-results");
+        out.replaceChildren(
+          el("div", { class: "card" }, [
+            el("div", { class: "finding-header" }, [
+              el("h3", { style: "margin:0", text: `Patch Verification: ${v.patch_id}` }),
+              el("span", { class: `pill ${v.verified ? "ok" : "err"}`, text: v.verified ? "VERIFIED" : "UNVERIFIED" }),
+            ]),
+            el("p", { style: "color:var(--muted)", text: v.summary }),
+            el("pre", { text: JSON.stringify(v, null, 2) }),
+          ])
+        );
+      } catch (err) {
+        setStatus("error", err.message);
+      }
+    });
+
+    loadDoctor();
+  </script>
+</body>
+</html>

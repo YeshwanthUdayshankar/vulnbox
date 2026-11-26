@@ -33,7 +33,16 @@ uv run vulnbox remediate /path/to/repo --backend docker --out ./vulnbox-out
 
 # Verify a custom/agent-authored patch + custom loopback curl probe
 uv run vulnbox verify-patch /path/to/repo --patch fix.patch --probe probe.json --backend docker
+
+# Launch the local Web UI (all CLI capabilities in your browser at http://127.0.0.1:8787)
+uv run vulnbox ui
 ```
+
+## Local Web UI (`vulnbox ui`)
+
+Run `uv run vulnbox ui` (or `uv run vulnbox ui --port 8787 --no-browser`) to launch the zero-dependency local dashboard at `http://127.0.0.1:8787`. It exposes every CLI workflow—**Remediate** (with optional guarded `--llm`), **Scan**, **Profile**, **Active `curl` Probe**, and **Verify Custom Patch**—with one-click sample fixture loaders, before/after `curl` diffs, syntax-highlighted unified diffs, Guardrail Audit Trail tables, and downloadable `report.md` / `findings.sarif.json` / `manifest.json` bundles.
+
+The UI server binds strictly to loopback (`127.0.0.1`), enforces a per-session CSRF token (`X-VulnBox-Token`) on all `POST /api/*` requests, validates `Host`/`Origin` headers, and sets strict `Content-Security-Policy` and `X-Frame-Options: DENY` headers.
 
 ## End-to-End Sample Runs (Captured Docker Sandbox Output)
 

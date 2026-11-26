@@ -226,6 +226,10 @@ def remediate(
         # Optional guarded LLM synthesis for findings without deterministic auto-patches
         if llm_client is not None and unpatched_findings:
             for f in unpatched_findings:
+                matched_probe = next(
+                    (p for p in custom_probes if p.finding_id == f.finding_id or p.rule_id == f.rule_id),
+                    None,
+                )
                 cand, ver, evs = synthesize_and_verify_patch(
                     repo_path=repo,
                     workspace_dir=ws,
@@ -234,6 +238,7 @@ def remediate(
                     backend=be,
                     client=llm_client,
                     policy=guardrail_policy,
+                    probe_spec=matched_probe,
                     start_cmd=start_cmd,
                     health_path=health_path,
                     advisories_path=advisories,

@@ -177,13 +177,22 @@ class GuardrailEvent(BaseModel):
     details: dict[str, Any] = Field(default_factory=dict)
 
 
+class LLMEdit(BaseModel):
+    """Exact search-and-replace edit proposed by an LLM (converted deterministically to unified diff)."""
+
+    file_path: str = Field(min_length=1)
+    target: str = Field(min_length=1)
+    replacement: str
+
+
 class LLMPatchProposal(BaseModel):
     """Strict structured JSON schema required from any LLM remediation response."""
 
     root_cause_explanation: str = Field(min_length=5, max_length=2000)
     probe_explanation: str | None = Field(default=None, max_length=2000)
     fix_explanation: str = Field(min_length=5, max_length=2000)
-    unified_diff: str = Field(min_length=10)
+    unified_diff: str | None = None
+    edits: list[LLMEdit] = Field(default_factory=list)
     regression_test_path: str | None = None
     regression_test_code: str | None = None
     probe_spec: DynamicProbeSpec | None = None

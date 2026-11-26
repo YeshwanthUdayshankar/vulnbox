@@ -95,6 +95,30 @@ def test_path_confinement_enforced():
 '''
         return (f"tests/test_security_{slug}.py", code)
 
+    if finding.rule_id == "PY-SQL-001":
+        code = f'''"""Security regression test for {finding.finding_id} ({finding.cwe_id})."""
+
+import ast
+from pathlib import Path
+
+
+def test_sql_queries_are_parameterized():
+    src = Path({finding.file_path!r}).read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "execute"
+            and node.args
+        ):
+            first = node.args[0]
+            assert not isinstance(first, (ast.JoinedStr, ast.BinOp)), (
+                "SQL execute() must use parameterized placeholders, not string formatting"
+            )
+'''
+        return (f"tests/test_security_{slug}.py", code)
+
     if finding.rule_id == "JS-TLS-001":
         code = f'''import test from "node:test";
 import assert from "node:assert/strict";

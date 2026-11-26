@@ -422,7 +422,7 @@ def validate_llm_proposal(
     """Run all output guardrails against a structured LLM patch proposal."""
     events: list[GuardrailEvent] = []
 
-    diff_ev = validate_llm_diff(proposal.unified_diff, finding, workspace_dir, policy)
+    diff_ev = validate_llm_diff(proposal.unified_diff or "", finding, workspace_dir, policy)
     events.append(diff_ev)
 
     if proposal.probe_spec is not None:

@@ -165,8 +165,9 @@ def render_markdown_report(report: AuditReport) -> str:
             ]
         )
         for ev in report.guardrail_events:
+            clean_reason = " ".join(ev.reason.splitlines()).replace("|", "\\|")
             lines.append(
-                f"| `{ev.gate}` | **{ev.decision.upper()}** | `{ev.finding_id or '-'}` | {ev.reason} |"
+                f"| `{ev.gate}` | **{ev.decision.upper()}** | `{ev.finding_id or '-'}` | {clean_reason} |"
             )
         lines.append("")
 

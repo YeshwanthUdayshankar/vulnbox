@@ -60,16 +60,51 @@ def apply_unified_diff(workspace_dir: Path, unified_diff: str) -> list[str]:
                 old_start = max(int(m.group(1)) - 1, 0)
                 i += 1
 
-                if old_start < orig_idx:
-                    raise ValueError(f"Overlapping hunks in {rel_path}")
-                out_lines.extend(orig_lines[orig_idx:old_start])
-                orig_idx = old_start
-
+                # Collect hunk lines first so minor line-number offsets from LLMs can be aligned safely
+                hunk_lines: list[str] = []
                 while i < len(lines) and not lines[i].startswith(("@@ ", "--- ", "diff --git ")):
-                    hline = lines[i]
-                    if hline.startswith("\\ No newline"):
+                    if lines[i].startswith("\\ No newline"):
                         i += 1
                         continue
+                    hunk_lines.append(lines[i])
+                    i += 1
+
+                expected_old = [
+                    hl[1:].rstrip("\r\n") for hl in hunk_lines if hl and hl[0] in (" ", "-")
+                ]
+                aligned_start = old_start
+                if expected_old:
+                    def _matches_at(
+                        pos: int,
+                        _orig_idx: int = orig_idx,
+                        _expected: list[str] = expected_old,
+                        _orig: list[str] = orig_lines,
+                    ) -> bool:
+                        if pos < _orig_idx or pos + len(_expected) > len(_orig):
+                            return False
+                        return all(
+                            _orig[pos + k].rstrip("\r\n") == _expected[k]
+                            for k in range(len(_expected))
+                        )
+
+                    if not _matches_at(aligned_start):
+                        found = None
+                        for delta in range(1, 12):
+                            for cand in (old_start - delta, old_start + delta):
+                                if _matches_at(cand):
+                                    found = cand
+                                    break
+                            if found is not None:
+                                break
+                        if found is not None:
+                            aligned_start = found
+
+                if aligned_start < orig_idx:
+                    raise ValueError(f"Overlapping hunks in {rel_path}")
+                out_lines.extend(orig_lines[orig_idx:aligned_start])
+                orig_idx = aligned_start
+
+                for hline in hunk_lines:
                     tag = hline[0]
                     content = hline[1:]
                     if tag == " ":
@@ -89,7 +124,6 @@ def apply_unified_diff(workspace_dir: Path, unified_diff: str) -> list[str]:
                         out_lines.append(content)
                     else:
                         raise ValueError(f"Unexpected diff line prefix {tag!r} in {rel_path}")
-                    i += 1
 
             out_lines.extend(orig_lines[orig_idx:])
             target.write_text("".join(out_lines), encoding="utf-8")

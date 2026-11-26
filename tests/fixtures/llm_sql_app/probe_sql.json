@@ -1,0 +1,15 @@
+{
+  "probe_id": "probe-sql-apostrophe",
+  "rule_id": "PY-SQL-001",
+  "description": "Query GET /users?name=O%27Brien with a benign apostrophe surname to prove unparameterized SQL syntax breakout (HTTP 500) pre-patch and safe parameterized lookup (HTTP 200) post-patch.",
+  "method": "GET",
+  "path": "/users?name=O%27Brien",
+  "vulnerable_expectation": {
+    "status_codes": [500],
+    "body_contains": ["syntax error"]
+  },
+  "fixed_expectation": {
+    "status_codes": [200],
+    "body_contains": ["O'Brien"]
+  }
+}

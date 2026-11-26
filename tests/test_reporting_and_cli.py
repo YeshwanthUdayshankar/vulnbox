@@ -38,9 +38,10 @@ def test_cli_remediate_produces_valid_sarif_markdown_and_patches(tmp_path: Path)
     )
     assert res.exit_code == 0, res.stdout
 
-    sarif_path = out_dir / "findings.sarif.json"
-    md_path = out_dir / "report.md"
-    manifest_path = out_dir / "manifest.json"
+    repo_out = out_dir / "py_sample_app"
+    sarif_path = repo_out / "findings.sarif.json"
+    md_path = repo_out / "report.md"
+    manifest_path = repo_out / "manifest.json"
     assert sarif_path.is_file()
     assert md_path.is_file()
     assert manifest_path.is_file()
@@ -55,7 +56,7 @@ def test_cli_remediate_produces_valid_sarif_markdown_and_patches(tmp_path: Path)
     assert "curl -sS -i" in md_text
     assert "Mandatory Human-in-the-Loop (HITL) Review Gate" in md_text
 
-    patches = list((out_dir / "patches").glob("*.patch"))
+    patches = list((repo_out / "patches").glob("*.patch"))
     assert len(patches) >= 4
 
 
@@ -74,7 +75,7 @@ def test_cli_verify_patch_command(tmp_path: Path):
     )
     assert res.exit_code == 0
 
-    yaml_patch = next((out_dir / "patches").glob("PY-YAML-001-*.patch"))
+    yaml_patch = next((out_dir / "py_sample_app" / "patches").glob("PY-YAML-001-*.patch"))
     finding_id = yaml_patch.stem
     probe_json = tmp_path / "probe.json"
     probe_json.write_text(

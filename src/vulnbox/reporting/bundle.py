@@ -3,12 +3,23 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 from vulnbox.models import AuditReport
 from vulnbox.registry import PluginRegistry, default_registry
 from vulnbox.reporting.markdown import render_markdown_report
 from vulnbox.reporting.sarif import build_sarif, validate_sarif
+
+
+def resolve_repo_output_dir(out_dir: Path, repo_path: Path) -> Path:
+    """Resolve the per-repository output directory `<out_dir>/<repo_name>` cleanly."""
+    base = Path(out_dir).resolve()
+    raw_name = Path(repo_path).resolve().name
+    repo_slug = re.sub(r"[^A-Za-z0-9._-]+", "_", raw_name).strip("._") or "repo"
+    if base.name == repo_slug:
+        return base
+    return base / repo_slug
 
 
 class SarifReporter:

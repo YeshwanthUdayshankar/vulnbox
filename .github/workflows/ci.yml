@@ -40,7 +40,9 @@ jobs:
           uv run vulnbox scan . --backend local --out /tmp/vulnbox-ci-self
           uv run python -c '
           import json
-          data = json.loads(open("/tmp/vulnbox-ci-self/manifest.json").read())
+          from pathlib import Path
+          manifest = next(Path("/tmp/vulnbox-ci-self").rglob("manifest.json"))
+          data = json.loads(manifest.read_text())
           assert len(data["findings"]) == 0, f"Unexpected self-scan findings: {data[\"findings\"]}"
           print("Self-scan clean: 0 findings.")
           '

@@ -37,7 +37,7 @@ from vulnbox.remediation import (
     verify_patch,
 )
 from vulnbox.remediation.verifier import run_existing_tests
-from vulnbox.reporting import write_report_bundle
+from vulnbox.reporting import resolve_repo_output_dir, write_report_bundle
 from vulnbox.sandbox import SandboxBackend, SandboxPolicy, select_backend
 from vulnbox.scrubber import ScrubbedWorkspace
 
@@ -127,7 +127,11 @@ class VulnBoxEngine:
                 memory_probes=memory_probes,
             )
             written = (
-                write_report_bundle(report, out_dir, registry=self.registry)
+                write_report_bundle(
+                    report,
+                    resolve_repo_output_dir(out_dir, repo),
+                    registry=self.registry,
+                )
                 if out_dir is not None
                 else {}
             )
@@ -320,7 +324,11 @@ class VulnBoxEngine:
             guardrail_events=guardrail_events,
         )
         written = (
-            write_report_bundle(report, out_dir, registry=self.registry)
+            write_report_bundle(
+                report,
+                resolve_repo_output_dir(out_dir, repo),
+                registry=self.registry,
+            )
             if out_dir is not None
             else {}
         )

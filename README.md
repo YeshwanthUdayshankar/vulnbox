@@ -117,7 +117,7 @@ Every LLM request and response passes through [`src/vulnbox/llm/guardrails.py`](
 Every `vulnbox remediate` run writes a self-contained review bundle (without touching your target repo):
 
 ```text
-vulnbox-out/
+vulnbox-out/<repo_name>/
 ├── report.md                     # Executive summary, before/after curl proof, diffs, guardrail audit trail, HITL checklist
 ├── findings.sarif.json           # Schema-validated SARIF 2.1.0 report
 ├── manifest.json                 # Full machine-readable AuditReport (headers, excerpts, logs, guardrail events)

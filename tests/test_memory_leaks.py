@@ -102,9 +102,9 @@ def test_python_leaky_app_end_to_end_before_after_heap_and_fd_verification(tmp_p
     assert fd_ver.memory_probe_after is not None and fd_ver.memory_probe_after.fd_delta <= 5
     assert fd_ver.memory_leak_confirmed_and_fixed is True
 
-    # Validate SARIF 2.1.0 output
+    # Validate SARIF 2.1.0 output under per-repo subfolder `<out_dir>/py_leaky_app/`
     validate_sarif(build_sarif(report))
-    assert (out_dir / "report.md").is_file()
+    assert (out_dir / "py_leaky_app" / "report.md").is_file()
 
 
 def test_node_leaky_app_end_to_end_before_after_heap_verification(tmp_path: Path) -> None:

@@ -211,7 +211,7 @@ def remediate(
     )
     console.print(f"Report:  {written['markdown']}")
     console.print(f"SARIF:   {written['sarif']}")
-    console.print(f"Patches: {out.resolve() / 'patches'}")
+    console.print(f"Patches: {written['markdown'].parent / 'patches'}")
 
 
 @app.command("verify-patch")

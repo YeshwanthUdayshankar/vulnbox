@@ -81,13 +81,38 @@ def scan(
     repo: Path = typer.Argument(..., exists=True, file_okay=False, resolve_path=True),
     backend: str = typer.Option("auto", "--backend", help="Sandbox backend: auto, docker, local"),
     advisories: Path | None = typer.Option(None, "--advisories", help="Optional JSON advisory file"),
+    deep: bool = typer.Option(
+        False,
+        "--deep",
+        help="Enable sandbox runtime call-graph tracing (sys.monitoring / V8 Inspector) and dynamic memory/FD leak probing",
+    ),
+    check_leaks: bool = typer.Option(
+        False,
+        "--check-leaks",
+        help="Run active loopback memory & file-descriptor stress probes for detected leak findings",
+    ),
     out: Path = typer.Option(Path("vulnbox-out"), "--out", help="Output directory for report bundle"),
 ) -> None:
-    """Scrub a repository and run SAST, config hygiene, and dependency reachability analysis."""
+    """Scrub a repository and run SAST, config hygiene, memory leak, and call-graph reachability analysis."""
     engine = VulnBoxEngine(backend=backend)
-    report, written = engine.scan(repo, advisories_path=advisories, out_dir=out)
+    report, written = engine.scan(
+        repo,
+        advisories_path=advisories,
+        deep=deep,
+        check_leaks=check_leaks,
+        out_dir=out,
+    )
 
     console.print(f"[bold]Scan complete[/bold]: {len(report.findings)} findings found.")
+    if report.call_graph_summary is not None:
+        cg = report.call_graph_summary
+        console.print(
+            f"Call graph:      {cg.total_nodes} nodes, {cg.total_edges} edges "
+            f"(runtime_resolved={cg.runtime_resolved_count}, unresolved={len(cg.unresolved_sites)})"
+        )
+    if report.memory_probes:
+        leaked = sum(1 for m in report.memory_probes if m.leak_detected)
+        console.print(f"Memory probes:   {leaked}/{len(report.memory_probes)} confirmed active leaks")
     console.print(f"Markdown report: {written['markdown']}")
     console.print(f"SARIF 2.1.0:     {written['sarif']}")
 
@@ -132,6 +157,16 @@ def remediate(
     health_path: str | None = typer.Option(None, "--health-path", help="Override healthcheck path"),
     probe_file: Path | None = typer.Option(None, "--probe", help="Optional custom JSON probe spec(s)"),
     advisories: Path | None = typer.Option(None, "--advisories", help="Optional JSON advisory file"),
+    deep: bool = typer.Option(
+        False,
+        "--deep",
+        help="Enable sandbox runtime call-graph tracing and active before/after memory & FD leak verification",
+    ),
+    check_leaks: bool = typer.Option(
+        False,
+        "--check-leaks",
+        help="Enable active before/after heap slope and file-descriptor leak verification",
+    ),
     llm: bool = typer.Option(False, "--llm", help="Enable guarded LLM synthesis for findings without deterministic patches"),
     llm_provider: str = typer.Option("ollama", "--llm-provider", help="LLM provider: ollama, openai, gemini, custom"),
     llm_model: str | None = typer.Option(None, "--llm-model", help="Override LLM model name"),
@@ -151,6 +186,8 @@ def remediate(
         health_path=health_path,
         custom_probes=custom_probes,
         advisories_path=advisories,
+        deep=deep,
+        check_leaks=check_leaks,
         llm_config=llm_cfg,
         guardrail_policy=GuardrailPolicy(max_retries=llm_max_retries),
         max_workers=jobs,
@@ -159,12 +196,18 @@ def remediate(
 
     verified_count = sum(1 for v in report.verifications if v.verified)
     active_count = sum(1 for v in report.verifications if v.dynamic_confirmed_and_fixed is True)
+    mem_fixed = sum(1 for v in report.verifications if v.memory_leak_confirmed_and_fixed is True)
     blocked_count = sum(1 for g in report.guardrail_events if g.decision == "block")
+    extra_parts: list[str] = []
+    if mem_fixed:
+        extra_parts.append(f"{mem_fixed} memory/FD leaks confirmed & fixed")
+    if llm:
+        extra_parts.append(f"{blocked_count} guardrail blocks")
+    suffix = f", {', '.join(extra_parts)}." if extra_parts else "."
     console.print(
         f"[bold green]Remediation bundle complete[/bold green]: "
         f"{len(report.findings)} findings, {verified_count}/{len(report.patches)} verified patches, "
-        f"{active_count} actively confirmed & fixed via live curl probe"
-        + (f", {blocked_count} guardrail blocks." if llm else ".")
+        f"{active_count} actively confirmed & fixed via live curl probe{suffix}"
     )
     console.print(f"Report:  {written['markdown']}")
     console.print(f"SARIF:   {written['sarif']}")

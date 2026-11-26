@@ -6,8 +6,8 @@ Sandboxed security testing, **active before/after loopback `curl` verification**
 
 - **Zero-Mutation Secret-Scrubbed Sandbox**: Copies your repository to an ephemeral workspace, strips `.git/config`, and scrubs `.env`/keys/tokens before running anything—never mutating your working tree.
 - **Pluggable Hardened Sandbox**: Runs inside hardened Docker containers (`--network=none`, `--cap-drop=ALL`, `--read-only`, `--security-opt=no-new-privileges:true`, non-root UID, CPU/RAM/PID caps) with an automatic isolated local fallback when Docker daemon is unavailable.
-- **4-Layer Analysis**: Python AST SAST, Node.js SAST, Dockerfile/config/secret hygiene, and Dependency CVE reachability (`reachable` / `not_reachable` / `under_investigation`).
-- **Active Before/After Loopback Verification (`curl`)**: Boots the target app on `127.0.0.1:<ephemeral_port>` inside the sandbox, runs a reproducible `curl` probe to prove the vulnerability exists live, applies the candidate fix, and re-runs the **exact same `curl` probe** to prove the fix works.
+- **4-Layer + Deep Hybrid Analysis**: Python AST SAST, **Tree-sitter JS/TS SAST**, Dockerfile/config/secret hygiene, **Static Memory & Resource Leak Analysis (CWE-401 / CWE-772)**, and **Hybrid Call-Graph CVE Reachability** (static AST/Tree-sitter + opt-in `--deep` sandbox runtime tracing via Python 3.12 `sys.monitoring` & Node.js V8 Inspector).
+- **Active Before/After Loopback Verification (`curl` & Memory/FD Slope)**: Boots the target app on `127.0.0.1:<ephemeral_port>` inside the sandbox, runs reproducible `curl` probes (and opt-in `--check-leaks` / `--deep` heap-slope + `/proc/<pid>/fd` stress probes), applies candidate fixes, and re-runs the exact same probes to prove fixes work.
 - **Dual-Verified Patching & Regression Tests**: Confirms SAST clean + active `curl` probe fixed + generated defensive regression test transitions `FAIL → PASS` + repo's existing test suite passes with zero regressions.
 - **Optional Guarded LLM Mode (`--llm`)**: Synthesizes patches for complex findings via any OpenAI-compatible model (local Ollama, OpenAI, Gemini, vLLM) gated by deterministic guardrails and the sandbox truth oracle.
 - **Standard Outputs**: Markdown report, verified `.patch` unified diffs, generated security regression tests, and schema-validated **SARIF 2.1.0** JSON.
@@ -30,6 +30,10 @@ docker build -t vulnbox-sandbox:latest -f docker/sandbox.Dockerfile .
 
 # Run end-to-end sandboxed scan, active curl probing, and dual-verified remediation
 uv run vulnbox remediate /path/to/repo --backend docker --out ./vulnbox-out
+
+# Deep mode: add sandbox runtime call-graph tracing (sys.monitoring / V8 Inspector)
+# + active before/after memory & file-descriptor leak slope verification
+uv run vulnbox remediate /path/to/repo --backend docker --deep --out ./vulnbox-out
 
 # Verify a custom/agent-authored patch + custom loopback curl probe
 uv run vulnbox verify-patch /path/to/repo --patch fix.patch --probe probe.json --backend docker

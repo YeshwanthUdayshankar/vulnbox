@@ -78,6 +78,16 @@
         </div>
 
         <div class="checkbox-row">
+          <input id="rem-deep-toggle" type="checkbox" />
+          <label for="rem-deep-toggle" class="checkbox-label">Deep Scan (<code>--deep</code>): Sandbox runtime call-graph tracing + active memory/FD leak probing</label>
+        </div>
+
+        <div class="checkbox-row">
+          <input id="rem-leaks-toggle" type="checkbox" />
+          <label for="rem-leaks-toggle" class="checkbox-label">Check Memory &amp; FD Leaks (<code>--check-leaks</code>): Active before/after heap slope &amp; descriptor verification</label>
+        </div>
+
+        <div class="checkbox-row">
           <input id="rem-llm-toggle" type="checkbox" />
           <label for="rem-llm-toggle" class="checkbox-label">Enable Guarded LLM Synthesis (<code>--llm</code>) for findings without deterministic built-in patches</label>
         </div>
@@ -134,6 +144,14 @@
             <label for="scan-advisories">Custom Advisories JSON Path (optional)</label>
             <input id="scan-advisories" type="text" placeholder="/path/to/advisories.json" />
           </div>
+        </div>
+        <div class="checkbox-row">
+          <input id="scan-deep-toggle" type="checkbox" />
+          <label for="scan-deep-toggle" class="checkbox-label">Deep Scan (<code>--deep</code>): Runtime call-graph tracing + dynamic memory/FD leak probes</label>
+        </div>
+        <div class="checkbox-row">
+          <input id="scan-leaks-toggle" type="checkbox" />
+          <label for="scan-leaks-toggle" class="checkbox-label">Dynamic Memory &amp; FD Leak Probing (<code>--check-leaks</code>)</label>
         </div>
         <div class="row-actions">
           <button id="btn-scan" class="btn">Run Scan</button>

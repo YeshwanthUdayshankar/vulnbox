@@ -314,7 +314,7 @@ class DependencyReachabilityAnalyzer:
     def __init__(self, advisories_path: Path | None = None) -> None:
         self.advisories = load_advisories(advisories_path)
 
-    def analyze(self, workspace_dir: Path) -> list[Finding]:
+    def analyze(self, workspace_dir: Path, call_graph: Any | None = None) -> list[Finding]:
         findings: list[Finding] = []
         py_deps = _parse_python_dependencies(workspace_dir)
         node_deps = _parse_node_dependencies(workspace_dir)
@@ -336,8 +336,40 @@ class DependencyReachabilityAnalyzer:
                         workspace_dir, adv.imports or [adv.package], adv.vulnerable_symbols
                     )
 
+                call_path: list[str] = []
+                call_path_provenance: list[str] = []
+                if call_graph is not None:
+                    pkg_prefixes = [f"external::{imp}" for imp in (adv.imports or [adv.package])]
+                    sym_tails = [s.split(".")[-1] for s in adv.vulnerable_symbols]
+
+                    def _matches_vuln(node_id: str, prefixes=pkg_prefixes, tails=sym_tails) -> bool:
+                        if not any(node_id.startswith(p) for p in prefixes):
+                            return False
+                        if not tails:
+                            return True
+                        return any(node_id.endswith(f".{t}") or node_id.endswith(f"::{t}") for t in tails)
+
+                    cg_hit = call_graph.shortest_path_from_entrypoints(_matches_vuln)
+                    if cg_hit is not None:
+                        call_path, call_path_provenance = cg_hit
+                        if reachability != "reachable":
+                            reachability = "reachable"
+
                 rule_id = f"DEP-{adv.advisory_id}"
                 cite_text = f" Citations: {', '.join(citations)}." if citations else ""
+                path_text = f" Call path: {' -> '.join(call_path)}." if call_path else ""
+                meta: dict[str, Any] = {
+                    "ecosystem": adv.ecosystem,
+                    "package": adv.package,
+                    "installed_version": installed_ver,
+                    "fixed_version": adv.fixed_version,
+                    "advisory_id": adv.advisory_id,
+                    "citations": citations,
+                }
+                if call_path:
+                    meta["call_path"] = call_path
+                    meta["call_path_provenance"] = call_path_provenance
+
                 findings.append(
                     Finding(
                         finding_id=make_finding_id(rule_id, manifest, line_no),
@@ -352,18 +384,12 @@ class DependencyReachabilityAnalyzer:
                         snippet=f"{manifest}:{line_no}: {pkg} ({installed_ver})",
                         message=(
                             f"Dependency '{adv.package}' version '{installed_ver}' is affected by "
-                            f"{adv.advisory_id} (< {adv.affected_below}). Reachability: {reachability}.{cite_text}"
+                            f"{adv.advisory_id} (< {adv.affected_below}). Reachability: {reachability}."
+                            f"{cite_text}{path_text}"
                         ),
                         reachability=reachability,
                         recommended_fix=f"Upgrade '{adv.package}' in {manifest} to >= {adv.fixed_version}.",
-                        metadata={
-                            "ecosystem": adv.ecosystem,
-                            "package": adv.package,
-                            "installed_version": installed_ver,
-                            "fixed_version": adv.fixed_version,
-                            "advisory_id": adv.advisory_id,
-                            "citations": citations,
-                        },
+                        metadata=meta,
                     )
                 )
 

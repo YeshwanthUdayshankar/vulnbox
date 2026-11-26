@@ -8,6 +8,7 @@ from pathlib import Path
 
 from vulnbox._version import __version__ as TOOL_VERSION
 from vulnbox.analyzers import run_all_analyzers
+from vulnbox.callgraph import build_hybrid_call_graph
 from vulnbox.llm import (
     GuardrailPolicy,
     LLMConfig,
@@ -19,6 +20,7 @@ from vulnbox.models import (
     DynamicProbeResult,
     DynamicProbeSpec,
     GuardrailEvent,
+    MemoryLeakProbeResult,
     PatchCandidate,
     RepoProfile,
     VerificationResult,
@@ -28,8 +30,10 @@ from vulnbox.registry import PluginRegistry, default_registry
 from vulnbox.remediation import (
     generate_patch_for_finding,
     generate_regression_test,
+    infer_memory_probe_for_finding,
     infer_probe_for_finding,
     run_dynamic_probe,
+    run_memory_leak_probe,
     verify_patch,
 )
 from vulnbox.remediation.verifier import run_existing_tests
@@ -64,18 +68,53 @@ class VulnBoxEngine:
         self,
         repo_path: str | Path,
         advisories_path: Path | None = None,
+        deep: bool = False,
+        check_leaks: bool = False,
+        start_cmd: str | None = None,
+        health_path: str | None = None,
         out_dir: Path | None = None,
     ) -> tuple[AuditReport, dict[str, Path]]:
         repo = Path(repo_path).resolve()
         prof = profile_repo(repo)
+        effective_check_leaks = check_leaks or deep
+        effective_start = start_cmd or prof.start_command
+        effective_health = health_path or prof.health_path
+        memory_probes: list[MemoryLeakProbeResult] = []
+
         with ScrubbedWorkspace(repo) as sws:
+            cg = build_hybrid_call_graph(
+                sws.path,
+                profile=prof,
+                backend=self.backend,
+                policy=self.sandbox_policy,
+                include_runtime=deep,
+            )
             findings = run_all_analyzers(
                 sws.path,
                 scrub_summary=sws.summary,
                 advisories_path=advisories_path,
                 profile=prof,
                 registry=self.registry,
+                call_graph=cg,
             )
+            if effective_check_leaks and effective_start:
+                for f in findings:
+                    if f.category not in ("memory_leak", "resource_leak"):
+                        continue
+                    mspec = infer_memory_probe_for_finding(
+                        f, sws.path, call_graph=cg, registry=self.registry
+                    )
+                    if mspec is not None:
+                        mres = run_memory_leak_probe(
+                            sws.path,
+                            backend=self.backend,
+                            start_cmd=effective_start,
+                            spec=mspec,
+                            health_path=effective_health,
+                            policy=self.sandbox_policy,
+                        )
+                        memory_probes.append(mres)
+
             report = AuditReport(
                 tool_version=TOOL_VERSION,
                 timestamp=_utc_now(),
@@ -83,6 +122,8 @@ class VulnBoxEngine:
                 profile=prof,
                 scrub_summary=sws.summary,
                 findings=findings,
+                call_graph_summary=cg.to_summary(),
+                memory_probes=memory_probes,
             )
             written = (
                 write_report_bundle(report, out_dir, registry=self.registry)
@@ -127,6 +168,8 @@ class VulnBoxEngine:
         health_path: str | None = None,
         custom_probes: list[DynamicProbeSpec] | None = None,
         advisories_path: Path | None = None,
+        deep: bool = False,
+        check_leaks: bool = False,
         llm_config: LLMConfig | None = None,
         llm_client: OpenAICompatLLMClient | None = None,
         guardrail_policy: GuardrailPolicy | None = None,
@@ -136,6 +179,7 @@ class VulnBoxEngine:
         repo = Path(repo_path).resolve()
         prof = profile_repo(repo)
         probes = custom_probes or []
+        effective_check_leaks = check_leaks or deep
 
         active_client = llm_client or (OpenAICompatLLMClient(llm_config) if llm_config else None)
         llm_enabled = active_client is not None
@@ -153,12 +197,20 @@ class VulnBoxEngine:
 
         with ScrubbedWorkspace(repo) as sws:
             scrub = sws.summary
+            cg = build_hybrid_call_graph(
+                sws.path,
+                profile=prof,
+                backend=self.backend,
+                policy=self.sandbox_policy,
+                include_runtime=deep,
+            )
             findings = run_all_analyzers(
                 sws.path,
                 scrub_summary=scrub,
                 advisories_path=advisories_path,
                 profile=prof,
                 registry=self.registry,
+                call_graph=cg,
             )
             if findings:
                 baseline_tests_cache = run_existing_tests(
@@ -182,6 +234,11 @@ class VulnBoxEngine:
                 if matched_probe is None:
                     matched_probe = infer_probe_for_finding(f, sws.path, registry=self.registry)
                 patch.probe_spec = matched_probe
+
+                if effective_check_leaks and f.category in ("memory_leak", "resource_leak"):
+                    patch.memory_probe_spec = infer_memory_probe_for_finding(
+                        f, sws.path, call_graph=cg, registry=self.registry
+                    )
                 patches.append(patch)
 
             if active_client is not None and unpatched_findings:
@@ -224,6 +281,9 @@ class VulnBoxEngine:
                 backend=self.backend,
                 finding=finding_map.get(p.finding_id),
                 probe_spec=p.probe_spec,
+                memory_probe_spec=p.memory_probe_spec,
+                check_leaks=effective_check_leaks,
+                call_graph=cg,
                 start_cmd=start_cmd,
                 health_path=health_path,
                 advisories_path=advisories_path,
@@ -239,6 +299,10 @@ class VulnBoxEngine:
             with ThreadPoolExecutor(max_workers=workers) as pool:
                 verifications.extend(pool.map(_verify_one, pending_patches))
 
+        mem_probe_results = [
+            v.memory_probe_before for v in verifications if v.memory_probe_before is not None
+        ]
+
         report = AuditReport(
             tool_version=TOOL_VERSION,
             timestamp=_utc_now(),
@@ -248,6 +312,8 @@ class VulnBoxEngine:
             findings=findings,
             patches=patches,
             verifications=verifications,
+            call_graph_summary=cg.to_summary(),
+            memory_probes=mem_probe_results,
             llm_enabled=llm_enabled,
             llm_model=llm_model,
             guardrail_events=guardrail_events,

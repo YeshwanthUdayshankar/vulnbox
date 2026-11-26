@@ -265,6 +265,103 @@ def test_dependency_meets_fixed_version():
     return (f"tests/test_security_{slug}.py", code)
 
 
+@default_registry.register_regression_test("MEM-PY-001")
+def _reg_mem_py_cache(finding: Finding) -> tuple[str, str]:
+    slug = _safe_ident(finding.finding_id)
+    cname = str(finding.metadata.get("container") or "cache")
+    code = f'''"""Memory leak regression test for {finding.finding_id} ({finding.cwe_id})."""
+
+import re
+from pathlib import Path
+
+
+def test_in_memory_cache_is_bounded():
+    src = Path({finding.file_path!r}).read_text(encoding="utf-8")
+    assert re.search(
+        r"\\b{re.escape(cname)}\\.(?:pop|popitem|clear|remove)\\s*\\(|\\blen\\s*\\(\\s*{re.escape(cname)}\\s*\\)\\s*(?:>=|>)",
+        src,
+    ), "Cache '{cname}' must enforce bounded size / eviction to prevent CWE-401 memory leaks"
+'''
+    return (f"tests/test_security_{slug}.py", code)
+
+
+@default_registry.register_regression_test("MEM-PY-002")
+def _reg_mem_py_lru(finding: Finding) -> tuple[str, str]:
+    slug = _safe_ident(finding.finding_id)
+    code = f'''"""Memory leak regression test for {finding.finding_id} ({finding.cwe_id})."""
+
+from pathlib import Path
+
+
+def test_no_unbounded_method_cache():
+    src = Path({finding.file_path!r}).read_text(encoding="utf-8")
+    assert "maxsize=None" not in src and "@cache" not in src
+'''
+    return (f"tests/test_security_{slug}.py", code)
+
+
+@default_registry.register_regression_test("MEM-PY-003")
+def _reg_mem_py_fd(finding: Finding) -> tuple[str, str]:
+    slug = _safe_ident(finding.finding_id)
+    var_name = str(finding.metadata.get("variable") or "fh")
+    code = f'''"""Resource leak regression test for {finding.finding_id} ({finding.cwe_id})."""
+
+import ast
+from pathlib import Path
+
+
+def test_resource_handle_uses_context_manager():
+    src = Path({finding.file_path!r}).read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    with_calls = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.With, ast.AsyncWith)):
+            for item in node.items:
+                with_calls.add(id(item.context_expr))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Call):
+            if id(node.value) in with_calls:
+                continue
+            if len(node.targets) == 1 and isinstance(node.targets[0], ast.Name) and node.targets[0].id == {var_name!r}:
+                raise AssertionError("Handle '{var_name}' must be opened using a `with` context manager")
+'''
+    return (f"tests/test_security_{slug}.py", code)
+
+
+@default_registry.register_regression_test("MEM-JS-001")
+def _reg_mem_js_cache(finding: Finding) -> tuple[str, str]:
+    slug = _safe_ident(finding.finding_id)
+    cname = str(finding.metadata.get("container") or "cache")
+    code = f'''import test from "node:test";
+import assert from "node:assert/strict";
+import fs from "node:fs";
+
+test("Collection {cname} enforces bounded eviction ({finding.finding_id})", () => {{
+  const src = fs.readFileSync({finding.file_path!r}, "utf8");
+  const bounded = /\\b{re.escape(cname)}\\.(?:delete|clear|shift|pop|splice)\\s*\\(|\\b{re.escape(cname)}\\.(?:size|length)\\s*(?:>=|>)/.test(src);
+  assert.ok(bounded, "Collection {cname} must bound its size to prevent memory leaks");
+}});
+'''
+    return (f"tests/security_{slug}.test.mjs", code)
+
+
+@default_registry.register_regression_test("MEM-JS-002")
+def _reg_mem_js_listener(finding: Finding) -> tuple[str, str]:
+    slug = _safe_ident(finding.finding_id)
+    emitter = str(finding.metadata.get("emitter") or "emitter")
+    code = f'''import test from "node:test";
+import assert from "node:assert/strict";
+import fs from "node:fs";
+
+test("Event listener on {emitter} does not leak per request ({finding.finding_id})", () => {{
+  const src = fs.readFileSync({finding.file_path!r}, "utf8");
+  const safe = src.includes("{emitter}.once(") || src.includes("{emitter}.off(") || src.includes("{emitter}.removeListener(");
+  assert.ok(safe, "Listener on {emitter} must use .once() or remove itself via .off()");
+}});
+'''
+    return (f"tests/security_{slug}.test.mjs", code)
+
+
 def generate_regression_test(
     finding: Finding,
     registry: PluginRegistry | None = None,

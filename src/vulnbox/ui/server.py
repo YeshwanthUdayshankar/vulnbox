@@ -57,6 +57,8 @@ def _discover_sample_fixtures() -> list[dict[str, str]]:
         ("py_sample_app", "Python Sample App"),
         ("node_sample_app", "Node.js Sample App"),
         ("llm_sql_app", "LLM SQL Sample App"),
+        ("py_leaky_app", "Python Deep/Leaky App"),
+        ("node_leaky_app", "Node.js Deep/Leaky App"),
     ):
         cand = fixtures_dir / name
         if cand.is_dir():
@@ -280,9 +282,17 @@ class VulnBoxUIHandler(BaseHTTPRequestHandler):
 
         out_raw = (body.get("out_dir") or "").strip()
         out_path = Path(out_raw).expanduser().resolve() if out_raw else None
+        deep = bool(body.get("deep"))
+        check_leaks = bool(body.get("check_leaks"))
 
         engine = VulnBoxEngine(backend=backend)
-        report, written = engine.scan(repo, advisories_path=adv_path, out_dir=out_path)
+        report, written = engine.scan(
+            repo,
+            advisories_path=adv_path,
+            deep=deep,
+            check_leaks=check_leaks,
+            out_dir=out_path,
+        )
         run_id, md_text, sarif_doc = self._store_report_artifacts(report)
         self._send_json(
             200,
@@ -320,6 +330,8 @@ class VulnBoxUIHandler(BaseHTTPRequestHandler):
 
         out_raw = (body.get("out_dir") or "").strip()
         out_path = Path(out_raw).expanduser().resolve() if out_raw else None
+        deep = bool(body.get("deep"))
+        check_leaks = bool(body.get("check_leaks"))
 
         engine = VulnBoxEngine(backend=backend)
         report, written = engine.remediate(
@@ -328,6 +340,8 @@ class VulnBoxUIHandler(BaseHTTPRequestHandler):
             health_path=health_path,
             custom_probes=probes,
             advisories_path=adv_path,
+            deep=deep,
+            check_leaks=check_leaks,
             llm_config=llm_cfg,
             guardrail_policy=GuardrailPolicy(max_retries=max_retries),
             out_dir=out_path,

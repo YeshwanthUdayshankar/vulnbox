@@ -9,10 +9,19 @@ from pydantic import BaseModel, Field
 
 Ecosystem = Literal["python", "node", "mixed", "unknown"]
 Severity = Literal["critical", "high", "medium", "low", "info"]
-FindingCategory = Literal["sast", "dependency", "config", "secret"]
+FindingCategory = Literal[
+    "sast", "dependency", "config", "secret", "memory_leak", "resource_leak"
+]
 ReachabilityStatus = Literal[
     "reachable", "not_reachable", "under_investigation", "not_applicable"
 ]
+EdgeProvenance = Literal[
+    "static_exact",
+    "framework_introspected",
+    "runtime_observed",
+    "unresolved",
+]
+CallNodeLanguage = Literal["python", "javascript", "typescript", "native"]
 PatchStrategy = Literal[
     "minimal_code_fix",
     "dependency_bump",
@@ -150,6 +159,106 @@ class DynamicProbeResult(BaseModel):
     error: str | None = None
 
 
+class CallNode(BaseModel):
+    """Function, method, or route handler node in the hybrid call graph."""
+
+    node_id: str
+    file_path: str
+    symbol: str
+    line: int = 1
+    language: CallNodeLanguage = "python"
+    is_entrypoint: bool = False
+    route: str | None = None
+
+
+class CallEdge(BaseModel):
+    """Directed caller -> callee edge tagged with analysis provenance."""
+
+    caller: str
+    callee: str
+    file_path: str
+    line: int = 1
+    provenance: EdgeProvenance = "static_exact"
+
+
+class UnresolvedCallSite(BaseModel):
+    """Call site whose target could not be statically resolved (e.g., getattr, subscript)."""
+
+    caller: str
+    file_path: str
+    line: int
+    expression: str
+    reason: str
+
+
+class CallGraphSummary(BaseModel):
+    """Serializable summary of the hybrid call graph for reports and UI."""
+
+    total_nodes: int = 0
+    total_edges: int = 0
+    edges_by_provenance: dict[str, int] = Field(default_factory=dict)
+    entrypoints: list[str] = Field(default_factory=list)
+    unresolved_sites: list[UnresolvedCallSite] = Field(default_factory=list)
+    runtime_resolved_count: int = 0
+
+
+class MemorySample(BaseModel):
+    """Single point-in-time memory & handle measurement inside the sandbox."""
+
+    iteration: int
+    heap_bytes: int
+    rss_bytes: int = 0
+    open_fds: int = 0
+    gc_uncollectable: int = 0
+
+
+class AllocationHotspot(BaseModel):
+    """Top growing allocation site attributed by tracemalloc or V8 HeapProfiler."""
+
+    location: str
+    size_diff_bytes: int
+    count_diff: int = 0
+    traceback_excerpt: str = ""
+
+
+class MemoryLeakProbeSpec(BaseModel):
+    """Declarative loopback stress-probe specification for memory & FD leak verification."""
+
+    probe_id: str
+    finding_id: str | None = None
+    rule_id: str | None = None
+    description: str
+    method: HttpMethod = "GET"
+    path: str = "/"
+    headers: dict[str, str] = Field(default_factory=dict)
+    body: str | None = None
+    vary_query_param: str | None = None
+    warmup_requests: int = 10
+    measure_requests: int = 60
+    sample_interval: int = 15
+    min_bytes_per_request: int = 1024
+    min_r_squared: float = 0.70
+    max_allowed_fd_delta: int = 5
+
+
+class MemoryLeakProbeResult(BaseModel):
+    """Captured result of running an active memory & FD leak stress probe."""
+
+    probe_id: str
+    endpoint: str
+    samples: list[MemorySample] = Field(default_factory=list)
+    bytes_per_request_slope: float = 0.0
+    r_squared: float = 0.0
+    total_heap_growth_bytes: int = 0
+    rss_growth_bytes: int = 0
+    fd_delta: int = 0
+    gc_garbage_delta: int = 0
+    top_allocations: list[AllocationHotspot] = Field(default_factory=list)
+    retainer_summary: str = ""
+    leak_detected: bool = False
+    error: str | None = None
+
+
 class PatchCandidate(BaseModel):
     """Proposed remediation patch and associated verification hooks."""
 
@@ -162,6 +271,7 @@ class PatchCandidate(BaseModel):
     regression_test_path: str | None = None
     regression_test_code: str | None = None
     probe_spec: DynamicProbeSpec | None = None
+    memory_probe_spec: MemoryLeakProbeSpec | None = None
     root_cause_explanation: str | None = None
     probe_explanation: str | None = None
     fix_explanation: str | None = None
@@ -212,6 +322,9 @@ class VerificationResult(BaseModel):
     dynamic_probe_before: DynamicProbeResult | None = None
     dynamic_probe_after: DynamicProbeResult | None = None
     dynamic_confirmed_and_fixed: bool | None = None
+    memory_probe_before: MemoryLeakProbeResult | None = None
+    memory_probe_after: MemoryLeakProbeResult | None = None
+    memory_leak_confirmed_and_fixed: bool | None = None
     regression_test_failed_before: bool | None = None
     regression_test_passed_after: bool | None = None
     existing_tests_passed_after: bool
@@ -231,6 +344,8 @@ class AuditReport(BaseModel):
     findings: list[Finding] = Field(default_factory=list)
     patches: list[PatchCandidate] = Field(default_factory=list)
     verifications: list[VerificationResult] = Field(default_factory=list)
+    call_graph_summary: CallGraphSummary | None = None
+    memory_probes: list[MemoryLeakProbeResult] = Field(default_factory=list)
     llm_enabled: bool = False
     llm_model: str | None = None
     guardrail_events: list[GuardrailEvent] = Field(default_factory=list)

@@ -231,6 +231,147 @@ def _patch_dep_upgrade(finding: Finding, ws: Path) -> PatchCandidate | None:
     return _build_candidate(finding, ws, _tx, desc, strategy="dependency_bump")
 
 
+@default_registry.register_patcher("MEM-PY-001")
+def _patch_mem_py_unbounded_cache(finding: Finding, ws: Path) -> PatchCandidate | None:
+    def _tx(old: str, f: Finding) -> str:
+        cname = str(f.metadata.get("container") or "")
+        kind = str(f.metadata.get("container_kind") or "dict")
+        lines = old.splitlines(keepends=True)
+        if not cname or f.start_line < 1 or f.start_line > len(lines):
+            return old
+        target_line = lines[f.start_line - 1]
+        indent = target_line[: len(target_line) - len(target_line.lstrip())]
+        if kind == "list":
+            guard = [
+                f"{indent}if len({cname}) >= 64:\n",
+                f"{indent}    {cname}.pop(0)\n",
+            ]
+        elif kind == "set":
+            guard = [
+                f"{indent}if len({cname}) >= 64:\n",
+                f"{indent}    {cname}.pop()\n",
+            ]
+        else:
+            guard = [
+                f"{indent}if len({cname}) >= 64:\n",
+                f"{indent}    {cname}.pop(next(iter({cname})))\n",
+            ]
+        return "".join(lines[: f.start_line - 1] + guard + lines[f.start_line - 1 :])
+
+    return _build_candidate(
+        finding,
+        ws,
+        _tx,
+        "Bound in-memory collection to 64 entries with oldest-entry eviction.",
+    )
+
+
+@default_registry.register_patcher("MEM-PY-002")
+def _patch_mem_py_lru_cache(finding: Finding, ws: Path) -> PatchCandidate | None:
+    def _tx(old: str, _f: Finding) -> str:
+        updated = re.sub(r"@(?:functools\.)?lru_cache\s*\(\s*maxsize\s*=\s*None\s*\)", "@lru_cache(maxsize=64)", old)
+        updated = re.sub(r"@(?:functools\.)?cache\b", "@lru_cache(maxsize=64)", updated)
+        if "@lru_cache(" in updated and "lru_cache" not in old:
+            updated = _insert_python_import(updated, "from functools import lru_cache\n")
+        return updated
+
+    return _build_candidate(finding, ws, _tx, "Replace unbounded cache decorator with @lru_cache(maxsize=64).")
+
+
+@default_registry.register_patcher("MEM-PY-003")
+def _patch_mem_py_unclosed_handle(finding: Finding, ws: Path) -> PatchCandidate | None:
+    def _tx(old: str, f: Finding) -> str:
+        lines = old.splitlines(keepends=True)
+        if f.start_line < 1 or f.start_line > len(lines):
+            return old
+        line = lines[f.start_line - 1]
+        m = re.match(r"^(\s*)([A-Za-z_][A-Za-z0-9_]*)\s*=\s*((?:open|sqlite3\.connect|socket\.socket)\(.+\))\s*$", line)
+        if not m:
+            return old
+        indent, var_name, call_expr = m.groups()
+        # Indent subsequent statements in the same block that reference `var_name`
+        new_block = [f"{indent}with {call_expr} as {var_name}:\n"]
+        end_idx = f.start_line
+        while end_idx < len(lines):
+            nxt = lines[end_idx]
+            if nxt.strip() == "":
+                break
+            nxt_indent = len(nxt) - len(nxt.lstrip())
+            if nxt_indent < len(indent):
+                break
+            new_block.append("    " + nxt)
+            end_idx += 1
+            if nxt.lstrip().startswith("return "):
+                break
+        return "".join(lines[: f.start_line - 1] + new_block + lines[end_idx:])
+
+    return _build_candidate(
+        finding,
+        ws,
+        _tx,
+        "Wrap bare file/resource handle in a `with` context manager so descriptors always close.",
+    )
+
+
+@default_registry.register_patcher("MEM-JS-001")
+def _patch_mem_js_unbounded_cache(finding: Finding, ws: Path) -> PatchCandidate | None:
+    def _tx(old: str, f: Finding) -> str:
+        cname = str(f.metadata.get("container") or "")
+        kind = str(f.metadata.get("container_kind") or "Map")
+        lines = old.splitlines(keepends=True)
+        if not cname or f.start_line < 1 or f.start_line > len(lines):
+            return old
+        target_line = lines[f.start_line - 1]
+        indent = target_line[: len(target_line) - len(target_line.lstrip())]
+        if kind in ("Map", "Set"):
+            guard = [
+                f"{indent}if ({cname}.size >= 64) {{\n",
+                f"{indent}  {cname}.delete({cname}.keys().next().value);\n",
+                f"{indent}}}\n",
+            ]
+        elif kind == "array":
+            guard = [
+                f"{indent}if ({cname}.length >= 64) {{\n",
+                f"{indent}  {cname}.shift();\n",
+                f"{indent}}}\n",
+            ]
+        else:
+            guard = [
+                f"{indent}const _keys = Object.keys({cname});\n",
+                f"{indent}if (_keys.length >= 64) delete {cname}[_keys[0]];\n",
+            ]
+        return "".join(lines[: f.start_line - 1] + guard + lines[f.start_line - 1 :])
+
+    return _build_candidate(
+        finding,
+        ws,
+        _tx,
+        "Bound JS collection to 64 entries with oldest-entry eviction.",
+    )
+
+
+@default_registry.register_patcher("MEM-JS-002")
+def _patch_mem_js_event_listener(finding: Finding, ws: Path) -> PatchCandidate | None:
+    def _tx(old: str, f: Finding) -> str:
+        emitter = str(f.metadata.get("emitter") or "")
+        method = str(f.metadata.get("method") or "on")
+        lines = old.splitlines(keepends=True)
+        if not emitter or f.start_line < 1 or f.start_line > len(lines):
+            return old
+        updated_line = lines[f.start_line - 1].replace(f"{emitter}.{method}(", f"{emitter}.once(", 1)
+        if updated_line == lines[f.start_line - 1]:
+            return old
+        lines[f.start_line - 1] = updated_line
+        return "".join(lines)
+
+    return _build_candidate(
+        finding,
+        ws,
+        _tx,
+        "Replace persistent per-request listener (.on) with single-use .once() to prevent listener leaks.",
+    )
+
+
 def generate_patch_for_finding(
     finding: Finding,
     workspace_dir: Path,

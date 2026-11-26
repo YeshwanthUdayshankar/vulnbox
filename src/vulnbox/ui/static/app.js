@@ -153,6 +153,32 @@ function renderReportView(container, data) {
       fCard.appendChild(cmp);
     }
 
+    if (ver && ver.memory_probe_before) {
+      const mb = ver.memory_probe_before;
+      const ma = ver.memory_probe_after;
+      const mcmp = el("div", { class: "probe-compare" }, [
+        el("div", { class: "probe-box" }, [
+          el("div", {
+            class: `pill ${mb.leak_detected ? "err" : "ok"}`,
+            text: `BEFORE PATCH MEM: ${mb.bytes_per_request_slope} B/req (R²=${mb.r_squared}), FD Δ=${mb.fd_delta}`,
+          }),
+          el("pre", { text: mb.retainer_summary || `Endpoint: ${mb.endpoint}\nHeap growth: ${mb.total_heap_growth_bytes} B` }),
+        ]),
+      ]);
+      if (ma) {
+        mcmp.appendChild(
+          el("div", { class: "probe-box" }, [
+            el("div", {
+              class: `pill ${ma.leak_detected ? "err" : "ok"}`,
+              text: `AFTER PATCH MEM: ${ma.bytes_per_request_slope} B/req (R²=${ma.r_squared}), FD Δ=${ma.fd_delta}`,
+            }),
+            el("pre", { text: ma.retainer_summary || `Endpoint: ${ma.endpoint}\nHeap growth: ${ma.total_heap_growth_bytes} B` }),
+          ])
+        );
+      }
+      fCard.appendChild(mcmp);
+    }
+
     if (patch) {
       if (patch.root_cause_explanation) {
         fCard.appendChild(el("p", { class: "explain-line", text: `Core Issue: ${patch.root_cause_explanation}` }));
@@ -184,6 +210,22 @@ function renderReportView(container, data) {
     detailsWrap.appendChild(fCard);
   }
   container.appendChild(detailsWrap);
+
+  if (report.call_graph_summary) {
+    const cg = report.call_graph_summary;
+    const provs = Object.entries(cg.edges_by_provenance || {})
+      .map(([k, v]) => `${k}: ${v}`)
+      .join(" | ");
+    container.appendChild(
+      el("div", { class: "card" }, [
+        el("h3", { text: "Hybrid Call Graph Coverage" }),
+        el("p", {
+          class: "mono",
+          text: `Nodes: ${cg.total_nodes} | Edges: ${cg.total_edges} (${provs || "none"}) | Runtime-Resolved Dynamic Sites: ${cg.runtime_resolved_count} | Remaining Unresolved: ${(cg.unresolved_sites || []).length}`,
+        }),
+      ])
+    );
+  }
 
   if (guardrails.length > 0) {
     const tbl = el("table", {}, [
@@ -338,6 +380,8 @@ document.getElementById("btn-scan").addEventListener("click", async () => {
       repo_path: document.getElementById("scan-repo").value,
       backend: document.getElementById("scan-backend").value,
       advisories_path: document.getElementById("scan-advisories").value,
+      deep: document.getElementById("scan-deep-toggle").checked,
+      check_leaks: document.getElementById("scan-leaks-toggle").checked,
     });
     setStatus("", "");
     renderReportView(document.getElementById("scan-results"), data);
@@ -357,6 +401,8 @@ document.getElementById("btn-remediate").addEventListener("click", async () => {
       advisories_path: document.getElementById("rem-advisories").value,
       out_dir: document.getElementById("rem-out").value,
       probe_json: document.getElementById("rem-probe").value,
+      deep: document.getElementById("rem-deep-toggle").checked,
+      check_leaks: document.getElementById("rem-leaks-toggle").checked,
       llm_enabled: document.getElementById("rem-llm-toggle").checked,
       llm_provider: document.getElementById("rem-llm-provider").value,
       llm_model: document.getElementById("rem-llm-model").value,

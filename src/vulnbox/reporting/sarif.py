@@ -50,6 +50,8 @@ def build_sarif(report: AuditReport) -> dict[str, Any]:
             "reachability": f.reachability,
             "recommendedFix": f.recommended_fix,
         }
+        if f.metadata.get("call_path"):
+            props["callPath"] = f.metadata["call_path"]
         if ver is not None:
             props["patchVerified"] = ver.verified
             props["patchId"] = ver.patch_id
@@ -60,6 +62,14 @@ def build_sarif(report: AuditReport) -> dict[str, Any]:
                 props["activeProbeFixedAfter"] = ver.dynamic_probe_after.matched_fixed
             if ver.dynamic_confirmed_and_fixed is not None:
                 props["activeDynamicVerified"] = ver.dynamic_confirmed_and_fixed
+            if ver.memory_probe_before is not None:
+                props["memorySlopeBeforeBytesPerReq"] = ver.memory_probe_before.bytes_per_request_slope
+                props["fdDeltaBefore"] = ver.memory_probe_before.fd_delta
+            if ver.memory_probe_after is not None:
+                props["memorySlopeAfterBytesPerReq"] = ver.memory_probe_after.bytes_per_request_slope
+                props["fdDeltaAfter"] = ver.memory_probe_after.fd_delta
+            if ver.memory_leak_confirmed_and_fixed is not None:
+                props["memoryLeakConfirmedAndFixed"] = ver.memory_leak_confirmed_and_fixed
 
         results.append(
             {

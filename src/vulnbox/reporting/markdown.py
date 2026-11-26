@@ -15,6 +15,9 @@ def render_markdown_report(report: AuditReport) -> str:
     active_confirmed = sum(
         1 for v in report.verifications if v.dynamic_confirmed_and_fixed is True
     )
+    mem_confirmed = sum(
+        1 for v in report.verifications if v.memory_leak_confirmed_and_fixed is True
+    )
 
     lines: list[str] = [
         "# VulnBox Sandboxed Security & Remediation Report",
@@ -32,11 +35,26 @@ def render_markdown_report(report: AuditReport) -> str:
         f"| **Total Findings** | {total} |",
         f"| **Dual-Verified Patches** | {verified_count} / {len(report.patches)} |",
         f"| **Actively Confirmed & Fixed (Live `curl` Probe)** | {active_confirmed} |",
+        f"| **Memory & FD Leaks Confirmed & Fixed** | {mem_confirmed} |",
         f"| **Guardrail Events (Blocks / Warnings)** | {sum(1 for g in report.guardrail_events if g.decision == 'block')} blocked / {sum(1 for g in report.guardrail_events if g.decision == 'warn')} warnings |",
         "",
-        "## Findings Overview",
-        "",
     ]
+
+    if report.call_graph_summary is not None:
+        cg = report.call_graph_summary
+        prov_str = ", ".join(f"`{k}`={v}" for k, v in sorted(cg.edges_by_provenance.items())) or "none"
+        lines.extend(
+            [
+                "## Hybrid Call Graph Summary",
+                "",
+                f"- **Nodes / Edges:** `{cg.total_nodes}` nodes / `{cg.total_edges}` edges ({prov_str})",
+                f"- **Entrypoints Detected:** `{len(cg.entrypoints)}`",
+                f"- **Dynamic Sites Resolved at Runtime:** `{cg.runtime_resolved_count}` | **Remaining Unresolved Sites:** `{len(cg.unresolved_sites)}`",
+                "",
+            ]
+        )
+
+    lines.extend(["## Findings Overview", ""])
 
     if not report.findings:
         lines.append("No vulnerabilities or hygiene issues detected.")
@@ -55,7 +73,9 @@ def render_markdown_report(report: AuditReport) -> str:
             else:
                 if ver.dynamic_confirmed_and_fixed is True:
                     active_str = "CONFIRMED -> FIXED"
-                elif ver.dynamic_confirmed_and_fixed is False:
+                elif ver.memory_leak_confirmed_and_fixed is True:
+                    active_str = "LEAK -> FIXED"
+                elif ver.dynamic_confirmed_and_fixed is False or ver.memory_leak_confirmed_and_fixed is False:
                     active_str = "FAILED"
                 else:
                     active_str = "Static/Unit"
@@ -125,6 +145,25 @@ def render_markdown_report(report: AuditReport) -> str:
                         lines.append(
                             f"  - Excerpt: `{ver.dynamic_probe_after.response_body_excerpt[:160].replace(chr(10), ' ')}`"
                         )
+                lines.append("")
+
+            if ver.memory_probe_before is not None:
+                mb = ver.memory_probe_before
+                lines.extend(
+                    [
+                        "#### Active Memory & File-Descriptor Leak Verification (Before vs. After Patch)",
+                        "",
+                        f"- **Endpoint:** `{mb.endpoint}`",
+                        f"- **Pre-Patch:** slope=`{mb.bytes_per_request_slope:.1f} B/req` ($R^2={mb.r_squared:.2f}$), heap_growth=`{mb.total_heap_growth_bytes} B`, fd_delta=`{mb.fd_delta}`, `leak_detected={mb.leak_detected}`",
+                    ]
+                )
+                if mb.retainer_summary:
+                    lines.append(f"  - Root Cause Attribution: {mb.retainer_summary}")
+                if ver.memory_probe_after is not None:
+                    ma = ver.memory_probe_after
+                    lines.append(
+                        f"- **Post-Patch (Same Stress Loop):** slope=`{ma.bytes_per_request_slope:.1f} B/req` ($R^2={ma.r_squared:.2f}$), heap_growth=`{ma.total_heap_growth_bytes} B`, fd_delta=`{ma.fd_delta}`, `leak_detected={ma.leak_detected}`"
+                    )
                 lines.append("")
 
         if patch is not None:

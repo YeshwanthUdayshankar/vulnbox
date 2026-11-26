@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 from vulnbox.analyzers.config_hygiene import ConfigHygieneAnalyzer
 from vulnbox.analyzers.dependency_reachability import DependencyReachabilityAnalyzer
+from vulnbox.analyzers.memory_leaks import MemoryLeakAnalyzer
 from vulnbox.analyzers.node_sast import NodeSASTAnalyzer
 from vulnbox.analyzers.python_sast import PythonSASTAnalyzer
 from vulnbox.models import Finding, RepoProfile, ScrubSummary
@@ -37,7 +39,16 @@ class _DependencyReachabilityPlugin:
     name = "dependency-reachability"
 
     def run(self, ctx: AnalysisContext) -> list[Finding]:
-        return DependencyReachabilityAnalyzer(ctx.advisories_path).analyze(ctx.workspace_dir)
+        return DependencyReachabilityAnalyzer(ctx.advisories_path).analyze(
+            ctx.workspace_dir, call_graph=ctx.call_graph
+        )
+
+
+class _MemoryLeaksPlugin:
+    name = "memory-leaks"
+
+    def run(self, ctx: AnalysisContext) -> list[Finding]:
+        return MemoryLeakAnalyzer().analyze(ctx.workspace_dir, call_graph=ctx.call_graph)
 
 
 def register_builtin_analyzers(registry: PluginRegistry = default_registry) -> None:
@@ -46,6 +57,7 @@ def register_builtin_analyzers(registry: PluginRegistry = default_registry) -> N
     registry.register_analyzer(_NodeSASTPlugin())
     registry.register_analyzer(_ConfigHygienePlugin())
     registry.register_analyzer(_DependencyReachabilityPlugin())
+    registry.register_analyzer(_MemoryLeaksPlugin())
 
 
 register_builtin_analyzers(default_registry)
@@ -57,6 +69,7 @@ def run_all_analyzers(
     advisories_path: Path | None = None,
     profile: RepoProfile | None = None,
     registry: PluginRegistry | None = None,
+    call_graph: Any | None = None,
 ) -> list[Finding]:
     """Run all registered analyzers (including entry_points plugins) and deduplicate findings."""
     reg = registry or default_registry
@@ -68,6 +81,7 @@ def run_all_analyzers(
         profile=profile,
         scrub_summary=scrub_summary,
         advisories_path=advisories_path,
+        call_graph=call_graph,
     )
     findings: list[Finding] = []
     for analyzer in reg.list_analyzers():
@@ -85,6 +99,7 @@ def run_all_analyzers(
 __all__ = [
     "ConfigHygieneAnalyzer",
     "DependencyReachabilityAnalyzer",
+    "MemoryLeakAnalyzer",
     "NodeSASTAnalyzer",
     "PythonSASTAnalyzer",
     "register_builtin_analyzers",

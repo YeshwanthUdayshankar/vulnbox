@@ -6,12 +6,13 @@ import importlib.metadata
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 from vulnbox.models import (
     AuditReport,
     DynamicProbeSpec,
     Finding,
+    MemoryLeakProbeSpec,
     PatchCandidate,
     RepoProfile,
     ScrubSummary,
@@ -26,6 +27,7 @@ class AnalysisContext:
     profile: RepoProfile | None = None
     scrub_summary: ScrubSummary | None = None
     advisories_path: Path | None = None
+    call_graph: Any | None = None
 
 
 @runtime_checkable
@@ -49,6 +51,7 @@ class ReporterPlugin(Protocol):
 PatcherFn = Callable[[Finding, Path], PatchCandidate | None]
 RegressionTestFn = Callable[[Finding], tuple[str, str] | None]
 ProbeInferFn = Callable[[Finding, Path], DynamicProbeSpec | None]
+MemoryProbeInferFn = Callable[[Finding, Path, Any | None], MemoryLeakProbeSpec | None]
 
 
 class PluginRegistry:
@@ -61,6 +64,7 @@ class PluginRegistry:
         self._regression_tests: dict[str, RegressionTestFn] = {}
         self._category_regression_tests: dict[str, RegressionTestFn] = {}
         self._probes: dict[str, ProbeInferFn] = {}
+        self._memory_probes: dict[str, MemoryProbeInferFn] = {}
         self._reporters: dict[str, ReporterPlugin] = {}
         self._entry_points_loaded: bool = False
 
@@ -127,6 +131,19 @@ class PluginRegistry:
 
     def get_probe_inferrer(self, finding: Finding) -> ProbeInferFn | None:
         return self._probes.get(finding.rule_id)
+
+    # --- Active Memory & Resource Leak Probe Inference ---
+
+    def register_memory_probe(self, *rule_ids: str) -> Callable[[MemoryProbeInferFn], MemoryProbeInferFn]:
+        def _decorator(fn: MemoryProbeInferFn) -> MemoryProbeInferFn:
+            for rid in rule_ids:
+                self._memory_probes[rid] = fn
+            return fn
+
+        return _decorator
+
+    def get_memory_probe_inferrer(self, finding: Finding) -> MemoryProbeInferFn | None:
+        return self._memory_probes.get(finding.rule_id)
 
     # --- Reporters ---
 

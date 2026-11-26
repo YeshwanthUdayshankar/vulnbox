@@ -11,6 +11,7 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from vulnbox.analyzers.base import SKIP_DIRS, iter_source_files, make_finding_id
+from vulnbox.constants import is_test_or_fixture_path
 from vulnbox.models import Finding, ReachabilityStatus, Severity
 
 
@@ -116,7 +117,7 @@ def _iter_manifest_files(workspace_dir: Path, names: tuple[str, ...]) -> list[Pa
         if not path.is_file():
             continue
         rel = path.relative_to(workspace_dir)
-        if any(part in SKIP_DIRS for part in rel.parts):
+        if any(part in SKIP_DIRS for part in rel.parts) or is_test_or_fixture_path(rel):
             continue
         if len(rel.parts) <= 4 and path.name in names:
             found.append(path)

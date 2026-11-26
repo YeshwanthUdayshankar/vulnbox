@@ -15,10 +15,11 @@ from vulnbox.models import (
     RepoProfile,
     VerificationResult,
 )
+from vulnbox.registry import PluginRegistry
+from vulnbox.remediation.diff_utils import apply_unified_diff
 from vulnbox.remediation.dynamic_probe import infer_probe_for_finding, run_dynamic_probe
-from vulnbox.remediation.patcher import apply_unified_diff
 from vulnbox.sandbox.base import SandboxBackend, SandboxPolicy
-from vulnbox.scrubber import cleanup_workspace, create_scrubbed_workspace
+from vulnbox.scrubber import ScrubbedWorkspace
 
 
 def _run_existing_tests(
@@ -64,20 +65,19 @@ def verify_patch(
     health_path: str | None = None,
     advisories_path: Path | None = None,
     policy: SandboxPolicy | None = None,
+    registry: PluginRegistry | None = None,
 ) -> VerificationResult:
     """Verify a patch candidate in a fresh scrubbed sandbox before and after patching."""
     pol = policy or SandboxPolicy()
-    scrub = create_scrubbed_workspace(repo_path)
-    ws = Path(scrub.sandbox_dir)
     logs: dict[str, str] = {}
-
     effective_start = start_cmd or profile.start_command
     effective_health = health_path or profile.health_path
 
-    try:
+    with ScrubbedWorkspace(repo_path) as sws:
+        ws = sws.path
         # 1. Baseline findings & existing tests
         baseline_findings = run_all_analyzers(
-            ws, scrub_summary=None, advisories_path=advisories_path
+            ws, scrub_summary=None, advisories_path=advisories_path, profile=profile, registry=registry
         )
         baseline_ids = {f.finding_id for f in baseline_findings}
 
@@ -87,7 +87,7 @@ def verify_patch(
         # 2. Active pre-patch curl/HTTP probe (if app is runnable & probe exists)
         active_probe = probe_spec or patch.probe_spec
         if active_probe is None and finding is not None:
-            active_probe = infer_probe_for_finding(finding, ws)
+            active_probe = infer_probe_for_finding(finding, ws, registry=registry)
 
         probe_before: DynamicProbeResult | None = None
         if active_probe is not None and effective_start:
@@ -146,7 +146,7 @@ def verify_patch(
 
         # 5. Post-patch static analysis check
         post_findings = run_all_analyzers(
-            ws, scrub_summary=None, advisories_path=advisories_path
+            ws, scrub_summary=None, advisories_path=advisories_path, profile=profile, registry=registry
         )
         post_ids = {f.finding_id for f in post_findings}
         target_rule = finding.rule_id if finding else patch.rule_id
@@ -244,5 +244,3 @@ def verify_patch(
             summary=", ".join(status_parts),
             logs=logs,
         )
-    finally:
-        cleanup_workspace(ws)

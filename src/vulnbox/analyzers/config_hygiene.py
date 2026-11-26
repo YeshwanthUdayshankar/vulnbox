@@ -6,6 +6,7 @@ import re
 from pathlib import Path
 
 from vulnbox.analyzers.base import SKIP_DIRS, extract_snippet, make_finding_id
+from vulnbox.constants import is_test_or_fixture_path
 from vulnbox.models import Finding, ScrubSummary
 
 FROM_RE = re.compile(r"^\s*FROM\s+([^\s]+)", re.IGNORECASE)
@@ -19,7 +20,9 @@ PIPE_TO_SHELL_RE = re.compile(
     r"\b(?:curl|wget)\b[^|\n]*\|\s*(?:sudo\s+)?(?:ba|z|da)?sh\b",
     re.IGNORECASE,
 )
-CHMOD_777_RE = re.compile(r"\bchmod\s+(?:-R\s+)?0?777\b|0o777")
+SHELL_CHMOD_777_RE = re.compile(r"^\s*(?:RUN\s+)?(?:sudo\s+)?chmod\s+(?:-R\s+)?0?777\b")
+PY_OS_CHMOD_777_RE = re.compile(r"\bos\.chmod\s*\([^)]*0o777\b")
+JS_FS_CHMOD_777_RE = re.compile(r"\bchmod(?:Sync)?\s*\([^)]*(?:0o777|['\"]777['\"])")
 
 
 class ConfigHygieneAnalyzer:
@@ -34,12 +37,12 @@ class ConfigHygieneAnalyzer:
     ) -> list[Finding]:
         findings: list[Finding] = []
 
-        # 1. Inspect Dockerfiles
+        # 1. Inspect Dockerfiles and permission calls (skipping test/fixture directories)
         for path in sorted(workspace_dir.rglob("*")):
             if not path.is_file():
                 continue
             rel = path.relative_to(workspace_dir)
-            if any(part in SKIP_DIRS for part in rel.parts):
+            if any(part in SKIP_DIRS for part in rel.parts) or is_test_or_fixture_path(rel):
                 continue
 
             if path.name == "Dockerfile" or path.name.startswith("Dockerfile."):
@@ -50,6 +53,8 @@ class ConfigHygieneAnalyzer:
         # 2. Report committed secret files / redacted tokens detected during scrubbing
         if scrub_summary:
             for rel_file in scrub_summary.files_scrubbed:
+                if is_test_or_fixture_path(Path(rel_file)):
+                    continue
                 fname = Path(rel_file).name
                 if fname.lower().startswith(".env") or fname.lower().endswith((".pem", ".key")):
                     env_cls = scrub_summary.env_classifications.get(rel_file, "real_secret")
@@ -233,8 +238,17 @@ class ConfigHygieneAnalyzer:
             lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
         except OSError:
             return findings
+        suffix = path.suffix.lower()
         for idx, line in enumerate(lines, start=1):
-            if CHMOD_777_RE.search(line):
+            stripped = line.lstrip()
+            if stripped.startswith(("#", "//", "/*", "*")):
+                continue
+            matched = (
+                (suffix in (".sh", ".yml", ".yaml") and bool(SHELL_CHMOD_777_RE.search(line)))
+                or (suffix == ".py" and bool(PY_OS_CHMOD_777_RE.search(line)))
+                or (suffix in (".js", ".mjs") and bool(JS_FS_CHMOD_777_RE.search(line)))
+            )
+            if matched:
                 findings.append(
                     Finding(
                         finding_id=make_finding_id("CFG-PERM-001", rel, idx),

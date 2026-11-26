@@ -5,20 +5,10 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from vulnbox.constants import DEFAULT_SKIP_DIRS
 from vulnbox.models import Ecosystem, RepoProfile
 
-IGNORED_DIRS = {
-    ".git",
-    ".venv",
-    "venv",
-    "node_modules",
-    "__pycache__",
-    ".pytest_cache",
-    ".ruff_cache",
-    "dist",
-    "build",
-    "vulnbox-out",
-}
+IGNORED_DIRS = DEFAULT_SKIP_DIRS
 
 
 def _iter_repo_files(root: Path, max_depth: int = 4) -> list[Path]:

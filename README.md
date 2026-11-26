@@ -88,6 +88,29 @@ vulnbox-out/
     └── test_security_<id>.py     # (or security_<id>.test.mjs) permanent defensive tests
 ```
 
+## Python SDK & Plugin Extensibility
+
+`VulnBoxEngine` (`src/vulnbox/engine.py`) is decoupled from the Typer CLI and backed by a central [`PluginRegistry`](src/vulnbox/registry.py) supporting both runtime registration and third-party `importlib.metadata` entry points (`vulnbox.plugins`):
+
+```python
+from vulnbox import AnalysisContext, VulnBoxEngine, default_registry
+
+# Register custom analyzers, patchers, regression tests, probes, or reporters:
+@default_registry.register_patcher("MY-RULE-001")
+def patch_my_rule(finding, workspace_dir):
+    ...
+
+engine = VulnBoxEngine(backend="docker")
+report, artifacts = engine.remediate("/path/to/repo", out_dir="./vulnbox-out")
+```
+
+To distribute a third-party language or rule pack (e.g., Go, Java, OSV, OpenVEX), advertise an entry point in your package's `pyproject.toml`:
+
+```toml
+[project.entry-points."vulnbox.plugins"]
+my_pack = "my_vulnbox_pack:register"  # callable taking (registry: PluginRegistry) -> None
+```
+
 ## Agent Skill
 
 `vulnbox` ships as a portable Antigravity/Agent Skill at [`skills/vulnbox/SKILL.md`](skills/vulnbox/SKILL.md). To install it globally for Antigravity:

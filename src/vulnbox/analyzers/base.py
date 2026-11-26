@@ -6,20 +6,10 @@ import hashlib
 from pathlib import Path
 from typing import Protocol
 
+from vulnbox.constants import DEFAULT_SKIP_DIRS, is_test_or_fixture_path
 from vulnbox.models import Finding
 
-SKIP_DIRS = {
-    ".git",
-    ".venv",
-    "venv",
-    "node_modules",
-    "__pycache__",
-    ".pytest_cache",
-    ".ruff_cache",
-    "dist",
-    "build",
-    "vulnbox-out",
-}
+SKIP_DIRS = DEFAULT_SKIP_DIRS
 
 
 class Analyzer(Protocol):
@@ -50,23 +40,16 @@ def iter_source_files(
     extensions: tuple[str, ...],
     skip_tests: bool = True,
 ) -> list[Path]:
-    """Iterate source files with given extensions, skipping vendor and optional test dirs."""
+    """Iterate source files with given extensions, skipping vendor and optional test/fixture dirs."""
     matched: list[Path] = []
     for path in sorted(root.rglob("*")):
         if not path.is_file():
             continue
         rel = path.relative_to(root)
-        if any(part in SKIP_DIRS for part in rel.parts):
+        if any(part in DEFAULT_SKIP_DIRS for part in rel.parts):
             continue
-        if skip_tests:
-            if "tests" in rel.parts or "__tests__" in rel.parts:
-                continue
-            name_lower = path.name.lower()
-            if (
-                name_lower.startswith("test_")
-                or name_lower.endswith(("_test.py", ".test.js", ".test.mjs", ".test.ts", ".spec.js", ".spec.ts"))
-            ):
-                continue
+        if skip_tests and is_test_or_fixture_path(rel):
+            continue
         if path.suffix.lower() in extensions:
             matched.append(path)
     return matched

@@ -220,3 +220,34 @@ def cleanup_workspace(workspace_dir: str | Path) -> None:
     path = Path(workspace_dir).resolve()
     if path.exists() and path.is_dir():
         shutil.rmtree(path, ignore_errors=True)
+
+
+class ScrubbedWorkspace:
+    """Context manager guaranteeing creation and cleanup of a scrubbed sandbox workspace."""
+
+    def __init__(
+        self,
+        repo_path: str | Path,
+        dest_dir: str | Path | None = None,
+    ) -> None:
+        self._repo_path = Path(repo_path)
+        self._dest_dir = dest_dir
+        self._summary: ScrubSummary | None = None
+
+    @property
+    def summary(self) -> ScrubSummary:
+        if self._summary is None:
+            raise RuntimeError("ScrubbedWorkspace has not been entered")
+        return self._summary
+
+    @property
+    def path(self) -> Path:
+        return Path(self.summary.sandbox_dir)
+
+    def __enter__(self) -> ScrubbedWorkspace:
+        self._summary = create_scrubbed_workspace(self._repo_path, dest_dir=self._dest_dir)
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        if self._summary is not None:
+            cleanup_workspace(self._summary.sandbox_dir)

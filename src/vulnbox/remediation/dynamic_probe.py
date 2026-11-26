@@ -16,6 +16,7 @@ from vulnbox.models import (
     Finding,
     ProbeExpectation,
 )
+from vulnbox.registry import PluginRegistry, default_registry
 from vulnbox.sandbox.base import SandboxBackend, SandboxPolicy
 
 ALLOWED_LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
@@ -209,86 +210,100 @@ def load_probe_specs(probe_path: Path) -> list[DynamicProbeSpec]:
     return specs
 
 
-def infer_probe_for_finding(
-    finding: Finding,
-    workspace_dir: Path,
-) -> DynamicProbeSpec | None:
-    """Infer a safe, deterministic loopback HTTP probe for supported findings."""
+def _read_finding_source(finding: Finding, workspace_dir: Path) -> str | None:
     target_file = workspace_dir / finding.file_path
     if not target_file.is_file():
         return None
-    source = target_file.read_text(encoding="utf-8", errors="ignore")
+    return target_file.read_text(encoding="utf-8", errors="ignore")
 
-    if finding.rule_id == "PY-YAML-001" and "/parse" in source:
-        return DynamicProbeSpec(
-            probe_id=f"probe-{finding.finding_id}",
-            finding_id=finding.finding_id,
-            rule_id=finding.rule_id,
-            description=(
-                "Send benign Python-tagged YAML ('!!python/tuple [1, 2]') to POST /parse "
-                "to prove non-safe YAML loader acceptance pre-patch and rejection (HTTP 400) post-patch."
-            ),
-            method="POST",
-            path="/parse",
-            headers={"Content-Type": "text/plain"},
-            body="!!python/tuple [1, 2]",
-            vulnerable_expectation=ProbeExpectation(status_codes=[200]),
-            fixed_expectation=ProbeExpectation(status_codes=[400, 422]),
-        )
 
-    if finding.rule_id in ("PY-PATH-001", "JS-PATH-001") and "/files" in source:
-        marker_name = "vulnbox_boundary_marker.txt"
-        marker_val = "VULNBOX_BOUNDARY_MARKER_9F3A"
-        return DynamicProbeSpec(
-            probe_id=f"probe-{finding.finding_id}",
-            finding_id=finding.finding_id,
-            rule_id=finding.rule_id,
-            description=(
-                "Request a synthetic sibling boundary marker outside the configured public directory "
-                "via GET /files?name=../vulnbox_boundary_marker.txt to verify path confinement."
-            ),
-            method="GET",
-            path=f"/files?name=../{marker_name}",
-            setup_marker_file=marker_name,
-            setup_marker_content=marker_val,
-            vulnerable_expectation=ProbeExpectation(
-                status_codes=[200],
-                body_contains=[marker_val],
-            ),
-            fixed_expectation=ProbeExpectation(
-                status_codes=[400, 403, 404],
-                body_not_contains=[marker_val],
-            ),
-        )
+@default_registry.register_probe("PY-YAML-001")
+def _probe_py_yaml(finding: Finding, workspace_dir: Path) -> DynamicProbeSpec | None:
+    source = _read_finding_source(finding, workspace_dir)
+    if not source or "/parse" not in source:
+        return None
+    return DynamicProbeSpec(
+        probe_id=f"probe-{finding.finding_id}",
+        finding_id=finding.finding_id,
+        rule_id=finding.rule_id,
+        description=(
+            "Send benign Python-tagged YAML ('!!python/tuple [1, 2]') to POST /parse "
+            "to prove non-safe YAML loader acceptance pre-patch and rejection (HTTP 400) post-patch."
+        ),
+        method="POST",
+        path="/parse",
+        headers={"Content-Type": "text/plain"},
+        body="!!python/tuple [1, 2]",
+        vulnerable_expectation=ProbeExpectation(status_codes=[200]),
+        fixed_expectation=ProbeExpectation(status_codes=[400, 422]),
+    )
 
-    if finding.rule_id == "JS-CORS-001" and ("/api/data" in source or "/health" in source):
-        route = "/api/data" if "/api/data" in source else "/health"
-        return DynamicProbeSpec(
-            probe_id=f"probe-{finding.finding_id}",
-            finding_id=finding.finding_id,
-            rule_id=finding.rule_id,
-            description=(
-                f"Send GET {route} with untrusted Origin header to verify permissive "
-                "Access-Control-Allow-Origin + Access-Control-Allow-Credentials reflection."
-            ),
-            method="GET",
-            path=route,
-            headers={"Origin": "https://untrusted.example"},
-            vulnerable_expectation=ProbeExpectation(
-                status_codes=[200],
-                headers_contain={
-                    "access-control-allow-credentials": "true",
-                },
-            ),
-            fixed_expectation=ProbeExpectation(
-                status_codes=[200],
-                headers_not_contain={
-                    "access-control-allow-origin": "https://untrusted.example",
-                },
-            ),
-        )
 
-    return None
+@default_registry.register_probe("PY-PATH-001", "JS-PATH-001")
+def _probe_path_confinement(finding: Finding, workspace_dir: Path) -> DynamicProbeSpec | None:
+    source = _read_finding_source(finding, workspace_dir)
+    if not source or "/files" not in source:
+        return None
+    marker_name = "vulnbox_boundary_marker.txt"
+    marker_val = "VULNBOX_BOUNDARY_MARKER_9F3A"
+    return DynamicProbeSpec(
+        probe_id=f"probe-{finding.finding_id}",
+        finding_id=finding.finding_id,
+        rule_id=finding.rule_id,
+        description=(
+            "Request a synthetic sibling boundary marker outside the configured public directory "
+            "via GET /files?name=../vulnbox_boundary_marker.txt to verify path confinement."
+        ),
+        method="GET",
+        path=f"/files?name=../{marker_name}",
+        setup_marker_file=marker_name,
+        setup_marker_content=marker_val,
+        vulnerable_expectation=ProbeExpectation(status_codes=[200], body_contains=[marker_val]),
+        fixed_expectation=ProbeExpectation(
+            status_codes=[400, 403, 404], body_not_contains=[marker_val]
+        ),
+    )
+
+
+@default_registry.register_probe("JS-CORS-001")
+def _probe_js_cors(finding: Finding, workspace_dir: Path) -> DynamicProbeSpec | None:
+    source = _read_finding_source(finding, workspace_dir)
+    if not source or ("/api/data" not in source and "/health" not in source):
+        return None
+    route = "/api/data" if "/api/data" in source else "/health"
+    return DynamicProbeSpec(
+        probe_id=f"probe-{finding.finding_id}",
+        finding_id=finding.finding_id,
+        rule_id=finding.rule_id,
+        description=(
+            f"Send GET {route} with untrusted Origin header to verify permissive "
+            "Access-Control-Allow-Origin + Access-Control-Allow-Credentials reflection."
+        ),
+        method="GET",
+        path=route,
+        headers={"Origin": "https://untrusted.example"},
+        vulnerable_expectation=ProbeExpectation(
+            status_codes=[200],
+            headers_contain={"access-control-allow-credentials": "true"},
+        ),
+        fixed_expectation=ProbeExpectation(
+            status_codes=[200],
+            headers_not_contain={"access-control-allow-origin": "https://untrusted.example"},
+        ),
+    )
+
+
+def infer_probe_for_finding(
+    finding: Finding,
+    workspace_dir: Path,
+    registry: PluginRegistry | None = None,
+) -> DynamicProbeSpec | None:
+    """Dispatch loopback active probe inference via the plugin registry."""
+    reg = registry or default_registry
+    inferrer = reg.get_probe_inferrer(finding)
+    if inferrer is None:
+        return None
+    return inferrer(finding, workspace_dir)
 
 
 def _matches_cors_vulnerable(spec: DynamicProbeSpec, res_headers: dict[str, str]) -> bool:

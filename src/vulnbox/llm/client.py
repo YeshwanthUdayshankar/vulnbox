@@ -9,8 +9,33 @@ import urllib.error
 import urllib.request
 from collections.abc import Callable
 from typing import Any
+from urllib.parse import urlparse
 
 from pydantic import BaseModel
+
+BLOCKED_LLM_METADATA_HOSTS = frozenset(
+    {
+        "169.254.169.254",
+        "169.254.170.2",
+        "metadata.google.internal",
+        "metadata.goog",
+        "fd00:ec2::254",
+    }
+)
+
+
+def validate_llm_base_url(url: str) -> None:
+    """Reject non-HTTP(S) schemes (e.g. file://) and cloud metadata SSRF hosts."""
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError(
+            f"Unsupported LLM base URL scheme {parsed.scheme!r}; only 'http' and 'https' are allowed."
+        )
+    host = (parsed.hostname or "").lower()
+    if not host:
+        raise ValueError(f"LLM base URL is missing a hostname: {url!r}")
+    if host in BLOCKED_LLM_METADATA_HOSTS or host.startswith("169.254."):
+        raise ValueError(f"Refusing LLM base URL pointing to link-local/metadata host: {host!r}")
 
 PROVIDER_DEFAULTS: dict[str, tuple[str, str, str | None]] = {
     # provider: (base_url, default_model, api_key_env)
@@ -101,7 +126,9 @@ class OpenAICompatLLMClient:
                 raise RuntimeError("Mock provider requires a mock_handler callback")
             return self.mock_handler(system_prompt, user_prompt, self._call_count)
 
-        url = f"{self.config.resolved_base_url()}/chat/completions"
+        base_url = self.config.resolved_base_url()
+        validate_llm_base_url(base_url)
+        url = f"{base_url}/chat/completions"
         headers = {"Content-Type": "application/json"}
         api_key = self.config.resolved_api_key()
         if api_key:

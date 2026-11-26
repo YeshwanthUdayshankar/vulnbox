@@ -1,0 +1,156 @@
+"""Extensible plugin registry for analyzers, patchers, regression tests, probes, and reporters."""
+
+from __future__ import annotations
+
+import importlib.metadata
+from collections.abc import Callable
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Protocol, runtime_checkable
+
+from vulnbox.models import (
+    AuditReport,
+    DynamicProbeSpec,
+    Finding,
+    PatchCandidate,
+    RepoProfile,
+    ScrubSummary,
+)
+
+
+@dataclass(frozen=True)
+class AnalysisContext:
+    """Uniform context passed to every registered analyzer."""
+
+    workspace_dir: Path
+    profile: RepoProfile | None = None
+    scrub_summary: ScrubSummary | None = None
+    advisories_path: Path | None = None
+
+
+@runtime_checkable
+class AnalyzerPlugin(Protocol):
+    """Protocol implemented by built-in and third-party security analyzers."""
+
+    name: str
+
+    def run(self, ctx: AnalysisContext) -> list[Finding]: ...
+
+
+@runtime_checkable
+class ReporterPlugin(Protocol):
+    """Protocol implemented by built-in and third-party report exporters."""
+
+    name: str
+
+    def write(self, report: AuditReport, out_dir: Path) -> Path: ...
+
+
+PatcherFn = Callable[[Finding, Path], PatchCandidate | None]
+RegressionTestFn = Callable[[Finding], tuple[str, str] | None]
+ProbeInferFn = Callable[[Finding, Path], DynamicProbeSpec | None]
+
+
+class PluginRegistry:
+    """Central extensible registry supporting decorators and pip entry_points discovery."""
+
+    def __init__(self) -> None:
+        self._analyzers: dict[str, AnalyzerPlugin] = {}
+        self._patchers: dict[str, PatcherFn] = {}
+        self._category_patchers: dict[str, PatcherFn] = {}
+        self._regression_tests: dict[str, RegressionTestFn] = {}
+        self._category_regression_tests: dict[str, RegressionTestFn] = {}
+        self._probes: dict[str, ProbeInferFn] = {}
+        self._reporters: dict[str, ReporterPlugin] = {}
+        self._entry_points_loaded: bool = False
+
+    # --- Analyzers ---
+
+    def register_analyzer(self, analyzer: AnalyzerPlugin) -> AnalyzerPlugin:
+        self._analyzers[analyzer.name] = analyzer
+        return analyzer
+
+    def list_analyzers(self) -> list[AnalyzerPlugin]:
+        return list(self._analyzers.values())
+
+    # --- Patchers ---
+
+    def register_patcher(
+        self,
+        *rule_ids: str,
+        category: str | None = None,
+    ) -> Callable[[PatcherFn], PatcherFn]:
+        def _decorator(fn: PatcherFn) -> PatcherFn:
+            for rid in rule_ids:
+                self._patchers[rid] = fn
+            if category is not None:
+                self._category_patchers[category] = fn
+            return fn
+
+        return _decorator
+
+    def get_patcher(self, finding: Finding) -> PatcherFn | None:
+        return self._patchers.get(finding.rule_id) or self._category_patchers.get(
+            finding.category
+        )
+
+    # --- Regression Test Generators ---
+
+    def register_regression_test(
+        self,
+        *rule_ids: str,
+        category: str | None = None,
+    ) -> Callable[[RegressionTestFn], RegressionTestFn]:
+        def _decorator(fn: RegressionTestFn) -> RegressionTestFn:
+            for rid in rule_ids:
+                self._regression_tests[rid] = fn
+            if category is not None:
+                self._category_regression_tests[category] = fn
+            return fn
+
+        return _decorator
+
+    def get_regression_test_generator(self, finding: Finding) -> RegressionTestFn | None:
+        return self._regression_tests.get(
+            finding.rule_id
+        ) or self._category_regression_tests.get(finding.category)
+
+    # --- Active Dynamic Probe Inference ---
+
+    def register_probe(self, *rule_ids: str) -> Callable[[ProbeInferFn], ProbeInferFn]:
+        def _decorator(fn: ProbeInferFn) -> ProbeInferFn:
+            for rid in rule_ids:
+                self._probes[rid] = fn
+            return fn
+
+        return _decorator
+
+    def get_probe_inferrer(self, finding: Finding) -> ProbeInferFn | None:
+        return self._probes.get(finding.rule_id)
+
+    # --- Reporters ---
+
+    def register_reporter(self, reporter: ReporterPlugin) -> ReporterPlugin:
+        self._reporters[reporter.name] = reporter
+        return reporter
+
+    def list_reporters(self) -> list[ReporterPlugin]:
+        return list(self._reporters.values())
+
+    # --- Third-party entry_points discovery ---
+
+    def load_entry_point_plugins(self, group: str = "vulnbox.plugins") -> list[str]:
+        """Discover and invoke installed third-party plugin hooks once."""
+        if self._entry_points_loaded:
+            return []
+        self._entry_points_loaded = True
+        loaded: list[str] = []
+        for ep in importlib.metadata.entry_points(group=group):
+            registrar = ep.load()
+            if callable(registrar):
+                registrar(self)
+                loaded.append(ep.name)
+        return loaded
+
+
+default_registry = PluginRegistry()

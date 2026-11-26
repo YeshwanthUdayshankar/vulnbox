@@ -1,11 +1,10 @@
-"""Typer CLI for VulnBox."""
+"""Thin Typer CLI presentation layer delegating orchestration to VulnBoxEngine."""
 
 from __future__ import annotations
 
 import json
 import shutil
 import sys
-from datetime import UTC, datetime
 from pathlib import Path
 
 import typer
@@ -13,26 +12,10 @@ from rich.console import Console
 from rich.table import Table
 
 from vulnbox import __version__
-from vulnbox.analyzers import run_all_analyzers
-from vulnbox.llm import (
-    GuardrailPolicy,
-    LLMConfig,
-    OpenAICompatLLMClient,
-    synthesize_and_verify_patch,
-)
-from vulnbox.models import AuditReport, GuardrailEvent, PatchCandidate
-from vulnbox.profiler import profile_repo
-from vulnbox.remediation import (
-    generate_patch_for_finding,
-    generate_regression_test,
-    infer_probe_for_finding,
-    load_probe_specs,
-    run_dynamic_probe,
-    verify_patch,
-)
-from vulnbox.reporting import write_report_bundle
-from vulnbox.sandbox import DockerSandboxBackend, LocalSandboxBackend, select_backend
-from vulnbox.scrubber import cleanup_workspace, create_scrubbed_workspace
+from vulnbox.engine import VulnBoxEngine
+from vulnbox.llm import GuardrailPolicy, LLMConfig
+from vulnbox.remediation import load_probe_specs
+from vulnbox.sandbox import DockerSandboxBackend, LocalSandboxBackend
 
 app = typer.Typer(
     name="vulnbox",
@@ -42,15 +25,10 @@ app = typer.Typer(
 console = Console()
 
 
-def _utc_now() -> str:
-    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
 @app.command()
 def doctor() -> None:
     """Check local toolchains, curl, and Docker/local sandbox readiness."""
-    docker_be = DockerSandboxBackend()
-    docker_ok = docker_be.is_available()
+    docker_ok = DockerSandboxBackend().is_available()
     local_ok = LocalSandboxBackend().is_available()
 
     table = Table(title=f"VulnBox v{__version__} Environment Check")
@@ -76,7 +54,7 @@ def profile(
     as_json: bool = typer.Option(False, "--json", help="Print JSON output"),
 ) -> None:
     """Profile a repository (ecosystem, manifests, test commands, runnable start command)."""
-    prof = profile_repo(repo)
+    prof = VulnBoxEngine(backend="local").profile(repo)
     if as_json:
         typer.echo(prof.model_dump_json(indent=2))
         return
@@ -104,25 +82,10 @@ def scan(
     out: Path = typer.Option(Path("vulnbox-out"), "--out", help="Output directory for report bundle"),
 ) -> None:
     """Scrub a repository and run SAST, config hygiene, and dependency reachability analysis."""
-    be = select_backend(backend)
-    prof = profile_repo(repo)
-    scrub = create_scrubbed_workspace(repo)
-    ws = Path(scrub.sandbox_dir)
-    try:
-        findings = run_all_analyzers(ws, scrub_summary=scrub, advisories_path=advisories)
-        report = AuditReport(
-            tool_version=__version__,
-            timestamp=_utc_now(),
-            sandbox_backend=be.name,
-            profile=prof,
-            scrub_summary=scrub,
-            findings=findings,
-        )
-        written = write_report_bundle(report, out)
-    finally:
-        cleanup_workspace(ws)
+    engine = VulnBoxEngine(backend=backend)
+    report, written = engine.scan(repo, advisories_path=advisories, out_dir=out)
 
-    console.print(f"[bold]Scan complete[/bold]: {len(findings)} findings found.")
+    console.print(f"[bold]Scan complete[/bold]: {len(report.findings)} findings found.")
     console.print(f"Markdown report: {written['markdown']}")
     console.print(f"SARIF 2.1.0:     {written['sarif']}")
 
@@ -136,36 +99,24 @@ def probe(
     backend: str = typer.Option("auto", "--backend", help="Sandbox backend: auto, docker, local"),
 ) -> None:
     """Start the repo inside a scrubbed sandbox on 127.0.0.1 and run active curl probes."""
-    be = select_backend(backend)
-    prof = profile_repo(repo)
-    effective_start = start_cmd or prof.start_command
-    if not effective_start:
-        console.print("[red]No runnable server start command detected. Pass --start-cmd.[/red]")
-        raise typer.Exit(code=2)
-
+    engine = VulnBoxEngine(backend=backend)
     specs = load_probe_specs(probe_file)
-    scrub = create_scrubbed_workspace(repo)
-    ws = Path(scrub.sandbox_dir)
-    any_error = False
     try:
-        for spec in specs:
-            res = run_dynamic_probe(
-                ws,
-                backend=be,
-                start_cmd=effective_start,
-                spec=spec,
-                health_path=health_path or prof.health_path,
-            )
-            console.print(f"[bold]Probe:[/bold] {res.probe_id}")
-            console.print(f"  curl: {res.curl_command}")
-            console.print(
-                f"  HTTP {res.status_code} | matched_vulnerable={res.matched_vulnerable} | matched_fixed={res.matched_fixed}"
-            )
-            if res.error:
-                console.print(f"  [red]error: {res.error}[/red]")
-                any_error = True
-    finally:
-        cleanup_workspace(ws)
+        results = engine.probe(repo, specs=specs, start_cmd=start_cmd, health_path=health_path)
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=2) from exc
+
+    any_error = False
+    for res in results:
+        console.print(f"[bold]Probe:[/bold] {res.probe_id}")
+        console.print(f"  curl: {res.curl_command}")
+        console.print(
+            f"  HTTP {res.status_code} | matched_vulnerable={res.matched_vulnerable} | matched_fixed={res.matched_fixed}"
+        )
+        if res.error:
+            console.print(f"  [red]error: {res.error}[/red]")
+            any_error = True
 
     if any_error:
         raise typer.Exit(code=1)
@@ -187,109 +138,27 @@ def remediate(
     out: Path = typer.Option(Path("vulnbox-out"), "--out", help="Output directory for report bundle"),
 ) -> None:
     """Run full end-to-end sandbox scan, active pre/post curl probing, patching, and dual verification."""
-    be = select_backend(backend)
-    prof = profile_repo(repo)
+    engine = VulnBoxEngine(backend=backend)
     custom_probes = load_probe_specs(probe_file) if probe_file else []
-
     llm_cfg = LLMConfig(provider=llm_provider, model=llm_model, base_url=llm_base_url) if llm else None
-    llm_client = OpenAICompatLLMClient(llm_cfg) if llm_cfg else None
-    guardrail_policy = GuardrailPolicy(max_retries=llm_max_retries)
-    guardrail_events: list[GuardrailEvent] = []
 
-    scrub = create_scrubbed_workspace(repo)
-    ws = Path(scrub.sandbox_dir)
-    patches: list[PatchCandidate] = []
-    verifications = []
-    unpatched_findings = []
-
-    try:
-        findings = run_all_analyzers(ws, scrub_summary=scrub, advisories_path=advisories)
-        for f in findings:
-            patch = generate_patch_for_finding(f, ws)
-            if patch is None:
-                if f.category != "secret":
-                    unpatched_findings.append(f)
-                continue
-            reg = generate_regression_test(f)
-            if reg:
-                patch.regression_test_path, patch.regression_test_code = reg
-
-            matched_probe = next(
-                (p for p in custom_probes if p.finding_id == f.finding_id or p.rule_id == f.rule_id),
-                None,
-            )
-            if matched_probe is None:
-                matched_probe = infer_probe_for_finding(f, ws)
-            patch.probe_spec = matched_probe
-            patches.append(patch)
-
-        # Optional guarded LLM synthesis for findings without deterministic auto-patches
-        if llm_client is not None and unpatched_findings:
-            for f in unpatched_findings:
-                matched_probe = next(
-                    (p for p in custom_probes if p.finding_id == f.finding_id or p.rule_id == f.rule_id),
-                    None,
-                )
-                cand, ver, evs = synthesize_and_verify_patch(
-                    repo_path=repo,
-                    workspace_dir=ws,
-                    profile=prof,
-                    finding=f,
-                    backend=be,
-                    client=llm_client,
-                    policy=guardrail_policy,
-                    probe_spec=matched_probe,
-                    start_cmd=start_cmd,
-                    health_path=health_path,
-                    advisories_path=advisories,
-                )
-                guardrail_events.extend(evs)
-                if cand is not None:
-                    patches.append(cand)
-                if ver is not None:
-                    verifications.append(ver)
-    finally:
-        cleanup_workspace(ws)
-
-    finding_map = {f.finding_id: f for f in findings}
-    already_verified_ids = {v.finding_id for v in verifications}
-    for patch in patches:
-        if patch.finding_id in already_verified_ids:
-            continue
-        ver = verify_patch(
-            repo_path=repo,
-            profile=prof,
-            patch=patch,
-            backend=be,
-            finding=finding_map.get(patch.finding_id),
-            probe_spec=patch.probe_spec,
-            start_cmd=start_cmd,
-            health_path=health_path,
-            advisories_path=advisories,
-        )
-        verifications.append(ver)
-
-    report = AuditReport(
-        tool_version=__version__,
-        timestamp=_utc_now(),
-        sandbox_backend=be.name,
-        profile=prof,
-        scrub_summary=scrub,
-        findings=findings,
-        patches=patches,
-        verifications=verifications,
-        llm_enabled=llm,
-        llm_model=llm_cfg.resolved_model() if llm_cfg else None,
-        guardrail_events=guardrail_events,
+    report, written = engine.remediate(
+        repo_path=repo,
+        start_cmd=start_cmd,
+        health_path=health_path,
+        custom_probes=custom_probes,
+        advisories_path=advisories,
+        llm_config=llm_cfg,
+        guardrail_policy=GuardrailPolicy(max_retries=llm_max_retries),
+        out_dir=out,
     )
-    written = write_report_bundle(report, out)
 
-    verified_count = sum(1 for v in verifications if v.verified)
-    active_count = sum(1 for v in verifications if v.dynamic_confirmed_and_fixed is True)
-    blocked_count = sum(1 for g in guardrail_events if g.decision == "block")
+    verified_count = sum(1 for v in report.verifications if v.verified)
+    active_count = sum(1 for v in report.verifications if v.dynamic_confirmed_and_fixed is True)
+    blocked_count = sum(1 for g in report.guardrail_events if g.decision == "block")
     console.print(
         f"[bold green]Remediation bundle complete[/bold green]: "
-        f"{len(findings)} findings, {verified_count}/{len(patches)} verified patches, "
+        f"{len(report.findings)} findings, {verified_count}/{len(report.patches)} verified patches, "
         f"{active_count} actively confirmed & fixed via live curl probe"
         + (f", {blocked_count} guardrail blocks." if llm else ".")
     )
@@ -312,37 +181,23 @@ def verify_patch_cmd(
     as_json: bool = typer.Option(False, "--json", help="Emit JSON result"),
 ) -> None:
     """Verify an external or agent-authored patch inside a scrubbed sandbox (exit 0 iff verified)."""
-    be = select_backend(backend)
-    prof = profile_repo(repo)
+    engine = VulnBoxEngine(backend=backend)
     diff_text = patch_file.read_text(encoding="utf-8")
-
-    reg_path: str | None = None
-    reg_code: str | None = None
-    if test_file:
-        reg_path = f"tests/{test_file.name}"
-        reg_code = test_file.read_text(encoding="utf-8")
-
+    reg_path = f"tests/{test_file.name}" if test_file else None
+    reg_code = test_file.read_text(encoding="utf-8") if test_file else None
     probe_spec = load_probe_specs(probe_file)[0] if probe_file else None
-    candidate = PatchCandidate(
-        patch_id=f"patch-{finding_id}",
+
+    result = engine.verify_external_patch(
+        repo_path=repo,
+        unified_diff=diff_text,
         finding_id=finding_id,
         rule_id=rule_id,
-        strategy="agent_supplied",
-        description=f"External patch from {patch_file.name}",
-        unified_diff=diff_text,
         regression_test_path=reg_path,
         regression_test_code=reg_code,
         probe_spec=probe_spec,
-    )
-
-    result = verify_patch(
-        repo_path=repo,
-        profile=prof,
-        patch=candidate,
-        backend=be,
-        probe_spec=probe_spec,
         start_cmd=start_cmd,
         health_path=health_path,
+        description=f"External patch from {patch_file.name}",
     )
 
     if as_json:

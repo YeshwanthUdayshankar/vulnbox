@@ -1,4 +1,4 @@
-"""Output artifact bundle writer (Markdown + SARIF 2.1.0 + unified diffs + regression tests)."""
+"""Registry-backed report bundle writer (SARIF 2.1.0, Markdown, JSON manifest, diffs, tests)."""
 
 from __future__ import annotations
 
@@ -6,12 +6,59 @@ import json
 from pathlib import Path
 
 from vulnbox.models import AuditReport
+from vulnbox.registry import PluginRegistry, default_registry
 from vulnbox.reporting.markdown import render_markdown_report
 from vulnbox.reporting.sarif import build_sarif, validate_sarif
 
 
-def write_report_bundle(report: AuditReport, out_dir: Path) -> dict[str, Path]:
-    """Write report.md, validated findings.sarif.json, manifest.json, patches/, and regression_tests/."""
+class SarifReporter:
+    name = "sarif"
+
+    def write(self, report: AuditReport, out_dir: Path) -> Path:
+        sarif_doc = build_sarif(report)
+        validate_sarif(sarif_doc)
+        path = out_dir / "findings.sarif.json"
+        path.write_text(json.dumps(sarif_doc, indent=2) + "\n", encoding="utf-8")
+        return path
+
+
+class MarkdownReporter:
+    name = "markdown"
+
+    def write(self, report: AuditReport, out_dir: Path) -> Path:
+        path = out_dir / "report.md"
+        path.write_text(render_markdown_report(report), encoding="utf-8")
+        return path
+
+
+class JsonManifestReporter:
+    name = "manifest"
+
+    def write(self, report: AuditReport, out_dir: Path) -> Path:
+        path = out_dir / "manifest.json"
+        path.write_text(report.model_dump_json(indent=2) + "\n", encoding="utf-8")
+        return path
+
+
+def register_builtin_reporters(registry: PluginRegistry = default_registry) -> None:
+    registry.register_reporter(SarifReporter())
+    registry.register_reporter(MarkdownReporter())
+    registry.register_reporter(JsonManifestReporter())
+
+
+register_builtin_reporters(default_registry)
+
+
+def write_report_bundle(
+    report: AuditReport,
+    out_dir: Path,
+    registry: PluginRegistry | None = None,
+) -> dict[str, Path]:
+    """Write all registered reporter outputs plus verified patches and regression tests."""
+    reg = registry or default_registry
+    if reg is default_registry:
+        reg.load_entry_point_plugins()
+
     root = Path(out_dir).resolve()
     root.mkdir(parents=True, exist_ok=True)
     patches_dir = root / "patches"
@@ -20,25 +67,9 @@ def write_report_bundle(report: AuditReport, out_dir: Path) -> dict[str, Path]:
     reg_dir.mkdir(exist_ok=True)
 
     written: dict[str, Path] = {}
+    for reporter in reg.list_reporters():
+        written[reporter.name] = reporter.write(report, root)
 
-    # 1. SARIF 2.1.0 (deterministically schema-validated before writing)
-    sarif_doc = build_sarif(report)
-    validate_sarif(sarif_doc)
-    sarif_path = root / "findings.sarif.json"
-    sarif_path.write_text(json.dumps(sarif_doc, indent=2) + "\n", encoding="utf-8")
-    written["sarif"] = sarif_path
-
-    # 2. Markdown report
-    md_path = root / "report.md"
-    md_path.write_text(render_markdown_report(report), encoding="utf-8")
-    written["markdown"] = md_path
-
-    # 3. Full JSON manifest
-    manifest_path = root / "manifest.json"
-    manifest_path.write_text(report.model_dump_json(indent=2) + "\n", encoding="utf-8")
-    written["manifest"] = manifest_path
-
-    # 4. Patches & regression tests
     for patch in report.patches:
         pfile = patches_dir / f"{patch.finding_id}.patch"
         pfile.write_text(patch.unified_diff, encoding="utf-8")

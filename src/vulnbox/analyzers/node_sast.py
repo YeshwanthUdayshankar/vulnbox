@@ -47,6 +47,9 @@ class NodeSASTAnalyzer:
             lines = source.splitlines()
 
             for idx, line in enumerate(lines, start=1):
+                stripped = line.lstrip()
+                if stripped.startswith(("//", "/*", "*")):
+                    continue
                 if CMD_EXEC_RE.search(line):
                     findings.append(
                         Finding(

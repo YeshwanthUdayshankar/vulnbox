@@ -46,6 +46,7 @@ class ScrubSummary(BaseModel):
     files_scrubbed: list[str] = Field(default_factory=list)
     secrets_redacted: int = 0
     excluded_paths: list[str] = Field(default_factory=list)
+    env_classifications: dict[str, str] = Field(default_factory=dict)
 
 
 class Finding(BaseModel):

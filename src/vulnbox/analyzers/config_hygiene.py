@@ -15,6 +15,10 @@ ENV_SECRET_RE = re.compile(
     re.IGNORECASE,
 )
 ADD_URL_RE = re.compile(r"^\s*ADD\s+https?://", re.IGNORECASE)
+PIPE_TO_SHELL_RE = re.compile(
+    r"\b(?:curl|wget)\b[^|\n]*\|\s*(?:sudo\s+)?(?:ba|z|da)?sh\b",
+    re.IGNORECASE,
+)
 CHMOD_777_RE = re.compile(r"\bchmod\s+(?:-R\s+)?0?777\b|0o777")
 
 
@@ -48,21 +52,45 @@ class ConfigHygieneAnalyzer:
             for rel_file in scrub_summary.files_scrubbed:
                 fname = Path(rel_file).name
                 if fname.lower().startswith(".env") or fname.lower().endswith((".pem", ".key")):
+                    env_cls = scrub_summary.env_classifications.get(rel_file, "real_secret")
+                    if fname.lower().startswith(".env") and env_cls == "public_only":
+                        sev = "low"
+                        title = "Public-Only Environment File Present in Repository"
+                        msg = (
+                            f"Environment file '{rel_file}' contains only non-secret/public keys "
+                            "(e.g. VITE_*/local URLs) and was scrubbed before sandbox execution."
+                        )
+                        rec = "Verify no private credentials are added to this file; prefer .env.example for shared defaults."
+                    elif fname.lower().startswith(".env") and env_cls == "template_placeholder":
+                        sev = "medium"
+                        title = "Environment File with Placeholder Secrets Present in Repository"
+                        msg = (
+                            f"Environment file '{rel_file}' contains placeholder secret values (e.g. 'changethis') "
+                            "and was scrubbed before sandbox execution."
+                        )
+                        rec = "Rename to .env.example and add .env to .gitignore so real deployment secrets are never committed."
+                    else:
+                        sev = "high"
+                        title = "Sensitive Environment or Key File Present in Repository"
+                        msg = f"Sensitive file '{rel_file}' was present in the repository and scrubbed before sandbox execution."
+                        rec = "Remove real secret files from version control, add them to .gitignore, and provide a sanitized .env.example instead."
+
                     findings.append(
                         Finding(
                             finding_id=make_finding_id("CFG-SECRET-001", rel_file, 1),
                             rule_id="CFG-SECRET-001",
                             cwe_id="CWE-798",
-                            title="Sensitive Environment or Key File Present in Repository",
+                            title=title,
                             category="secret",
-                            severity="high",
+                            severity=sev,  # type: ignore[arg-type]
                             file_path=rel_file,
                             start_line=1,
                             end_line=1,
-                            snippet=f"{rel_file} (scrubbed before sandbox execution)",
-                            message=f"Sensitive file '{rel_file}' was present in the repository and scrubbed before sandbox execution.",
+                            snippet=f"{rel_file} (scrubbed before sandbox execution; classification={env_cls})",
+                            message=msg,
                             reachability="not_applicable",
-                            recommended_fix="Remove real secret files from version control, add them to .gitignore, and provide a sanitized .env.example instead.",
+                            recommended_fix=rec,
+                            metadata={"env_classification": env_cls},
                         )
                     )
                 else:
@@ -157,6 +185,24 @@ class ConfigHygieneAnalyzer:
                         snippet=extract_snippet(lines, idx, idx),
                         message="ADD with remote URLs bypasses checksum verification.",
                         recommended_fix="Use curl/wget with checksum verification inside a RUN step or COPY local artifacts.",
+                    )
+                )
+
+            if PIPE_TO_SHELL_RE.search(line):
+                findings.append(
+                    Finding(
+                        finding_id=make_finding_id("CFG-DOCKER-005", rel, idx),
+                        rule_id="CFG-DOCKER-005",
+                        cwe_id="CWE-494",
+                        title="Unverified Remote Script Piped Directly to Shell",
+                        category="config",
+                        severity="high",
+                        file_path=rel,
+                        start_line=idx,
+                        end_line=idx,
+                        snippet=extract_snippet(lines, idx, idx),
+                        message="Piping curl/wget output directly into sh/bash executes unverified remote code during container build.",
+                        recommended_fix="Install via a pinned package manager, official multi-stage COPY --from=<pinned-image>, or download and verify a SHA256 checksum before executing.",
                     )
                 )
 

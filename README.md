@@ -44,6 +44,7 @@ All three bundled sample repositories were tested end-to-end inside the hardened
 | [`tests/fixtures/py_sample_app`](tests/fixtures/py_sample_app) | Deterministic (`--backend docker`) | 8 | 7 / 7 | 2 (`PY-YAML-001`, `PY-PATH-001`) | [docs/sample-run-python.md](docs/sample-run-python.md) |
 | [`tests/fixtures/node_sample_app`](tests/fixtures/node_sample_app) | Deterministic (`--backend docker`) | 5 | 5 / 5 | 2 (`JS-PATH-001`, `JS-CORS-001`) | [docs/sample-run-node.md](docs/sample-run-node.md) |
 | [`tests/fixtures/llm_sql_app`](tests/fixtures/llm_sql_app) | Guarded LLM (`--llm` Ollama `qwen2.5:7b` + Docker) | 1 | 1 / 1 | 1 (`PY-SQL-001` + prompt-injection guardrail) | [docs/sample-run-llm-ollama.md](docs/sample-run-llm-ollama.md) |
+| Public Benchmarks (`fastapi/full-stack-fastapi-template`, `OWASP/NodeGoat`) | Real-World Precision & Recall (`scan`) | 5 / 5 | — | Triage + Gap Analysis | [docs/benchmark-public-repos.md](docs/benchmark-public-repos.md) |
 
 ## Optional Guarded LLM Mode (`--llm`)
 

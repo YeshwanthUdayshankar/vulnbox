@@ -45,9 +45,9 @@ def _detect_python_details(
     start_cmd: str | None = None
 
     rel_map = {str(p.relative_to(root)): p for p in files}
-    for name in ("pyproject.toml", "requirements.txt", "setup.py", "Pipfile"):
-        if name in rel_map:
-            manifests.append(name)
+    for rel, p in rel_map.items():
+        if p.name in ("pyproject.toml", "requirements.txt", "setup.py", "Pipfile", "uv.lock"):
+            manifests.append(rel)
 
     py_files = [p for p in files if p.suffix == ".py"]
     if not manifests and not py_files:
@@ -55,6 +55,8 @@ def _detect_python_details(
 
     combined_manifest_text = ""
     for m in manifests:
+        if m.endswith("uv.lock"):
+            continue
         try:
             combined_manifest_text += rel_map[m].read_text(encoding="utf-8", errors="ignore") + "\n"
         except OSError:
@@ -65,14 +67,21 @@ def _detect_python_details(
         if fw in lower_manifest:
             frameworks.append(fw)
 
-    has_tests_dir = (root / "tests").is_dir() or any(
-        p.name.startswith("test_") for p in py_files
-    )
+    has_tests_dir = any(
+        (root / d).is_dir() for d in ("tests", "backend/tests")
+    ) or any(p.name.startswith("test_") for p in py_files)
     if has_tests_dir:
         test_cmd = "python3 -m pytest -q"
 
     # Detect runnable entrypoint for active loopback verification
-    for candidate in ("app.py", "server.py", "main.py", "src/app.py", "src/server.py"):
+    for candidate in (
+        "app.py",
+        "server.py",
+        "main.py",
+        "src/app.py",
+        "src/server.py",
+        "backend/app/main.py",
+    ):
         if candidate in rel_map:
             try:
                 content = rel_map[candidate].read_text(encoding="utf-8", errors="ignore")
@@ -87,6 +96,9 @@ def _detect_python_details(
                 if "http.server" in content and "stdlib-http" not in frameworks:
                     frameworks.append("stdlib-http")
                 break
+            if "FastAPI(" in content and candidate == "backend/app/main.py":
+                start_cmd = "fastapi run backend/app/main.py --port $PORT"
+                break
 
     return manifests, frameworks, test_cmd, start_cmd
 
@@ -100,23 +112,25 @@ def _detect_node_details(
     start_cmd: str | None = None
 
     rel_map = {str(p.relative_to(root)): p for p in files}
-    for name in ("package.json", "package-lock.json", "yarn.lock", "pnpm-lock.yaml"):
-        if name in rel_map:
-            manifests.append(name)
+    for rel, p in rel_map.items():
+        if p.name in ("package.json", "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "bun.lock"):
+            manifests.append(rel)
 
+    pkg_files = [rel for rel in manifests if rel.endswith("package.json")]
     pkg_data: dict = {}
-    if "package.json" in rel_map:
+    all_deps: dict[str, str] = {}
+    for rel in pkg_files:
         try:
-            pkg_data = json.loads(rel_map["package.json"].read_text(encoding="utf-8"))
+            parsed = json.loads(rel_map[rel].read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
-            pkg_data = {}
+            parsed = {}
+        if rel == "package.json":
+            pkg_data = parsed
+        all_deps.update(parsed.get("dependencies") or {})
+        all_deps.update(parsed.get("devDependencies") or {})
 
-    deps = {
-        **(pkg_data.get("dependencies") or {}),
-        **(pkg_data.get("devDependencies") or {}),
-    }
-    for fw in ("express", "fastify", "koa", "next", "hono"):
-        if fw in deps:
+    for fw in ("express", "fastify", "koa", "next", "hono", "react", "vite", "vue", "angular"):
+        if fw in all_deps:
             frameworks.append(fw)
 
     scripts = pkg_data.get("scripts") or {}

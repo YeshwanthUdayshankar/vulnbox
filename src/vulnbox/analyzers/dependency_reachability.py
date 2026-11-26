@@ -10,7 +10,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-from vulnbox.analyzers.base import iter_source_files, make_finding_id
+from vulnbox.analyzers.base import SKIP_DIRS, iter_source_files, make_finding_id
 from vulnbox.models import Finding, ReachabilityStatus, Severity
 
 
@@ -106,46 +106,85 @@ def _is_version_below(installed: str, threshold: str) -> bool:
     return _parse_version(installed) < _parse_version(threshold)
 
 
+UV_LOCK_PKG_RE = re.compile(r'^\[\[package\]\]\s*\nname\s*=\s*"([^"]+)"\s*\nversion\s*=\s*"([^"]+)"', re.MULTILINE)
+PYPROJECT_DEP_RE = re.compile(r'"([A-Za-z0-9_.-]+)(?:\[[^\]]+\])?\s*(==|<=|>=|~=|!=|<|>)\s*([0-9][A-Za-z0-9_.*+-]*)')
+
+
+def _iter_manifest_files(workspace_dir: Path, names: tuple[str, ...]) -> list[Path]:
+    found: list[Path] = []
+    for path in sorted(workspace_dir.rglob("*")):
+        if not path.is_file():
+            continue
+        rel = path.relative_to(workspace_dir)
+        if any(part in SKIP_DIRS for part in rel.parts):
+            continue
+        if len(rel.parts) <= 4 and path.name in names:
+            found.append(path)
+    return found
+
+
 def _parse_python_dependencies(workspace_dir: Path) -> list[tuple[str, str, str, int]]:
-    """Return list of (package_lower, version, manifest_rel_path, line_no)."""
+    """Return list of (package_lower, version, manifest_rel_path, line_no) across monorepo."""
     deps: list[tuple[str, str, str, int]] = []
-    req_file = workspace_dir / "requirements.txt"
-    if req_file.is_file():
+    seen_keys: set[tuple[str, str]] = set()
+
+    for req_file in _iter_manifest_files(workspace_dir, ("requirements.txt",)):
+        rel = str(req_file.relative_to(workspace_dir))
         for idx, line in enumerate(req_file.read_text(encoding="utf-8", errors="ignore").splitlines(), start=1):
             stripped = line.split("#", 1)[0].strip()
             if not stripped:
                 continue
             m = REQ_LINE_RE.match(stripped)
             if m:
-                deps.append((m.group(1).lower(), m.group(3), "requirements.txt", idx))
+                pkg = m.group(1).lower()
+                deps.append((pkg, m.group(3), rel, idx))
+                seen_keys.add((pkg, rel))
+
+    for lock_file in _iter_manifest_files(workspace_dir, ("uv.lock",)):
+        rel = str(lock_file.relative_to(workspace_dir))
+        raw = lock_file.read_text(encoding="utf-8", errors="ignore")
+        for m in UV_LOCK_PKG_RE.finditer(raw):
+            pkg, ver = m.group(1).lower(), m.group(2)
+            line_no = raw[: m.start()].count("\n") + 1
+            deps.append((pkg, ver, rel, line_no))
+            seen_keys.add((pkg, rel))
+
+    for pyproj in _iter_manifest_files(workspace_dir, ("pyproject.toml",)):
+        rel = str(pyproj.relative_to(workspace_dir))
+        for idx, line in enumerate(pyproj.read_text(encoding="utf-8", errors="ignore").splitlines(), start=1):
+            for m in PYPROJECT_DEP_RE.finditer(line):
+                pkg, op, ver = m.group(1).lower(), m.group(2), m.group(3)
+                if op in ("==", "<=", "<", "~="):
+                    deps.append((pkg, ver, rel, idx))
+                    seen_keys.add((pkg, rel))
+
     return deps
 
 
 def _parse_node_dependencies(workspace_dir: Path) -> list[tuple[str, str, str, int]]:
     deps: list[tuple[str, str, str, int]] = []
-    pkg_file = workspace_dir / "package.json"
-    if not pkg_file.is_file():
-        return deps
-    try:
-        raw = pkg_file.read_text(encoding="utf-8")
-        data = json.loads(raw)
-    except (OSError, json.JSONDecodeError):
-        return deps
-    lines = raw.splitlines()
-    for section in ("dependencies", "devDependencies"):
-        entries = data.get(section) or {}
-        if not isinstance(entries, dict):
+    for pkg_file in _iter_manifest_files(workspace_dir, ("package.json",)):
+        rel = str(pkg_file.relative_to(workspace_dir))
+        try:
+            raw = pkg_file.read_text(encoding="utf-8")
+            data = json.loads(raw)
+        except (OSError, json.JSONDecodeError):
             continue
-        for pkg, ver in entries.items():
-            if not isinstance(ver, str):
+        lines = raw.splitlines()
+        for section in ("dependencies", "devDependencies"):
+            entries = data.get(section) or {}
+            if not isinstance(entries, dict):
                 continue
-            line_no = 1
-            needle = f'"{pkg}"'
-            for i, line in enumerate(lines, start=1):
-                if needle in line:
-                    line_no = i
-                    break
-            deps.append((pkg.lower(), ver, "package.json", line_no))
+            for pkg, ver in entries.items():
+                if not isinstance(ver, str):
+                    continue
+                line_no = 1
+                needle = f'"{pkg}"'
+                for i, line in enumerate(lines, start=1):
+                    if needle in line:
+                        line_no = i
+                        break
+                deps.append((pkg.lower(), ver, rel, line_no))
     return deps
 
 

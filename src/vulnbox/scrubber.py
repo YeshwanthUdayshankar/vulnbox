@@ -39,19 +39,37 @@ SECRET_TOKEN_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ),
 ]
 
-ENV_LINE_RE = re.compile(r"^(\s*(?:export\s+)?[A-Za-z_][A-Za-z0-9_]*\s*=\s*)(.+)$")
+ENV_LINE_RE = re.compile(r"^(\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*)(.+)$")
+SECRET_KEY_NAME_RE = re.compile(
+    r"(?:SECRET|PASSWORD|PASSWD|TOKEN|API_KEY|PRIVATE_KEY|CREDENTIAL|AUTH|DSN|DATABASE_URL)",
+    re.IGNORECASE,
+)
+PUBLIC_KEY_PREFIXES = ("VITE_", "NEXT_PUBLIC_", "REACT_APP_", "NUXT_PUBLIC_", "PUBLIC_")
+PLACEHOLDER_VALUES = {
+    "changethis",
+    "changeme",
+    "change_me",
+    "replace_me",
+    "your_secret_here",
+    "example",
+    "dummy",
+    "placeholder",
+}
 
 
-def _is_sensitive_filename(name: str) -> bool:
-    if name.lower().endswith((".example", ".sample", ".template")):
-        return False
-    return any(p.search(name) for p in SENSITIVE_FILENAME_PATTERNS)
+def _classify_and_scrub_env_content(content: str) -> tuple[str, int, str]:
+    """Preserve env variable names, redact values, and classify secret risk.
 
-
-def _scrub_env_content(content: str) -> tuple[str, int]:
-    """Preserve env variable names while replacing real values with safe placeholders."""
+    Classification:
+      - 'real_secret': secret-named key with non-placeholder value
+      - 'template_placeholder': secret-named key whose value is a placeholder (e.g. changethis)
+      - 'public_only': only public/non-secret config keys (e.g. VITE_API_URL, HOST, PORT)
+    """
     redacted = 0
+    has_real_secret = False
+    has_placeholder_secret = False
     out_lines: list[str] = []
+
     for line in content.splitlines():
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
@@ -59,13 +77,37 @@ def _scrub_env_content(content: str) -> tuple[str, int]:
             continue
         match = ENV_LINE_RE.match(line)
         if match:
-            prefix = match.group(1)
-            key_name = prefix.replace("export", "").strip().rstrip("=").strip()
+            prefix, key_name, raw_val = match.group(1), match.group(2), match.group(3).strip().strip("\"'")
+            is_public_key = key_name.upper().startswith(PUBLIC_KEY_PREFIXES)
+            is_secret_key = (not is_public_key) and bool(SECRET_KEY_NAME_RE.search(key_name))
+
+            if is_secret_key:
+                low_val = raw_val.lower()
+                # Also recognize postgres://...:${POSTGRES_PASSWORD}@localhost as template ref
+                if low_val in PLACEHOLDER_VALUES or "${" in raw_val or "changethis" in low_val:
+                    has_placeholder_secret = True
+                elif low_val not in ("", "false", "true", "none", "null"):
+                    has_real_secret = True
+
             out_lines.append(f"{prefix}REDACTED_BY_VULNBOX_{key_name}")
             redacted += 1
         else:
             out_lines.append(line)
-    return "\n".join(out_lines) + ("\n" if content.endswith("\n") else ""), redacted
+
+    if has_real_secret:
+        classification = "real_secret"
+    elif has_placeholder_secret:
+        classification = "template_placeholder"
+    else:
+        classification = "public_only"
+
+    return "\n".join(out_lines) + ("\n" if content.endswith("\n") else ""), redacted, classification
+
+
+def _is_sensitive_filename(name: str) -> bool:
+    if name.lower().endswith((".example", ".sample", ".template")):
+        return False
+    return any(p.search(name) for p in SENSITIVE_FILENAME_PATTERNS)
 
 
 def _scrub_text_tokens(content: str) -> tuple[str, int]:
@@ -100,6 +142,7 @@ def create_scrubbed_workspace(
     files_scrubbed: list[str] = []
     secrets_redacted = 0
     excluded_paths: list[str] = []
+    env_classifications: dict[str, str] = {}
 
     for dirpath, dirnames, filenames in os.walk(src_root):
         rel_dir = Path(dirpath).relative_to(src_root)
@@ -129,12 +172,14 @@ def create_scrubbed_workspace(
                 if fname.lower().startswith(".env"):
                     try:
                         raw = src_file.read_text(encoding="utf-8", errors="ignore")
-                        cleaned, count = _scrub_env_content(raw)
+                        cleaned, count, cls = _classify_and_scrub_env_content(raw)
                         dst_file.write_text(cleaned, encoding="utf-8")
                         secrets_redacted += max(count, 1)
+                        env_classifications[rel_file] = cls
                     except OSError:
                         dst_file.write_text("# REDACTED_BY_VULNBOX\n", encoding="utf-8")
                         secrets_redacted += 1
+                        env_classifications[rel_file] = "real_secret"
                 else:
                     dst_file.write_text("REDACTED_BY_VULNBOX_SENSITIVE_FILE\n", encoding="utf-8")
                     secrets_redacted += 1
@@ -166,6 +211,7 @@ def create_scrubbed_workspace(
         files_scrubbed=sorted(set(files_scrubbed)),
         secrets_redacted=secrets_redacted,
         excluded_paths=sorted(set(excluded_paths)),
+        env_classifications=env_classifications,
     )
 
 

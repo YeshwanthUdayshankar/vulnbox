@@ -83,18 +83,30 @@ Pass `--deep` (or `--check-leaks`) to unlock full hybrid sandbox verification:
 | **Hybrid Call Graph (`--deep`)** | Merges cross-file Python AST + Tree-sitter JS/TS CST + FastAPI/Express route/DI edges with runtime edges captured via **Python 3.12+ `sys.monitoring` (PEP 669)** and **Node.js `node:inspector` Profiler + Precise Coverage**, resolving `getattr()` and dynamic subscript dispatch (`runtime_observed`) and attaching entrypoint-to-sink CVE `call_path` traces. | If a runtime hook or grammar is unavailable on the host, degrades cleanly back to static edges with zero crash. |
 | **Dynamic Memory & FD Leak Probing (`--check-leaks` / `--deep`)** | Runs warmup → baseline GC → repeated loopback stress requests → post-GC snapshots, computing OLS heap growth slope (`B/req`), $R^2$, `/proc/<pid>/fd` delta, and `file:line` allocation attribution. Verifies leak patches **before vs. after** (`LEAK -> FIXED`). | Pluggable `MemoryProfilerAdapter` chain: `python-tracemalloc` → `node-v8-inspector` → `os-proc-fallback` (Linux `/proc` RSS+FD for any binary) → graceful `skipped=True` (never breaks scans or patch verification on incompatible OS/runtimes). |
 
-## End-to-End Sample Runs (Captured Docker Sandbox Output)
+## Dependency-Aware Sandbox & Air-Gapped Integration Mocking
 
-Bundled sample repositories were tested end-to-end inside the hardened **`vulnbox-sandbox:latest`** Docker container (`--network=none`, `--cap-drop=ALL`, `--read-only`, non-root user, `memray` included). Full captured CLI output, before/after `curl` HTTP responses, unified diffs, regression test transitions, and Guardrail Audit Trails live under `docs/`:
+Real-world repositories depend on third-party packages, `.env` DSNs, external REST APIs, Redis/Postgres, and authenticated routes. VulnBox handles all four layers without ever relaxing air-gap isolation:
 
-| Sample Repo | Mode | Findings | Verified Patches | Live Proof Confirmed → Fixed | Full Capture |
+| Layer | Flag / Mechanism | How It Works Safely |
+| :--- | :--- | :--- |
+| **Dependency Runtime** | `--build-deps`, `--image <tag>`, `vulnbox clean-cache` | Phase 1 builds a locally cached `vulnbox-deps:<sha256[:12]>` Docker layer copying **only manifests/lockfiles** (zero app source, `npm --ignore-scripts`). Phase 2 mounts scrubbed app code into that image with `--network=none`. `--backend local` also reuses a target repo's `.venv/bin` read-only. Missing runtime deps/services classify cleanly as `skipped=True` without failing patch verification. |
+| **Expected-Shape HTTP Auto-Mock & SSRF Canary** | `--mock-integrations` *(on by default)*, `--mocks mocks.json`, `--mocks-strict` | Format-preserving `.env` scrubbing keeps DSNs/URLs/JWT keys syntactically valid while redacting real secrets. Static Python AST + JS/TS inference (`mock_inferrer.py`) inspects response key reads (`resp.json()["charge_status"]`, `const { id, paid } = await r.json()`) to synthesize HTTP `200 OK` JSON with the exact keys/types the code expects. Zero-edit Python & Node preload hooks intercept outbound HTTP/HTTPS inside `--network=none` and record every outbound host as a live **SSRF Canary** (`outbound_calls`). |
+| **Service Shims & Air-Gapped Sidecars** | Automatic Redis/SMTP shims; opt-in `--services postgres,redis` | Automatically boots zero-container stdlib loopback RESP2 Redis + RFC 5321 SMTP shims inside the sandbox. When full SQL/cache engines are needed, `--services postgres,redis` launches pinned `postgres:16-alpine` / `redis:7-alpine` containers on an ephemeral Docker `--internal` network (strictly zero internet egress) and destroys them on exit. |
+| **In-Process Probing & Test-JWT Auth** | Automatic ASGI/WSGI fallback; `--auth-header`, `--auth-jwt-claims` | When no standalone server start command exists, falls back to in-process FastAPI/Starlette `TestClient` or Flask `app.test_client()`. `--auth-jwt-claims '{"sub":"tester","role":"admin"}'` mints a valid HS256 JWT signed with the sandbox's scrubbed dummy `JWT_SECRET` so authenticated routes can be actively probed. |
+
+## End-to-End Sample Runs (Captured Sandbox Output)
+
+Bundled sample repositories were tested end-to-end inside the hardened **`vulnbox-sandbox:latest`** Docker container (`--network=none`, `--cap-drop=ALL`, `--read-only`, non-root user, `memray` included) and on popular real-world GitHub repos. Full captured CLI output, before/after `curl` HTTP responses, unified diffs, regression test transitions, and Guardrail Audit Trails live under `docs/`:
+
+| Sample / Benchmark Repo | Mode | Findings | Verified Patches | Live Proof / Confirmed Highlights | Full Capture |
 | :--- | :--- | :---: | :---: | :---: | :--- |
 | [`tests/fixtures/py_sample_app`](tests/fixtures/py_sample_app) | Deterministic (`--backend docker`) | 8 | 7 / 7 | 2 `curl` (`PY-YAML-001`, `PY-PATH-001`) + CVE call path | [docs/sample-run-python.md](docs/sample-run-python.md) |
 | [`tests/fixtures/node_sample_app`](tests/fixtures/node_sample_app) | Deterministic (`--backend docker`) | 5 | 5 / 5 | 2 `curl` (`JS-PATH-001`, `JS-CORS-001`) | [docs/sample-run-node.md](docs/sample-run-node.md) |
+| [`tests/fixtures/py_integrated_app`](tests/fixtures/py_integrated_app) | Mocked Integrations (`--mock-integrations --auth-jwt-claims`) | — | — | Stripe HTTPS `200` expected-shape mock, RESP2 Redis shim, HS256 JWT auth, `169.254.169.254` SSRF canary | [tests/test_integration_mocks.py](tests/test_integration_mocks.py) |
 | [`tests/fixtures/py_leaky_app`](tests/fixtures/py_leaky_app) | Deep Hybrid (`--backend docker --deep`) | 2 | 2 / 2 | 2 Memory/FD (`16.9 KB/req → flat`, `FD +30 → 0`) + `getattr` resolved | [docs/ui-guide.md](docs/ui-guide.md) |
 | [`tests/fixtures/node_leaky_app`](tests/fixtures/node_leaky_app) | Deep Hybrid (`--backend docker --deep`) | 2 | 2 / 2 | 2 V8 Heap Leaks (`Map` + `EventEmitter.on`) + subscript resolved | [docs/ui-guide.md](docs/ui-guide.md) |
 | [`tests/fixtures/llm_sql_app`](tests/fixtures/llm_sql_app) | Guarded LLM (`--llm` Ollama `qwen2.5:7b` + Docker) | 1 | 1 / 1 | 1 `curl` (`PY-SQL-001` + prompt-injection guardrail) | [docs/sample-run-llm-ollama.md](docs/sample-run-llm-ollama.md) |
-| Public Benchmarks (`fastapi/full-stack-fastapi-template`, `OWASP/NodeGoat`) | Real-World Precision & Recall (`scan`) | 5 / 5 | — | Triage + Gap Analysis | [docs/benchmark-public-repos.md](docs/benchmark-public-repos.md) |
+| Public Benchmarks (`fastapi/full-stack-fastapi-template`, `OWASP/NodeGoat`, `dgtlmoon/changedetection.io`) | Real-World Precision & Recall (`scan`) | 5 / 5 / 38 | — | Confirmed root `Dockerfile`, `verify=False` TLS, unvalidated `from_version`/`to_version` path inputs, 0 critical FPs | [docs/benchmark-public-repos.md](docs/benchmark-public-repos.md) |
 
 ## Optional Guarded LLM Mode (`--llm`)
 

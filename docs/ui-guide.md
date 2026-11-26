@@ -11,9 +11,9 @@ Launch the zero-dependency local Web UI backed by `VulnBoxEngine` on **Linux, ma
 
 All launchers keep setup, `.venv/`, and `uv`/`pip` caches (`.vulnbox-cache/`) **strictly local to the repository** (setting `PIP_REQUIRE_VIRTUALENV=1`, `PIP_USER=0`, `PYTHONNOUSERSITE=1`, `UV_PROJECT_ENVIRONMENT=.venv`, and `UV_CACHE_DIR=.vulnbox-cache/uv`). They accept `--host`, `--port`, `--no-browser`, `--install` (force re-sync), `--no-install`, and `--dry-run`, and respect `VULNBOX_UI_HOST`, `VULNBOX_UI_PORT`, and `VULNBOX_NO_BROWSER`. Opens `http://127.0.0.1:8787` by default.
 
-## 1. Dashboard Overview, Deep Scan (`--deep`), `--jobs`, & Guarded `--llm` Controls
+## 1. Dashboard Overview, Deep Scan (`--deep`), Integration Mocking, `--jobs`, & Guarded `--llm` Controls
 
-The top environment doctor bar reports live readiness for Python, Node.js, `curl`, the hardened Docker sandbox, **Tree-sitter grammars** (`python/javascript/typescript`), and **pluggable Memory Profilers**. One-click sample buttons load bundled Python, Node.js, LLM SQL, and Deep/Leaky fixtures, alongside `--jobs` parallel workers, **Deep Scan (`--deep`)**, **Check Memory & FD Leaks (`--check-leaks`)**, and the optional **Guarded LLM Synthesis (`--llm`)** configuration panel.
+The top environment doctor bar reports live readiness for Python, Node.js, `curl`, the hardened Docker sandbox, **Tree-sitter grammars** (`python/javascript/typescript`), **pluggable Memory Profilers**, **Auto-Mock + SSRF Canary**, and a one-click **Clean Dep Cache** (`POST /api/clean-cache`) button. One-click sample buttons load bundled Python, Node.js, LLM SQL, Deep/Leaky, and Integrated/Mocked fixtures, alongside `--jobs` parallel workers, **Auto-Mock Integrations (`--mock-integrations`)**, **Strict Mocks (`--mocks-strict`)**, **Cached Docker Dep Layer (`--build-deps`)**, custom `--image`, `--services`, `--auth-header` / `--auth-jwt-claims`, **Deep Scan (`--deep`)**, **Check Memory & FD Leaks (`--check-leaks`)**, and the optional **Guarded LLM Synthesis (`--llm`)** panel.
 
 ![VulnBox Web UI Dashboard Overview](images/ui-dashboard-overview.png)
 

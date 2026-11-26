@@ -74,16 +74,43 @@
             <label for="rem-jobs">Parallel Verification Workers (<code>--jobs</code>)</label>
             <input id="rem-jobs" type="number" min="1" max="16" value="4" />
           </div>
+          <div>
+            <label for="rem-image">Custom Docker Image (optional, <code>--image</code>)</label>
+            <input id="rem-image" type="text" placeholder="vulnbox-sandbox:latest" />
+          </div>
+          <div>
+            <label for="rem-services">Air-Gapped Sidecars (optional, <code>--services</code>)</label>
+            <input id="rem-services" type="text" placeholder="e.g. postgres,redis" />
+          </div>
+          <div>
+            <label for="rem-auth-header">Auth Header (optional, <code>--auth-header</code>)</label>
+            <input id="rem-auth-header" type="text" placeholder="Authorization: Bearer ..." />
+          </div>
+          <div>
+            <label for="rem-jwt-claims">Test-JWT Claims JSON (optional, <code>--auth-jwt-claims</code>)</label>
+            <input id="rem-jwt-claims" type="text" placeholder='{"sub":"tester","role":"admin"}' />
+          </div>
         </div>
 
-        <div class="mt-12">
-          <label for="rem-probe">Custom Loopback Probe JSON (optional)</label>
-          <textarea id="rem-probe" placeholder="Optional DynamicProbeSpec JSON (inferred automatically for standard routes)"></textarea>
+        <div class="grid-2 mt-12">
+          <div>
+            <label for="rem-probe">Custom Loopback Probe JSON (optional)</label>
+            <textarea id="rem-probe" placeholder="Optional DynamicProbeSpec JSON (inferred automatically for standard routes)"></textarea>
+          </div>
+          <div>
+            <label for="rem-mocks-json">Explicit Mock Rules JSON (optional, <code>--mocks</code>)</label>
+            <textarea id="rem-mocks-json" placeholder='[{"host_pattern":"api.stripe.com","path_prefix":"/v1/charges","status":200,"json_body":{"id":"ch_mock","charge_status":"succeeded"}}]'></textarea>
+          </div>
         </div>
 
         <div class="checkbox-row">
           <input id="rem-mock-toggle" type="checkbox" checked />
           <label for="rem-mock-toggle" class="checkbox-label">Auto-Mock Integrations (<code>--mock-integrations</code>): Expected-shape HTTP 200 mocks, SSRF canary, and Redis/SMTP shims</label>
+        </div>
+
+        <div class="checkbox-row">
+          <input id="rem-mocks-strict-toggle" type="checkbox" />
+          <label for="rem-mocks-strict-toggle" class="checkbox-label">Strict Mocks (<code>--mocks-strict</code>): Return HTTP 502 for unmocked outbound calls instead of inferred 200</label>
         </div>
 
         <div class="checkbox-row">
@@ -230,10 +257,22 @@
             <label for="probe-image">Custom Docker Image (optional)</label>
             <input id="probe-image" type="text" placeholder="vulnbox-sandbox:latest" />
           </div>
+          <div>
+            <label for="probe-services">Air-Gapped Sidecars (optional)</label>
+            <input id="probe-services" type="text" placeholder="e.g. postgres,redis" />
+          </div>
         </div>
         <div class="checkbox-row">
           <input id="probe-mock-toggle" type="checkbox" checked />
           <label for="probe-mock-toggle" class="checkbox-label">Auto-Mock Integrations (expected-shape HTTP 200 mocks + SSRF canary + Redis/SMTP shims)</label>
+        </div>
+        <div class="checkbox-row">
+          <input id="probe-mocks-strict-toggle" type="checkbox" />
+          <label for="probe-mocks-strict-toggle" class="checkbox-label">Strict Mocks (<code>--mocks-strict</code>): Return HTTP 502 on unmocked hosts</label>
+        </div>
+        <div class="checkbox-row">
+          <input id="probe-build-deps-toggle" type="checkbox" />
+          <label for="probe-build-deps-toggle" class="checkbox-label">Build Cached Docker Dep Layer (<code>--build-deps</code>)</label>
         </div>
         <div class="mt-12">
           <label for="probe-mocks-json">Optional Explicit Mock Rules JSON (<code>--mocks</code>)</label>
@@ -248,6 +287,7 @@
           <button id="btn-preset-yaml" class="btn secondary small" type="button">Preset: YAML Tag</button>
           <button id="btn-preset-path" class="btn secondary small" type="button">Preset: Path Boundary</button>
           <button id="btn-preset-cors" class="btn secondary small" type="button">Preset: CORS Origin</button>
+          <button id="btn-preset-ssrf" class="btn secondary small" type="button">Preset: Mock + SSRF Canary</button>
         </div>
       </div>
       <div id="probe-results"></div>
@@ -300,6 +340,24 @@
             <label for="ver-probe-json">Active Probe JSON (optional)</label>
             <textarea id="ver-probe-json" placeholder="Optional DynamicProbeSpec JSON"></textarea>
           </div>
+        </div>
+        <div class="grid-2 mt-12">
+          <div>
+            <label for="ver-jwt-claims">Test-JWT Claims JSON (optional)</label>
+            <input id="ver-jwt-claims" type="text" placeholder='{"sub":"tester","role":"admin"}' />
+          </div>
+          <div>
+            <label for="ver-image">Custom Docker Image (optional)</label>
+            <input id="ver-image" type="text" placeholder="vulnbox-sandbox:latest" />
+          </div>
+        </div>
+        <div class="checkbox-row">
+          <input id="ver-mock-toggle" type="checkbox" checked />
+          <label for="ver-mock-toggle" class="checkbox-label">Auto-Mock Integrations (expected-shape HTTP 200 mocks + SSRF canary + Redis/SMTP shims)</label>
+        </div>
+        <div class="checkbox-row">
+          <input id="ver-build-deps-toggle" type="checkbox" />
+          <label for="ver-build-deps-toggle" class="checkbox-label">Build Cached Docker Dep Layer (<code>--build-deps</code>)</label>
         </div>
         <div class="row-actions">
           <button id="btn-verify" class="btn">Verify Patch in Sandbox</button>

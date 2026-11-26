@@ -21,7 +21,12 @@ from vulnbox.models import DynamicProbeSpec, MockRule
 from vulnbox.registry import default_registry
 from vulnbox.reporting.markdown import render_markdown_report
 from vulnbox.reporting.sarif import build_sarif, validate_sarif
-from vulnbox.sandbox import DockerSandboxBackend, LocalSandboxBackend
+from vulnbox.sandbox import (
+    SUPPORTED_SIDECARS,
+    DockerSandboxBackend,
+    LocalSandboxBackend,
+    prune_dependency_images,
+)
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 STATIC_ASSETS: dict[str, tuple[str, str]] = {
@@ -86,6 +91,8 @@ def _doctor_status() -> dict[str, Any]:
         "default_backend": "docker" if docker_ok else "local",
         "tree_sitter_languages": available_tree_sitter_languages(),
         "memory_profilers": [p.name for p in default_registry.list_memory_profilers()],
+        "integration_mocking": True,
+        "supported_sidecars": sorted(SUPPORTED_SIDECARS),
         "samples": _discover_sample_fixtures(),
     }
 
@@ -277,6 +284,9 @@ class VulnBoxUIHandler(BaseHTTPRequestHandler):
                 self._handle_probe(body)
             elif parsed.path == "/api/verify-patch":
                 self._handle_verify_patch(body)
+            elif parsed.path == "/api/clean-cache":
+                removed = prune_dependency_images()
+                self._send_json(200, {"removed": removed, "count": len(removed)})
             else:
                 self._send_json(404, {"error": "Unknown API endpoint."})
         except (ValueError, json.JSONDecodeError) as exc:
@@ -475,8 +485,18 @@ class VulnBoxUIHandler(BaseHTTPRequestHandler):
 
         probes = _parse_probe_specs_payload(body.get("probe_json"))
         probe_spec = probes[0] if probes else None
+        build_deps = bool(body.get("build_deps"))
+        image = (body.get("image") or "").strip() or None
+        mock_integrations = (
+            bool(body.get("mock_integrations")) if "mock_integrations" in body else True
+        )
+        mock_rules = _parse_mock_rules_payload(body.get("mocks_json"))
+        mocks_strict = bool(body.get("mocks_strict"))
+        services = _parse_services_payload(body.get("services"))
+        auth_header = (body.get("auth_header") or "").strip() or None
+        auth_jwt_claims = (body.get("auth_jwt_claims") or "").strip() or None
 
-        engine = VulnBoxEngine(backend=backend)
+        engine = VulnBoxEngine(backend=backend, image=image or "vulnbox-sandbox:latest")
         result = engine.verify_external_patch(
             repo_path=repo,
             unified_diff=unified_diff,
@@ -488,6 +508,14 @@ class VulnBoxUIHandler(BaseHTTPRequestHandler):
             start_cmd=start_cmd,
             health_path=health_path,
             description="Patch submitted via VulnBox Web UI",
+            build_deps=build_deps,
+            image=image,
+            mock_integrations=mock_integrations,
+            mock_rules=mock_rules,
+            mocks_strict=mocks_strict,
+            services=services,
+            auth_header=auth_header,
+            auth_jwt_claims=auth_jwt_claims,
         )
         self._send_json(200, {"verification": result.model_dump()})
 

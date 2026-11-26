@@ -123,6 +123,8 @@ function renderReportView(container, data) {
       badges.push(el("span", { class: `pill ${ver.verified ? "ok" : "err"}`, text: ver.verified ? "VERIFIED" : "UNVERIFIED" }));
       if (ver.dynamic_confirmed_and_fixed === true) {
         badges.push(el("span", { class: "pill ok", text: "LIVE CURL: CONFIRMED -> FIXED" }));
+      } else if (ver.dynamic_probe_before && ver.dynamic_probe_before.skipped) {
+        badges.push(el("span", { class: "pill warn", text: "CURL PROBE SKIPPED (MISSING DEPS/SVC)" }));
       }
       if (ver.memory_leak_confirmed_and_fixed === true) {
         badges.push(el("span", { class: "pill ok", text: "MEM/FD LEAK: CONFIRMED -> FIXED" }));
@@ -155,23 +157,45 @@ function renderReportView(container, data) {
     if (ver && ver.dynamic_probe_before) {
       const before = ver.dynamic_probe_before;
       const after = ver.dynamic_probe_after;
-      fCard.appendChild(el("div", { class: "probe-title", text: "Active Loopback curl Verification" }));
+      fCard.appendChild(el("div", { class: "probe-title", text: `Active Loopback Verification (${before.probe_mode || "http_server"})` }));
       fCard.appendChild(el("pre", { text: before.curl_command }));
-      const cmp = el("div", { class: "probe-compare" }, [
-        el("div", { class: "probe-box" }, [
-          el("div", { class: "pill err", text: `BEFORE PATCH: HTTP ${before.status_code ?? "ERR"} (vulnerable=${before.matched_vulnerable})` }),
-          el("pre", { text: before.response_body_excerpt || JSON.stringify(before.response_headers, null, 2) }),
-        ]),
-      ]);
-      if (after) {
-        cmp.appendChild(
+      if (before.skipped) {
+        fCard.appendChild(
           el("div", { class: "probe-box" }, [
-            el("div", { class: `pill ${after.matched_fixed ? "ok" : "err"}`, text: `AFTER PATCH: HTTP ${after.status_code ?? "ERR"} (fixed=${after.matched_fixed})` }),
-            el("pre", { text: after.response_body_excerpt || JSON.stringify(after.response_headers, null, 2) }),
+            el("div", { class: "pill warn", text: "ACTIVE PROBE SKIPPED (GRACEFUL DEGRADATION)" }),
+            el("pre", { text: before.skip_reason || before.error || "App boot skipped due to missing runtime deps or services." }),
           ])
         );
+      } else {
+        const cmp = el("div", { class: "probe-compare" }, [
+          el("div", { class: "probe-box" }, [
+            el("div", { class: "pill err", text: `BEFORE PATCH: HTTP ${before.status_code ?? "ERR"} (vulnerable=${before.matched_vulnerable})` }),
+            el("pre", { text: before.response_body_excerpt || JSON.stringify(before.response_headers, null, 2) }),
+          ]),
+        ]);
+        if (after) {
+          cmp.appendChild(
+            el("div", { class: "probe-box" }, [
+              el("div", { class: `pill ${after.skipped ? "warn" : after.matched_fixed ? "ok" : "err"}`, text: after.skipped ? "AFTER PATCH: SKIPPED" : `AFTER PATCH: HTTP ${after.status_code ?? "ERR"} (fixed=${after.matched_fixed})` }),
+              el("pre", { text: after.skip_reason || after.response_body_excerpt || JSON.stringify(after.response_headers, null, 2) }),
+            ])
+          );
+        }
+        fCard.appendChild(cmp);
+        const outCalls = before.outbound_calls || [];
+        if (outCalls.length > 0) {
+          fCard.appendChild(
+            el("div", { class: "probe-box mt-10" }, [
+              el("div", { class: "pill info", text: `Intercepted Outbound Calls / SSRF Canary (${outCalls.length})` }),
+              el("pre", {
+                text: outCalls
+                  .map((c) => `${c.method} ${c.host}${c.path} -> HTTP ${c.status_code} [${c.matched_rule || "mock"}]`)
+                  .join("\n"),
+              }),
+            ])
+          );
+        }
       }
-      fCard.appendChild(cmp);
     }
 
     if (ver && ver.memory_probe_before) {
@@ -355,7 +379,22 @@ async function loadDoctor() {
       el("span", { class: `pill ${doc.curl ? "ok" : "warn"}`, text: doc.curl ? "curl OK" : "urllib Fallback" }),
       el("span", { class: `pill ${doc.docker_ready ? "ok" : "warn"}`, text: doc.docker_ready ? "Docker READY" : "Docker Unavailable" }),
       el("span", { class: "pill info", text: `Tree-sitter: ${tsLangs}` }),
-      el("span", { class: "pill info", text: `Memory Profilers: ${memProfs}` })
+      el("span", { class: "pill info", text: `Memory Profilers: ${memProfs}` }),
+      el("span", { class: "pill ok", text: "Auto-Mock + SSRF Canary" }),
+      el("button", {
+        class: "btn secondary small",
+        type: "button",
+        text: "Clean Dep Cache",
+        onclick: async () => {
+          setStatus("loading", "Pruning cached vulnbox-deps:* Docker images...");
+          try {
+            const res = await apiPost("/api/clean-cache", {});
+            setStatus("info", res.count > 0 ? `Removed ${res.count} cached dep image(s): ${res.removed.join(", ")}` : "No cached vulnbox-deps:* images found.");
+          } catch (err) {
+            setStatus("error", `Failed to clean cache: ${err.message}`);
+          }
+        },
+      })
     );
 
     if (doc.samples && doc.samples.length > 0) {
@@ -420,6 +459,15 @@ const PROBE_PRESETS = {
     vulnerable_expectation: { status_codes: [200], headers_contain: { "access-control-allow-credentials": "true" } },
     fixed_expectation: { status_codes: [200], headers_not_contain: { "access-control-allow-origin": "https://untrusted.example" } },
   },
+  ssrf: {
+    probe_id: "probe-ssrf-canary",
+    rule_id: "PY-SSRF-001",
+    description: "Confirm outbound metadata SSRF request is captured by the air-gapped SSRF canary",
+    method: "GET",
+    path: "/fetch?url=http://169.254.169.254/latest/meta-data/",
+    vulnerable_expectation: { status_codes: [200], outbound_hosts_contain: ["169.254.169.254"] },
+    fixed_expectation: { status_codes: [400, 403], outbound_hosts_not_contain: ["169.254.169.254"] },
+  },
 };
 
 document.getElementById("probe-json").value = JSON.stringify(PROBE_PRESETS.yaml, null, 2);
@@ -431,6 +479,9 @@ document.getElementById("btn-preset-path").addEventListener("click", () => {
 });
 document.getElementById("btn-preset-cors").addEventListener("click", () => {
   document.getElementById("probe-json").value = JSON.stringify(PROBE_PRESETS.cors, null, 2);
+});
+document.getElementById("btn-preset-ssrf").addEventListener("click", () => {
+  document.getElementById("probe-json").value = JSON.stringify(PROBE_PRESETS.ssrf, null, 2);
 });
 
 document.getElementById("btn-profile").addEventListener("click", async () => {
@@ -475,11 +526,17 @@ document.getElementById("btn-remediate").addEventListener("click", async () => {
       advisories_path: document.getElementById("rem-advisories").value,
       out_dir: document.getElementById("rem-out").value,
       probe_json: document.getElementById("rem-probe").value,
+      mocks_json: document.getElementById("rem-mocks-json").value,
       max_workers: Number(document.getElementById("rem-jobs").value || 4),
       deep: document.getElementById("rem-deep-toggle").checked,
       check_leaks: document.getElementById("rem-leaks-toggle").checked,
       mock_integrations: document.getElementById("rem-mock-toggle").checked,
+      mocks_strict: document.getElementById("rem-mocks-strict-toggle").checked,
       build_deps: document.getElementById("rem-build-deps-toggle").checked,
+      image: document.getElementById("rem-image").value,
+      services: document.getElementById("rem-services").value,
+      auth_header: document.getElementById("rem-auth-header").value,
+      auth_jwt_claims: document.getElementById("rem-jwt-claims").value,
       llm_enabled: document.getElementById("rem-llm-toggle").checked,
       llm_provider: document.getElementById("rem-llm-provider").value,
       llm_model: document.getElementById("rem-llm-model").value,
@@ -502,10 +559,13 @@ document.getElementById("btn-probe").addEventListener("click", async () => {
       backend: document.getElementById("probe-backend").value,
       probe_json: document.getElementById("probe-json").value,
       mock_integrations: document.getElementById("probe-mock-toggle").checked,
+      mocks_strict: document.getElementById("probe-mocks-strict-toggle").checked,
+      build_deps: document.getElementById("probe-build-deps-toggle").checked,
       mocks_json: document.getElementById("probe-mocks-json").value,
       auth_header: document.getElementById("probe-auth-header").value,
       auth_jwt_claims: document.getElementById("probe-jwt-claims").value,
       image: document.getElementById("probe-image").value,
+      services: document.getElementById("probe-services").value,
     });
     setStatus("", "");
     const out = document.getElementById("probe-results");
@@ -559,6 +619,10 @@ document.getElementById("btn-verify").addEventListener("click", async () => {
       regression_test_path: document.getElementById("ver-reg-path").value,
       regression_test_code: document.getElementById("ver-reg-code").value,
       probe_json: document.getElementById("ver-probe-json").value,
+      mock_integrations: document.getElementById("ver-mock-toggle").checked,
+      build_deps: document.getElementById("ver-build-deps-toggle").checked,
+      auth_jwt_claims: document.getElementById("ver-jwt-claims").value,
+      image: document.getElementById("ver-image").value,
     });
     setStatus("", "");
     const v = data.verification;

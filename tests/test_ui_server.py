@@ -237,3 +237,61 @@ def test_ui_deep_scan_memory_leaks_and_doctor_capabilities(ui_server: tuple[str,
     assert len(vers) >= 2
     assert all(v["verified"] for v in vers)
     assert all(v["memory_leak_confirmed_and_fixed"] is True for v in vers)
+
+
+def test_ui_integration_mocks_ssrf_canary_jwt_and_clean_cache(ui_server: tuple[str, str]) -> None:
+    base_url, token = ui_server
+    integrated_repo = str(FIXTURES / "py_integrated_app")
+
+    with urllib.request.urlopen(f"{base_url}/api/doctor", timeout=5) as resp:
+        doc = json.loads(resp.read().decode("utf-8"))
+        assert doc["integration_mocking"] is True
+        assert "postgres" in doc["supported_sidecars"]
+        assert any(s["name"] == "py_integrated_app" for s in doc["samples"])
+
+    # Probe with expected-shape auto-mock + HS256 test-JWT + SSRF canary
+    st, probe_data = _post_json(
+        f"{base_url}/api/probe",
+        {
+            "repo_path": integrated_repo,
+            "backend": "local",
+            "mock_integrations": True,
+            "auth_jwt_claims": '{"sub":"ui-tester","role":"admin"}',
+            "probe_json": [
+                {
+                    "probe_id": "ui-stripe-mock",
+                    "method": "POST",
+                    "path": "/checkout",
+                    "vulnerable_expectation": {
+                        "status_codes": [200],
+                        "body_contains": ["succeeded"],
+                        "outbound_hosts_contain": ["api.stripe.com"],
+                    },
+                    "fixed_expectation": {"status_codes": [400]},
+                },
+                {
+                    "probe_id": "ui-admin-jwt",
+                    "method": "GET",
+                    "path": "/admin",
+                    "vulnerable_expectation": {
+                        "status_codes": [200],
+                        "body_contains": ["ui-tester", "admin"],
+                    },
+                    "fixed_expectation": {"status_codes": [401]},
+                },
+            ],
+        },
+        token=token,
+    )
+    assert st == 200
+    assert len(probe_data["results"]) == 2
+    assert probe_data["results"][0]["matched_vulnerable"] is True
+    assert any("api.stripe.com" in c["host"] for c in probe_data["results"][0]["outbound_calls"])
+    assert probe_data["results"][1]["matched_vulnerable"] is True
+
+    # CSRF-protected clean-cache endpoint
+    st, _ = _post_json(f"{base_url}/api/clean-cache", {}, token=None)
+    assert st == 403
+    st, clean_data = _post_json(f"{base_url}/api/clean-cache", {}, token=token)
+    assert st == 200
+    assert "removed" in clean_data and "count" in clean_data

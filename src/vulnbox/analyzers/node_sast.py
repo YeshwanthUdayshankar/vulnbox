@@ -11,6 +11,12 @@ from vulnbox.models import Finding
 
 SQL_KW_RE = re.compile(r"\b(?:SELECT|INSERT|UPDATE|DELETE)\b", re.IGNORECASE)
 JS_EXTS = (".js", ".mjs", ".cjs", ".ts", ".tsx")
+MINIFIED_SUFFIXES = (".min.js", ".min.mjs", ".bundle.js")
+
+
+def _is_minified_vendor_file(path: Path) -> bool:
+    low = path.name.lower()
+    return low.endswith(MINIFIED_SUFFIXES)
 
 
 def _strip_quotes(text: str) -> str:
@@ -38,6 +44,8 @@ class NodeSASTAnalyzer:
     def analyze(self, workspace_dir: Path) -> list[Finding]:
         findings: list[Finding] = []
         for js_file in iter_source_files(workspace_dir, JS_EXTS):
+            if _is_minified_vendor_file(js_file):
+                continue
             try:
                 source = js_file.read_text(encoding="utf-8", errors="ignore")
             except OSError:
@@ -47,6 +55,7 @@ class NodeSASTAnalyzer:
                 continue
             rel = str(js_file.relative_to(workspace_dir))
             lines = source.splitlines()
+            has_child_process = "child_process" in source
 
             has_fs_read = False
             has_path_confinement = (
@@ -182,12 +191,19 @@ class NodeSASTAnalyzer:
                     first_txt = node_text(first, raw)
                     receiver = fn_txt.rsplit(".", 1)[0] if "." in fn_txt else ""
                     non_shell_receivers = {"r", "db", "knex", "pool", "conn", "connection", "stmt", "re", "regex"}
+                    shell_receivers = {"", "cp", "child_process", "childprocess", "shell"}
+                    is_child_process_call = (
+                        tail == "execSync"
+                        or has_child_process
+                        or receiver.lower() in shell_receivers
+                    )
                     is_sql_orm = (
                         receiver.lower() in non_shell_receivers
                         or bool(re.match(r"""^[`'"\s]*(?:SELECT|INSERT|UPDATE|DELETE|CREATE|DROP|ALTER|PRAGMA)\b""", first_txt, re.IGNORECASE))
                     )
                     if (
-                        not is_sql_orm
+                        is_child_process_call
+                        and not is_sql_orm
                         and first.type in ("template_string", "binary_expression")
                         and _has_dynamic_arg(first, raw)
                     ):

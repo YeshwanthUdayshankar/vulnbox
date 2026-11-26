@@ -211,10 +211,13 @@ def _analyze_python_leaks(
             if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
             with_calls: set[int] = set()
+            with_managed_vars: set[str] = set()
             for sub in ast.walk(node):
                 if isinstance(sub, (ast.With, ast.AsyncWith)):
                     for item in sub.items:
                         with_calls.add(id(item.context_expr))
+                        if isinstance(item.context_expr, ast.Name):
+                            with_managed_vars.add(item.context_expr.id)
 
             # Collect returned variable names (factory functions intentionally return handles)
             returned_names: set[str] = set()
@@ -240,7 +243,11 @@ def _analyze_python_leaks(
                 if len(sub.targets) != 1 or not isinstance(sub.targets[0], ast.Name):
                     continue
                 var_name = sub.targets[0].id
-                if var_name in returned_names or var_name in closed_vars:
+                if (
+                    var_name in returned_names
+                    or var_name in closed_vars
+                    or var_name in with_managed_vars
+                ):
                     continue
                 lineno = getattr(sub, "lineno", node.lineno)
                 route = call_graph.find_route_for_location(rel, lineno) if call_graph else None
@@ -303,6 +310,8 @@ def _analyze_node_leaks(
 ) -> list[Finding]:
     findings: list[Finding] = []
     for js_file in iter_source_files(workspace_dir, JS_EXTS):
+        if js_file.name.lower().endswith((".min.js", ".min.mjs", ".bundle.js")):
+            continue
         try:
             source = js_file.read_text(encoding="utf-8", errors="ignore")
         except OSError:
@@ -486,12 +495,18 @@ def _analyze_node_leaks(
             )
 
         # --- MEM-JS-003: Uncaptured setInterval() ---
+        is_browser_ui_script = (
+            "/static/" in f"/{rel.replace(chr(92), '/')}"
+            and any(tok in source for tok in ("$(document).ready", "document.addEventListener", "window.addEventListener", "$(function"))
+        )
         for node in walk_nodes(tree.root_node):
             if node.type == "expression_statement" and node.named_children:
                 child = node.named_children[0]
                 if child.type == "call_expression":
                     fn = child.child_by_field_name("function")
                     if fn and node_text(fn, raw) == "setInterval":
+                        if is_browser_ui_script:
+                            continue
                         lineno = child.start_point[0] + 1
                         findings.append(
                             Finding(

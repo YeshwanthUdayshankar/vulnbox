@@ -21,7 +21,19 @@ def _dotted_name(node: ast.AST) -> str:
 
 
 def _is_dynamic_expr(node: ast.AST) -> bool:
-    return not isinstance(node, ast.Constant)
+    if isinstance(node, ast.Constant):
+        return False
+    if isinstance(node, ast.Name) and node.id.isupper():
+        return False
+    return True
+
+
+def _is_non_security_hash_context(line_text: str) -> bool:
+    low = line_text.lower()
+    return any(
+        hint in low
+        for hint in ("checksum", "etag", "cache", "previous_md5", "fetched_md5", "current_md5", "prompt_hash", "content")
+    )
 
 
 def _contains_sql_keyword(node: ast.AST) -> bool:
@@ -95,6 +107,8 @@ class _PythonSecurityVisitor(ast.NodeVisitor):
         self, func: ast.FunctionDef | ast.AsyncFunctionDef
     ) -> None:
         """Detect os.path.join used for file reads without path confinement checks."""
+        if Path(self.rel_path).name == "setup.py":
+            return
         src = ast.get_source_segment("\n".join(self.lines), func) or ""
         has_confinement = (
             "is_relative_to" in src
@@ -102,6 +116,8 @@ class _PythonSecurityVisitor(ast.NodeVisitor):
             or ("realpath(" in src and "startswith(" in src)
             or ("abspath(" in src and "startswith(" in src)
             or "commonpath(" in src
+            or "re.fullmatch(" in src
+            or "_RE.match(" in src
         )
         if has_confinement:
             return
@@ -274,11 +290,14 @@ class _PythonSecurityVisitor(ast.NodeVisitor):
                 for kw in node.keywords
             )
             if not non_sec:
+                lineno = getattr(node, "lineno", 1)
+                ctx_line = self.lines[lineno - 1] if 1 <= lineno <= len(self.lines) else ""
+                hash_sev: Severity = "low" if _is_non_security_hash_context(ctx_line) else "medium"
                 self._add(
                     rule_id="PY-HASH-001",
                     cwe_id="CWE-328",
                     title="Weak Cryptographic Hash Algorithm",
-                    severity="medium",
+                    severity=hash_sev,
                     node=node,
                     message=f"{name}() is cryptographically weak. Prefer SHA-256 or pass usedforsecurity=False for non-security checksums.",
                     recommended_fix="Replace hashlib.md5()/sha1() with hashlib.sha256().",

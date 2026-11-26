@@ -23,6 +23,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
+  "mypy>=1.13.0",
   "pytest>=8.3.0",
   "ruff>=0.7.0",
 ]
@@ -37,6 +38,16 @@ packages = ["src/vulnbox"]
 testpaths = ["tests"]
 pythonpath = ["src"]
 norecursedirs = ["fixtures"]
+markers = [
+  "docker: opt-in integration tests requiring a reachable Docker daemon",
+]
+
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true
+warn_unused_ignores = true
+check_untyped_defs = false
+exclude = ["tests/fixtures"]
 
 [tool.ruff]
 line-length = 100

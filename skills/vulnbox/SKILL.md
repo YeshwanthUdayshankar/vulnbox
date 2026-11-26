@@ -29,8 +29,11 @@ Test repositories in an isolated, secret-scrubbed sandbox, **actively confirm vu
      --out <output-dir>
    ```
    - Pass `--start-cmd "<cmd>"` and `--health-path "/health"` if the app uses a custom server entrypoint.
+   - Pass `--deep` / `--check-leaks` to enable sandbox runtime call-graph tracing (`sys.monitoring` / V8 Inspector) and active before/after memory & FD leak slope verification.
+   - Pass `--build-deps` (cached `vulnbox-deps:<hash>`, pruned via `clean-cache`) or `--image <tag>` when the target repo needs third-party packages inside Docker; `--backend local` automatically reuses a target repo's `.venv` read-only.
+   - Outbound HTTP/HTTPS integrations are auto-mocked with expected-shape `200 OK` JSON responses + SSRF canary logging + loopback Redis/SMTP shims by default (`--mock-integrations`); customize via `--mocks <mocks.json>`, `--mocks-strict`, `--services postgres,redis` (air-gapped `--internal` Docker network), or `--auth-header` / `--auth-jwt-claims '{"sub":"tester","role":"admin"}'`.
    - Pass `--advisories <advisories.json>` to check specific dependency CVEs and reachability.
-   - Pass `--probe <probe.json>` to run custom loopback `curl` probes against specific endpoints.
+   - Pass `--probe <probe.json>` to run custom loopback `curl` probes against specific endpoints (automatically falls back to in-process FastAPI/Flask probing if no standalone server start command exists).
    - Pass `--llm --llm-provider ollama|openai|gemini|custom` to enable the built-in guarded LLM synthesis loop for findings without deterministic built-in patches (all LLM outputs are validated by deterministic guardrails and dual-verified inside the sandbox).
 
 3. **Author & verify custom patches for complex or custom-endpoint findings:**

@@ -9,10 +9,10 @@ from typing import Any
 try:
     from tree_sitter import Language, Node, Parser, Tree
 except ImportError:  # pragma: no cover - optional degraded mode
-    Language = None  # type: ignore[assignment]
-    Node = Any  # type: ignore[assignment]
-    Parser = None  # type: ignore[assignment]
-    Tree = Any  # type: ignore[assignment]
+    Language = None  # type: ignore[assignment,misc]
+    Node = Any  # type: ignore[assignment,misc]
+    Parser = None  # type: ignore[assignment,misc]
+    Tree = Any  # type: ignore[assignment,misc]
 
 
 def _load_grammar(ext: str) -> Any | None:

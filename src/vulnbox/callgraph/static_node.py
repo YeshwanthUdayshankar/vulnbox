@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
+from typing import Any
 
 from vulnbox.analyzers.base import iter_source_files
 from vulnbox.callgraph.graph import CallGraph
@@ -44,7 +45,7 @@ def build_node_static_call_graph(workspace_dir: Path) -> CallGraph:
     cg = CallGraph()
     js_files = list(iter_source_files(workspace_dir, JS_EXTS))
 
-    parsed: list[tuple[Path, str, CallNodeLanguage, object, bytes]] = []
+    parsed: list[tuple[Path, str, CallNodeLanguage, Any, bytes]] = []
     file_symbols: dict[str, dict[str, str]] = {}
 
     # Pass 1: parse files and index functions/methods/handlers

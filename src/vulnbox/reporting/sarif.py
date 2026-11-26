@@ -57,7 +57,15 @@ def build_sarif(report: AuditReport) -> dict[str, Any]:
             props["patchId"] = ver.patch_id
             if ver.dynamic_probe_before is not None:
                 props["activeProbeCurl"] = ver.dynamic_probe_before.curl_command
+                props["activeProbeMode"] = ver.dynamic_probe_before.probe_mode
                 props["activeProbeReproducedBefore"] = ver.dynamic_probe_before.matched_vulnerable
+                if ver.dynamic_probe_before.skipped:
+                    props["activeProbeSkipped"] = True
+                    props["activeProbeSkipReason"] = ver.dynamic_probe_before.skip_reason
+                if ver.dynamic_probe_before.outbound_calls:
+                    props["outboundCalls"] = [
+                        c.model_dump() for c in ver.dynamic_probe_before.outbound_calls
+                    ]
             if ver.dynamic_probe_after is not None:
                 props["activeProbeFixedAfter"] = ver.dynamic_probe_after.matched_fixed
             if ver.dynamic_confirmed_and_fixed is not None:

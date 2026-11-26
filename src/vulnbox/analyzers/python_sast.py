@@ -5,7 +5,12 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
-from vulnbox.analyzers.base import extract_snippet, iter_source_files, make_finding_id
+from vulnbox.analyzers.base import (
+    extract_snippet,
+    iter_source_files,
+    make_finding_id,
+    safe_ast_parse,
+)
 from vulnbox.models import Finding, Severity
 
 SQL_KEYWORDS = ("select ", "insert ", "update ", "delete ", "drop ")
@@ -139,11 +144,20 @@ class _PythonSecurityVisitor(ast.NodeVisitor):
 
         if join_nodes and has_file_read:
             node = join_nodes[0]
+            has_http_context = bool(func.decorator_list) or any(
+                tok in src
+                for tok in ("request.", "parse_qs", "query_params", "req.", "flask", "FastAPI", "do_GET", "do_POST")
+            )
+            direct_user_arg = any(
+                isinstance(a, ast.Name) and a.id.lower() in {"name", "filename", "filepath", "file_path", "path", "rel_path", "target", "user_path"}
+                for a in node.args[1:]
+            )
+            path_sev: Severity = "high" if (has_http_context or direct_user_arg) else "low"
             self._add(
                 rule_id="PY-PATH-001",
                 cwe_id="CWE-22",
                 title="Unconstrained Path Join Before File Read",
-                severity="high",
+                severity=path_sev,
                 node=node,
                 message=(
                     f"Function '{func.name}' constructs a file path with os.path.join() "
@@ -153,7 +167,7 @@ class _PythonSecurityVisitor(ast.NodeVisitor):
                     "Resolve both the base directory and target path using Path.resolve() "
                     "and enforce target.is_relative_to(base_dir) before reading."
                 ),
-                metadata={"function": func.name},
+                metadata={"function": func.name, "http_context": has_http_context},
             )
 
     def visit_Call(self, node: ast.Call) -> None:
@@ -336,7 +350,7 @@ class PythonSASTAnalyzer:
         for py_file in iter_source_files(workspace_dir, (".py",)):
             try:
                 source = py_file.read_text(encoding="utf-8", errors="ignore")
-                tree = ast.parse(source, filename=str(py_file))
+                tree = safe_ast_parse(source, filename=str(py_file))
             except (OSError, SyntaxError):
                 continue
             rel = str(py_file.relative_to(workspace_dir))

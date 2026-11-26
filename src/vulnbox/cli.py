@@ -101,16 +101,26 @@ def scan(
         "--check-leaks",
         help="Run active loopback memory & file-descriptor stress probes for detected leak findings",
     ),
+    build_deps: bool = typer.Option(
+        False,
+        "--build-deps",
+        help="Build & cache a manifest-only Docker dependency layer (vulnbox-deps:<hash>)",
+    ),
+    image: str | None = typer.Option(
+        None, "--image", help="Custom pre-built Docker image tag for sandbox execution"
+    ),
     out: Path = typer.Option(Path("vulnbox-out"), "--out", help="Output directory for report bundle"),
 ) -> None:
     """Scrub a repository and run SAST, config hygiene, memory leak, and call-graph reachability analysis."""
-    engine = VulnBoxEngine(backend=backend)
+    engine = VulnBoxEngine(backend=backend, image=image or "vulnbox-sandbox:latest")
     report, written = engine.scan(
         repo,
         advisories_path=advisories,
         deep=deep,
         check_leaks=check_leaks,
         out_dir=out,
+        build_deps=build_deps,
+        image=image,
     )
 
     console.print(f"[bold]Scan complete[/bold]: {len(report.findings)} findings found.")
@@ -326,14 +336,45 @@ def verify_patch_cmd(
     start_cmd: str | None = typer.Option(None, "--start-cmd", help="Override server start command"),
     health_path: str | None = typer.Option(None, "--health-path", help="Override healthcheck path"),
     backend: str = typer.Option("auto", "--backend", help="Sandbox backend: auto, docker, local"),
+    build_deps: bool = typer.Option(
+        False,
+        "--build-deps",
+        help="Build & cache a manifest-only Docker dependency layer (vulnbox-deps:<hash>)",
+    ),
+    image: str | None = typer.Option(
+        None, "--image", help="Custom pre-built Docker image tag for sandbox execution"
+    ),
+    mocks: Path | None = typer.Option(
+        None, "--mocks", exists=True, help="Optional JSON file with explicit MockRule overrides"
+    ),
+    mocks_strict: bool = typer.Option(
+        False, "--mocks-strict", help="Return HTTP 502 for unmocked outbound calls instead of inferred 200"
+    ),
+    mock_integrations: bool = typer.Option(
+        True,
+        "--mock-integrations/--no-mock-integrations",
+        help="Auto-mock outbound HTTP/HTTPS integrations with expected-shape 200 responses + Redis/SMTP shims",
+    ),
+    services: str | None = typer.Option(
+        None, "--services", help="Comma-separated air-gapped Docker sidecars (e.g. postgres,redis)"
+    ),
+    auth_header: str | None = typer.Option(
+        None, "--auth-header", help="Optional auth header for probed routes"
+    ),
+    auth_jwt_claims: str | None = typer.Option(
+        None,
+        "--auth-jwt-claims",
+        help="JSON claims object to mint an HS256 test JWT signed with the sandbox dummy secret",
+    ),
     as_json: bool = typer.Option(False, "--json", help="Emit JSON result"),
 ) -> None:
     """Verify an external or agent-authored patch inside a scrubbed sandbox (exit 0 iff verified)."""
-    engine = VulnBoxEngine(backend=backend)
+    engine = VulnBoxEngine(backend=backend, image=image or "vulnbox-sandbox:latest")
     diff_text = patch_file.read_text(encoding="utf-8")
     reg_path = f"tests/{test_file.name}" if test_file else None
     reg_code = test_file.read_text(encoding="utf-8") if test_file else None
     probe_spec = load_probe_specs(probe_file)[0] if probe_file else None
+    mock_rules = load_mock_rules(mocks) if mocks else None
 
     result = engine.verify_external_patch(
         repo_path=repo,
@@ -346,6 +387,14 @@ def verify_patch_cmd(
         start_cmd=start_cmd,
         health_path=health_path,
         description=f"External patch from {patch_file.name}",
+        build_deps=build_deps,
+        image=image,
+        mock_integrations=mock_integrations,
+        mock_rules=mock_rules,
+        mocks_strict=mocks_strict,
+        services=_parse_services_opt(services),
+        auth_header=auth_header,
+        auth_jwt_claims=auth_jwt_claims,
     )
 
     if as_json:
@@ -386,7 +435,8 @@ def ui(
     """Launch the local CSRF-protected Web UI for all VulnBox workflows."""
     server = create_ui_server(host=host, port=port)
     bound_host, bound_port = server.server_address[:2]
-    url = f"http://{bound_host}:{bound_port}"
+    host_str = bound_host.decode("utf-8") if isinstance(bound_host, bytes) else str(bound_host)
+    url = f"http://{host_str}:{bound_port}"
     console.print(f"[bold green]VulnBox Web UI running[/bold green] at [bold]{url}[/bold]")
     console.print("Press Ctrl+C to stop.")
     if not no_browser:

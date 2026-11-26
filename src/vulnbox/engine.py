@@ -125,6 +125,8 @@ class VulnBoxEngine:
         start_cmd: str | None = None,
         health_path: str | None = None,
         out_dir: Path | None = None,
+        build_deps: bool = False,
+        image: str | None = None,
     ) -> tuple[AuditReport, dict[str, Path]]:
         repo = Path(repo_path).resolve()
         prof = profile_repo(repo)
@@ -133,60 +135,65 @@ class VulnBoxEngine:
         effective_health = health_path or prof.health_path
         memory_probes: list[MemoryLeakProbeResult] = []
 
-        with ScrubbedWorkspace(repo) as sws:
-            cg = build_hybrid_call_graph(
-                sws.path,
-                profile=prof,
-                backend=self.backend,
-                policy=self.sandbox_policy,
-                include_runtime=deep,
-            )
-            findings = run_all_analyzers(
-                sws.path,
-                scrub_summary=sws.summary,
-                advisories_path=advisories_path,
-                profile=prof,
-                registry=self.registry,
-                call_graph=cg,
-            )
-            if effective_check_leaks and effective_start:
-                for f in findings:
-                    if f.category not in ("memory_leak", "resource_leak"):
-                        continue
-                    mspec = infer_memory_probe_for_finding(
-                        f, sws.path, call_graph=cg, registry=self.registry
-                    )
-                    if mspec is not None:
-                        mres = run_memory_leak_probe(
-                            sws.path,
-                            backend=self.backend,
-                            start_cmd=effective_start,
-                            spec=mspec,
-                            health_path=effective_health,
-                            policy=self.sandbox_policy,
-                            registry=self.registry,
-                        )
-                        memory_probes.append(mres)
-
-            report = AuditReport(
-                tool_version=TOOL_VERSION,
-                timestamp=_utc_now(),
-                sandbox_backend=self.backend.name,
-                profile=prof,
-                scrub_summary=sws.summary,
-                findings=findings,
-                call_graph_summary=cg.to_summary(),
-                memory_probes=memory_probes,
-            )
-            written = (
-                write_report_bundle(
-                    report,
-                    resolve_repo_output_dir(out_dir, repo),
-                    registry=self.registry,
+        with self._execution_context(repo, build_deps=build_deps, image=image) as (
+            exec_backend,
+            exec_policy,
+            _svc_env,
+        ):
+            with ScrubbedWorkspace(repo) as sws:
+                cg = build_hybrid_call_graph(
+                    sws.path,
+                    profile=prof,
+                    backend=exec_backend,
+                    policy=exec_policy,
+                    include_runtime=deep,
                 )
-                if out_dir is not None
-                else {}
-            )
+                findings = run_all_analyzers(
+                    sws.path,
+                    scrub_summary=sws.summary,
+                    advisories_path=advisories_path,
+                    profile=prof,
+                    registry=self.registry,
+                    call_graph=cg,
+                )
+                if effective_check_leaks and effective_start:
+                    for f in findings:
+                        if f.category not in ("memory_leak", "resource_leak"):
+                            continue
+                        mspec = infer_memory_probe_for_finding(
+                            f, sws.path, call_graph=cg, registry=self.registry
+                        )
+                        if mspec is not None:
+                            mres = run_memory_leak_probe(
+                                sws.path,
+                                backend=exec_backend,
+                                start_cmd=effective_start,
+                                spec=mspec,
+                                health_path=effective_health,
+                                policy=exec_policy,
+                                registry=self.registry,
+                            )
+                            memory_probes.append(mres)
+
+                report = AuditReport(
+                    tool_version=TOOL_VERSION,
+                    timestamp=_utc_now(),
+                    sandbox_backend=exec_backend.name,
+                    profile=prof,
+                    scrub_summary=sws.summary,
+                    findings=findings,
+                    call_graph_summary=cg.to_summary(),
+                    memory_probes=memory_probes,
+                )
+                written = (
+                    write_report_bundle(
+                        report,
+                        resolve_repo_output_dir(out_dir, repo),
+                        registry=self.registry,
+                    )
+                    if out_dir is not None
+                    else {}
+                )
         return report, written
 
     def probe(

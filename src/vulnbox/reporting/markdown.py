@@ -75,6 +75,8 @@ def render_markdown_report(report: AuditReport) -> str:
                     active_str = "CONFIRMED -> FIXED"
                 elif ver.memory_leak_confirmed_and_fixed is True:
                     active_str = "LEAK -> FIXED"
+                elif ver.dynamic_probe_before is not None and ver.dynamic_probe_before.skipped:
+                    active_str = "SKIPPED"
                 elif ver.dynamic_confirmed_and_fixed is False or ver.memory_leak_confirmed_and_fixed is False:
                     active_str = "FAILED"
                 else:
@@ -122,29 +124,49 @@ def render_markdown_report(report: AuditReport) -> str:
             lines.append("")
 
             if ver.dynamic_probe_before is not None:
+                pb = ver.dynamic_probe_before
                 lines.extend(
                     [
-                        "#### Active Loopback Verification (`curl` Before vs. After Patch)",
+                        f"#### Active Loopback Verification (`curl` Before vs. After Patch — mode: `{pb.probe_mode}`)",
                         "",
                         "```bash",
-                        ver.dynamic_probe_before.curl_command,
+                        pb.curl_command,
                         "```",
                         "",
-                        f"- **Pre-Patch Response:** HTTP `{ver.dynamic_probe_before.status_code}` | `matched_vulnerable={ver.dynamic_probe_before.matched_vulnerable}`",
                     ]
                 )
-                if ver.dynamic_probe_before.response_body_excerpt:
+                if pb.skipped:
                     lines.append(
-                        f"  - Excerpt: `{ver.dynamic_probe_before.response_body_excerpt[:160].replace(chr(10), ' ')}`"
+                        f"- **Probe Status:** `SKIPPED` — {pb.skip_reason or pb.error or 'missing runtime deps or services'}"
                     )
-                if ver.dynamic_probe_after is not None:
+                else:
                     lines.append(
-                        f"- **Post-Patch Response (Same Probe):** HTTP `{ver.dynamic_probe_after.status_code}` | `matched_fixed={ver.dynamic_probe_after.matched_fixed}` | `matched_vulnerable={ver.dynamic_probe_after.matched_vulnerable}`"
+                        f"- **Pre-Patch Response:** HTTP `{pb.status_code}` | `matched_vulnerable={pb.matched_vulnerable}`"
                     )
-                    if ver.dynamic_probe_after.response_body_excerpt:
+                    if pb.response_body_excerpt:
                         lines.append(
-                            f"  - Excerpt: `{ver.dynamic_probe_after.response_body_excerpt[:160].replace(chr(10), ' ')}`"
+                            f"  - Excerpt: `{pb.response_body_excerpt[:160].replace(chr(10), ' ')}`"
                         )
+                    if pb.outbound_calls:
+                        hosts = ", ".join(
+                            f"`{c.method} {c.host}{c.path}` (HTTP {c.status_code})"
+                            for c in pb.outbound_calls[:10]
+                        )
+                        lines.append(f"  - **Intercepted Outbound Calls (SSRF Canary):** {hosts}")
+                    if ver.dynamic_probe_after is not None:
+                        pa = ver.dynamic_probe_after
+                        if pa.skipped:
+                            lines.append(
+                                f"- **Post-Patch Response:** `SKIPPED` — {pa.skip_reason or pa.error}"
+                            )
+                        else:
+                            lines.append(
+                                f"- **Post-Patch Response (Same Probe):** HTTP `{pa.status_code}` | `matched_fixed={pa.matched_fixed}` | `matched_vulnerable={pa.matched_vulnerable}`"
+                            )
+                            if pa.response_body_excerpt:
+                                lines.append(
+                                    f"  - Excerpt: `{pa.response_body_excerpt[:160].replace(chr(10), ' ')}`"
+                                )
                 lines.append("")
 
             if ver.memory_probe_before is not None:

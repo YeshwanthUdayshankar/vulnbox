@@ -70,3 +70,126 @@ def test_python_sast_skips_regex_guarded_path_join_and_setup_py_and_triages_chec
     md5_findings = [f for f in findings if f.rule_id == "PY-HASH-001"]
     assert len(md5_findings) == 1
     assert md5_findings[0].severity == "low"
+
+
+def test_python_path_severity_triage_and_reporting_phase1_to_4_parity(tmp_path: Path):
+    from vulnbox.models import (
+        AuditReport,
+        DynamicProbeResult,
+        Finding,
+        OutboundCallRecord,
+        RepoProfile,
+        ScrubSummary,
+        VerificationResult,
+    )
+    from vulnbox.reporting.markdown import render_markdown_report
+    from vulnbox.reporting.sarif import build_sarif, validate_sarif
+
+    (tmp_path / "paths.py").write_text(
+        "import os\n"
+        "def internal_helper(base, ts):\n"
+        "    p = os.path.join(base, f'snapshot-{ts}.txt')\n"
+        "    with open(p) as f:\n"
+        "        return f.read()\n"
+        "def read_user_file(base, filename):\n"
+        "    p = os.path.join(base, filename)\n"
+        "    with open(p) as f:\n"
+        "        return f.read()\n",
+        encoding="utf-8",
+    )
+    findings = PythonSASTAnalyzer().analyze(tmp_path)
+    by_fn = {f.metadata["function"]: f for f in findings if f.rule_id == "PY-PATH-001"}
+    assert by_fn["internal_helper"].severity == "low"
+    assert by_fn["read_user_file"].severity == "high"
+
+    # Verify Markdown & SARIF render skipped probe + outbound SSRF canary calls cleanly
+    f_skip = Finding(
+        finding_id="F-SKIP",
+        rule_id="PY-YAML-001",
+        cwe_id="CWE-502",
+        title="YAML",
+        category="sast",
+        severity="high",
+        file_path="app.py",
+        message="msg",
+        recommended_fix="fix",
+    )
+    f_ssrf = Finding(
+        finding_id="F-SSRF",
+        rule_id="PY-SSRF-001",
+        cwe_id="CWE-918",
+        title="SSRF",
+        category="sast",
+        severity="high",
+        file_path="app.py",
+        message="msg",
+        recommended_fix="fix",
+    )
+    report = AuditReport(
+        tool_version="0.1.0",
+        timestamp="2026-11-26T00:00:00Z",
+        sandbox_backend="local",
+        profile=RepoProfile(repo_path=str(tmp_path), ecosystem="python"),
+        scrub_summary=ScrubSummary(sandbox_dir=str(tmp_path)),
+        findings=[f_skip, f_ssrf],
+        verifications=[
+            VerificationResult(
+                patch_id="p1",
+                finding_id="F-SKIP",
+                sandbox_backend="local",
+                baseline_tests_passed=True,
+                patch_applied=True,
+                finding_resolved=True,
+                no_new_findings=True,
+                dynamic_probe_before=DynamicProbeResult(
+                    probe_id="pr1",
+                    curl_command="curl http://127.0.0.1:$PORT/",
+                    skipped=True,
+                    skip_reason="Boot skipped: missing dep",
+                    probe_mode="http_server",
+                ),
+                existing_tests_passed_after=True,
+                verified=True,
+                summary="ok",
+            ),
+            VerificationResult(
+                patch_id="p2",
+                finding_id="F-SSRF",
+                sandbox_backend="local",
+                baseline_tests_passed=True,
+                patch_applied=True,
+                finding_resolved=True,
+                no_new_findings=True,
+                dynamic_probe_before=DynamicProbeResult(
+                    probe_id="pr2",
+                    curl_command="curl http://127.0.0.1:$PORT/fetch",
+                    status_code=200,
+                    matched_vulnerable=True,
+                    probe_mode="in_process",
+                    outbound_calls=[
+                        OutboundCallRecord(
+                            host="169.254.169.254",
+                            method="GET",
+                            path="/latest/meta-data/",
+                            status_code=200,
+                        )
+                    ],
+                ),
+                existing_tests_passed_after=True,
+                verified=True,
+                summary="ok",
+            ),
+        ],
+    )
+    md = render_markdown_report(report)
+    assert "| SKIPPED |" in md
+    assert "Boot skipped: missing dep" in md
+    assert "Intercepted Outbound Calls (SSRF Canary)" in md
+    assert "169.254.169.254" in md
+
+    sarif = build_sarif(report)
+    validate_sarif(sarif)
+    res_props = {r["properties"]["findingId"]: r["properties"] for r in sarif["runs"][0]["results"]}
+    assert res_props["F-SKIP"]["activeProbeSkipped"] is True
+    assert res_props["F-SSRF"]["activeProbeMode"] == "in_process"
+    assert res_props["F-SSRF"]["outboundCalls"][0]["host"] == "169.254.169.254"

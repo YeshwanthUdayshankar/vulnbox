@@ -8,7 +8,7 @@ import shutil
 import socket
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urlparse
 
 from vulnbox.models import (
@@ -242,7 +242,7 @@ def _build_probe_result(
     exec_stdout: str,
     exec_stderr: str,
     exit_code: int,
-    default_mode: str = "http_server",
+    default_mode: Literal["http_server", "in_process"] = "http_server",
 ) -> DynamicProbeResult:
     if exit_code != 0 and not exec_stdout.strip():
         err_msg = f"Probe runner failed (rc={exit_code}): {exec_stderr.strip()}"
@@ -286,6 +286,10 @@ def _build_probe_result(
             status_code, res_headers, body_excerpt, outbound_hosts=outbound_hosts
         ) and _matches_cors_fixed(spec, res_headers)
 
+    raw_mode = str(data.get("probe_mode") or default_mode)
+    probe_mode: Literal["http_server", "in_process"] = (
+        "in_process" if raw_mode == "in_process" else "http_server"
+    )
     return DynamicProbeResult(
         probe_id=spec.probe_id,
         curl_command=curl_command,
@@ -297,7 +301,7 @@ def _build_probe_result(
         skipped=skip_reason is not None,
         skip_reason=skip_reason,
         outbound_calls=outbound_raw,
-        probe_mode=str(data.get("probe_mode") or default_mode),
+        probe_mode=probe_mode,
         error=err,
     )
 

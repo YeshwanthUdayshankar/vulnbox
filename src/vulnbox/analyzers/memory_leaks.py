@@ -7,7 +7,12 @@ import re
 from pathlib import Path
 from typing import Any
 
-from vulnbox.analyzers.base import extract_snippet, iter_source_files, make_finding_id
+from vulnbox.analyzers.base import (
+    extract_snippet,
+    iter_source_files,
+    make_finding_id,
+    safe_ast_parse,
+)
 from vulnbox.callgraph.ts_utils import node_text, parse_source, walk_nodes
 from vulnbox.models import Finding
 
@@ -52,7 +57,7 @@ def _analyze_python_leaks(
     for py_file in iter_source_files(workspace_dir, (".py",)):
         try:
             source = py_file.read_text(encoding="utf-8", errors="ignore")
-            tree = ast.parse(source)
+            tree = safe_ast_parse(source, filename=str(py_file))
         except (OSError, SyntaxError):
             continue
         rel = str(py_file.relative_to(workspace_dir))
@@ -214,10 +219,10 @@ def _analyze_python_leaks(
             with_managed_vars: set[str] = set()
             for sub in ast.walk(node):
                 if isinstance(sub, (ast.With, ast.AsyncWith)):
-                    for item in sub.items:
-                        with_calls.add(id(item.context_expr))
-                        if isinstance(item.context_expr, ast.Name):
-                            with_managed_vars.add(item.context_expr.id)
+                    for witem in sub.items:
+                        with_calls.add(id(witem.context_expr))
+                        if isinstance(witem.context_expr, ast.Name):
+                            with_managed_vars.add(witem.context_expr.id)
 
             # Collect returned variable names (factory functions intentionally return handles)
             returned_names: set[str] = set()

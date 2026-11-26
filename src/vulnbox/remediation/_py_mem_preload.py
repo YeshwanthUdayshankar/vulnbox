@@ -12,6 +12,7 @@ import os
 import signal
 import tracemalloc
 from pathlib import Path
+from typing import Any
 
 _SNAP_FILE = os.environ.get("VULNBOX_MEM_SNAP_FILE", "")
 _WORKSPACE = os.environ.get("VULNBOX_MEM_WORKSPACE", "")
@@ -44,9 +45,9 @@ def _install() -> None:
         current_bytes, _peak_bytes = tracemalloc.get_traced_memory()
         gc_garbage_count = len(gc.garbage)
 
-        top_allocs: list[dict[str, object]] = []
+        top_allocs: list[dict[str, Any]] = []
         retainer_summary = ""
-        if _SEQ <= 2:
+        if _SEQ <= 2 or _BASELINE_SNAP is None:
             # seq=1 warms up snapshot machinery; seq=2 captures clean S0 baseline
             _BASELINE_SNAP = snap
         else:

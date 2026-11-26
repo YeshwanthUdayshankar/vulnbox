@@ -5,7 +5,7 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
-from vulnbox.analyzers.base import iter_source_files
+from vulnbox.analyzers.base import iter_source_files, safe_ast_parse
 from vulnbox.callgraph.graph import CallGraph
 from vulnbox.models import CallEdge, CallNode, UnresolvedCallSite
 
@@ -90,7 +90,7 @@ def build_python_static_call_graph(workspace_dir: Path) -> CallGraph:
     for py_file in py_files:
         try:
             src = py_file.read_text(encoding="utf-8", errors="ignore")
-            tree = ast.parse(src)
+            tree = safe_ast_parse(src, filename=str(py_file))
         except (OSError, SyntaxError):
             continue
         rel = str(py_file.relative_to(workspace_dir))

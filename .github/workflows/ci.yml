@@ -32,8 +32,11 @@ jobs:
       - name: Lint with ruff
         run: uv run ruff check src tests scripts
 
+      - name: Type-check with mypy
+        run: uv run mypy src/vulnbox
+
       - name: Run pytest suite
-        run: uv run pytest -v
+        run: uv run pytest -v -m "not docker"
 
       - name: Dogfood VulnBox self-scan (expect 0 findings)
         run: |

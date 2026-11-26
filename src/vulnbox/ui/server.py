@@ -376,14 +376,16 @@ class VulnBoxUIHandler(BaseHTTPRequestHandler):
                 model=(body.get("llm_model") or "").strip() or None,
                 base_url=(body.get("llm_base_url") or "").strip() or None,
             )
-        max_retries = int(body.get("llm_max_retries") if body.get("llm_max_retries") is not None else 2)
+        raw_retries = body.get("llm_max_retries")
+        max_retries = int(raw_retries) if raw_retries is not None else 2
         max_retries = max(0, min(5, max_retries))
 
         out_raw = (body.get("out_dir") or "").strip()
         out_path = Path(out_raw).expanduser().resolve() if out_raw else None
         deep = bool(body.get("deep"))
         check_leaks = bool(body.get("check_leaks"))
-        max_workers = int(body.get("max_workers") if body.get("max_workers") is not None else 4)
+        raw_workers = body.get("max_workers")
+        max_workers = int(raw_workers) if raw_workers is not None else 4
         max_workers = max(1, min(16, max_workers))
         build_deps = bool(body.get("build_deps"))
         image = (body.get("image") or "").strip() or None

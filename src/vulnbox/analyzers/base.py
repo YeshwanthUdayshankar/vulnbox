@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import ast
 import hashlib
+import warnings
 from pathlib import Path
 from typing import Protocol
 
@@ -10,6 +12,13 @@ from vulnbox.constants import DEFAULT_SKIP_DIRS, is_test_or_fixture_path
 from vulnbox.models import Finding
 
 SKIP_DIRS = DEFAULT_SKIP_DIRS
+
+
+def safe_ast_parse(source: str, filename: str = "<unknown>") -> ast.Module:
+    """Parse Python source with SyntaxWarning suppressed for third-party regex escapes."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", SyntaxWarning)
+        return ast.parse(source, filename=filename)
 
 
 class Analyzer(Protocol):

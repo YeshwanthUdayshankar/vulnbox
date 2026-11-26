@@ -85,7 +85,7 @@ def _install_http_mock_hooks() -> None:
 
     # 2. Patch requests.Session.request if installed
     try:
-        import requests  # type: ignore[import-not-found]
+        import requests
 
         orig_req = requests.Session.request
 
@@ -104,13 +104,13 @@ def _install_http_mock_hooks() -> None:
                 url = f"http://{mock_host}:{mock_port}{target_path}"
             return orig_req(self, method, url, *args, **kwargs)
 
-        requests.Session.request = _patched_requests_request  # type: ignore[method-assign]
+        requests.Session.request = _patched_requests_request
     except Exception:
         pass
 
     # 3. Patch httpx.Client.send & httpx.AsyncClient.send if installed
     try:
-        import httpx  # type: ignore[import-not-found]
+        import httpx
 
         orig_send = httpx.Client.send
 
@@ -126,7 +126,7 @@ def _install_http_mock_hooks() -> None:
         def _patched_httpx_send(self: Any, request: Any, *args: Any, **kwargs: Any) -> Any:
             return orig_send(self, _rewrite_httpx_request(request), *args, **kwargs)
 
-        httpx.Client.send = _patched_httpx_send  # type: ignore[method-assign]
+        httpx.Client.send = _patched_httpx_send
 
         orig_async_send = httpx.AsyncClient.send
 
@@ -135,7 +135,7 @@ def _install_http_mock_hooks() -> None:
         ) -> Any:
             return await orig_async_send(self, _rewrite_httpx_request(request), *args, **kwargs)
 
-        httpx.AsyncClient.send = _patched_httpx_async_send  # type: ignore[method-assign]
+        httpx.AsyncClient.send = _patched_httpx_async_send
     except Exception:
         pass
 

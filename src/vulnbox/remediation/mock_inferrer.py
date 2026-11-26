@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+from vulnbox.analyzers.base import safe_ast_parse
 from vulnbox.models import MockRule
 
 SKIP_DIRS = {
@@ -274,7 +275,7 @@ def _analyze_python_file(
 ) -> None:
     try:
         src = py_file.read_text(encoding="utf-8", errors="ignore")
-        tree = ast.parse(src, filename=str(py_file))
+        tree = safe_ast_parse(src, filename=str(py_file))
     except (OSError, SyntaxError):
         return
 
@@ -295,23 +296,23 @@ def _analyze_python_file(
 
         if isinstance(node, ast.Assign) and isinstance(node.value, ast.Call):
             if _is_http_call(node.value):
-                ep: tuple[str, str] | None = None
+                assign_ep: tuple[str, str] | None = None
                 for arg in list(node.value.args) + [kw.value for kw in node.value.keywords]:
-                    ep = _extract_url_from_ast(arg)
-                    if ep:
+                    assign_ep = _extract_url_from_ast(arg)
+                    if assign_ep:
                         break
                 for tgt in node.targets:
                     if isinstance(tgt, ast.Name):
                         resp_vars.add(tgt.id)
-                        if ep:
-                            resp_endpoints[tgt.id] = ep
+                        if assign_ep:
+                            resp_endpoints[tgt.id] = assign_ep
             else:
                 is_json, src_resp = _is_json_decode_call(node.value, resp_vars)
                 if is_json:
-                    ep = resp_endpoints.get(src_resp) if src_resp else None
+                    json_ep = resp_endpoints.get(src_resp) if src_resp else None
                     for tgt in node.targets:
                         if isinstance(tgt, ast.Name):
-                            json_vars[tgt.id] = ep
+                            json_vars[tgt.id] = json_ep
 
         if isinstance(node, ast.With):
             for item in node.items:

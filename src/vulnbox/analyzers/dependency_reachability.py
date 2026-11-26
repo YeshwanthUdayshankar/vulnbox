@@ -10,7 +10,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-from vulnbox.analyzers.base import SKIP_DIRS, iter_source_files, make_finding_id
+from vulnbox.analyzers.base import SKIP_DIRS, iter_source_files, make_finding_id, safe_ast_parse
 from vulnbox.constants import is_test_or_fixture_path
 from vulnbox.models import Finding, ReachabilityStatus, Severity
 
@@ -203,7 +203,7 @@ def _check_python_reachability(
     for py_file in iter_source_files(workspace_dir, (".py",)):
         try:
             src = py_file.read_text(encoding="utf-8", errors="ignore")
-            tree = ast.parse(src, filename=str(py_file))
+            tree = safe_ast_parse(src, filename=str(py_file))
         except (OSError, SyntaxError):
             continue
 

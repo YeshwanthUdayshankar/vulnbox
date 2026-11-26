@@ -79,9 +79,9 @@ def _dispatch_request(
 
     # FastAPI / Starlette
     try:
-        from fastapi.testclient import TestClient  # type: ignore[import-not-found]
+        from fastapi.testclient import TestClient
     except ImportError:
-        from starlette.testclient import TestClient  # type: ignore[import-not-found]
+        from starlette.testclient import TestClient
 
     with TestClient(app) as client:
         resp = client.request(

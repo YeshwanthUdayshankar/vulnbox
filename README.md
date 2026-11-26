@@ -91,6 +91,10 @@ Patches: /tmp/vulnbox-docker-node/patches
 
 #### 1. `PY-YAML-001` — Unsafe YAML Deserialization (`app.py:17`, `CWE-502`)
 
+- **Core Issue:** `parse_config()` passes untrusted HTTP request bodies directly to `yaml.load(raw, Loader=yaml.FullLoader)`. Unlike `SafeLoader`, `FullLoader` honors Python-specific YAML object tags (`!!python/...`), allowing callers to instantiate arbitrary Python types during deserialization.
+- **How the `curl` Probe Verifies It:** VulnBox boots `app.py` inside the network-isolated Docker sandbox and sends a benign Python-tagged YAML document (`!!python/tuple [1, 2]`) to `POST /parse`. Because `FullLoader` executes Python tag constructors instead of restricting input to standard YAML primitives, the unpatched server returns `HTTP 200` with the deserialized tuple (`{"parsed": "(1, 2)"}`).
+- **How the Fix Resolves It:** Replacing `yaml.load(raw, Loader=yaml.FullLoader)` with `yaml.safe_load(raw)` restricts parsing to basic YAML types (strings, numbers, lists, dicts). Re-running the exact same `curl` command is rejected with `HTTP 400` (`could not determine a constructor for the tag 'tag:yaml.org,2002:python/tuple'`), while normal YAML configs continue passing all unit tests.
+
 **Active Loopback `curl` Probe Executed Inside Docker Sandbox:**
 ```bash
 curl -sS -i -X POST -H 'Content-Type: text/plain' --data '!!python/tuple [1, 2]' 'http://127.0.0.1:$PORT/parse'
@@ -141,6 +145,10 @@ content-length: 185
 ---
 
 #### 2. `PY-PATH-001` — Unconstrained `os.path.join` Before File Read (`app.py:22`, `CWE-22`)
+
+- **Core Issue:** `read_public_file(name)` combines `PUBLIC_DIR` with the caller-supplied `name` query parameter via `os.path.join(PUBLIC_DIR, name)` and immediately opens the file without canonicalizing or verifying that the resolved path stays inside `PUBLIC_DIR`. Relative `../` segments escape the intended directory.
+- **How the `curl` Probe Verifies It:** VulnBox creates a synthetic non-sensitive marker file (`vulnbox_boundary_marker.txt`) outside `public/` in the ephemeral sandbox and requests `GET /files?name=../vulnbox_boundary_marker.txt`. The unpatched server traverses up out of `public/` and leaks the marker with `HTTP 200` (`VULNBOX_BOUNDARY_MARKER_9F3A`).
+- **How the Fix Resolves It:** The patch canonicalizes both `PUBLIC_DIR` and the requested path with `Path.resolve()` and enforces `target.is_relative_to(_base_dir)`, raising `ValueError` if the path escapes the root. Re-running the exact same `curl` probe now returns `HTTP 403` (`{"error": "Path escapes allowed base directory"}`), while legitimate files inside `public/` still return `200`.
 
 **Active Loopback `curl` Probe Executed Inside Docker Sandbox** *(against a synthetic non-sensitive boundary marker `vulnbox_boundary_marker.txt` placed outside `public/` in the ephemeral sandbox)*:
 ```bash
@@ -200,9 +208,28 @@ content-length: 48
 
 ---
 
-#### 3. Additional Verified Patches in Python Sample Repo
+#### 3. Additional Findings & Verified Patches in Python Sample Repo
 
-All remaining auto-remediable findings transitioned regression tests `FAIL → PASS` and kept existing tests green (`2 passed`):
+- **`PY-TLS-001` (`app.py:29`, `CWE-295` — TLS Certificate Verification Disabled):**
+  - **Core Issue:** `fetch_upstream_status()` calls `requests_mod.get(url, verify=False, ...)`, disabling TLS certificate validation and exposing outbound HTTPS requests to man-in-the-middle interception.
+  - **Verification & Fix:** Verified via AST check + generated regression test (`FAIL → PASS`). Switching `verify=False` to `verify=True` restores standard CA certificate validation.
+- **`CFG-DOCKER-002` (`Dockerfile:1`, `CWE-829` — Unpinned Container Base Image):**
+  - **Core Issue:** `FROM python:latest` pulls a mutable floating tag, making builds non-reproducible and risking unexpected breaking or vulnerable base image changes.
+  - **Verification & Fix:** Verified via config analyzer + Dockerfile regression test (`FAIL → PASS`). Pinning to `FROM python:3.12-slim` locks the runtime baseline.
+- **`CFG-DOCKER-001` (`Dockerfile:4`, `CWE-250` — Container Runs as Root):**
+  - **Core Issue:** The `Dockerfile` omits a `USER` instruction, so the containerized app runs as UID `0` (`root`), amplifying blast radius if the process is compromised.
+  - **Verification & Fix:** Verified via config analyzer + Dockerfile regression test (`FAIL → PASS`). Adding `RUN useradd --create-home --uid 1000 appuser` and `USER appuser` drops privileges to a non-root user.
+- **`CFG-SECRET-001` (`.env:1`, `CWE-798` — Sensitive `.env` File in Repository):**
+  - **Core Issue:** A `.env` file containing credentials (`DATABASE_URL`, `API_TOKEN`) is present in the repository tree.
+  - **Verification & Fix:** Automatically scrubbed (`REDACTED_BY_VULNBOX_*`) before mounting into the sandbox and flagged for manual removal, `.gitignore` enforcement, and credential rotation.
+- **`DEP-CVE-2020-14343` (`requirements.txt:1`, `CWE-502` — Reachable PyYAML CVE):**
+  - **Core Issue:** `PyYAML==5.3.1` is vulnerable to arbitrary code execution via `FullLoader`/`yaml.load`, and AST call-graph analysis confirms it is **reachable** (`app.py:17`).
+  - **Verification & Fix:** Verified via reachability analyzer + manifest version regression test (`FAIL → PASS`). Bumping to `PyYAML>=6.0.2` moves off the vulnerable release.
+- **`DEP-CVE-2023-45803` (`requirements.txt:2`, `CWE-200` — Unreachable `urllib3` CVE):**
+  - **Core Issue:** `urllib3==1.26.5` does not strip request bodies on cross-origin redirects; AST analysis classifies it as **`not_reachable`** (never imported in source), reducing triage urgency while still offering a clean upgrade path.
+  - **Verification & Fix:** Verified via manifest version regression test (`FAIL → PASS`) with zero impact on existing unit tests by upgrading to `urllib3>=2.2.3`.
+
+All 5 auto-remediable diffs below transitioned regression tests `FAIL → PASS` and kept existing tests green (`2 passed`):
 
 ```diff
 # patches/PY-TLS-001-8289e912.patch (CWE-295)
@@ -267,6 +294,10 @@ All remaining auto-remediable findings transitioned regression tests `FAIL → P
 
 #### 1. `JS-PATH-001` — Unconstrained `path.join` Before File Read (`server.mjs:14`, `CWE-22`)
 
+- **Core Issue:** `readPublicFile(name)` constructs a path with `path.join(PUBLIC_DIR, name)` and reads it directly via `fs.readFileSync(target, "utf8")`. Because `path.join()` resolves `..` sequences without checking whether the output stays under `PUBLIC_DIR`, callers can traverse outside the public directory.
+- **How the `curl` Probe Verifies It:** VulnBox writes a synthetic boundary marker (`vulnbox_boundary_marker.txt`) one directory above `public/` inside the ephemeral Docker sandbox and sends `GET /files?name=../vulnbox_boundary_marker.txt`. The unpatched server resolves the parent traversal and returns `HTTP 200` with `VULNBOX_BOUNDARY_MARKER_9F3A`.
+- **How the Fix Resolves It:** The patch resolves `_baseDir = path.resolve(PUBLIC_DIR)` and `target = path.resolve(_baseDir, name)` and throws an error unless `target` stays inside `_baseDir + path.sep`. Re-running the exact same `curl` probe now returns `HTTP 403` (`{"error":"Path escapes allowed base directory"}`), while normal public files continue passing `node --test`.
+
 **Active Loopback `curl` Probe Executed Inside Docker Sandbox:**
 ```bash
 curl -sS -i -X GET 'http://127.0.0.1:$PORT/files?name=../vulnbox_boundary_marker.txt'
@@ -315,6 +346,10 @@ content-type: application/json
 ---
 
 #### 2. `JS-CORS-001` — Permissive CORS Origin Reflection with Credentials (`server.mjs:29`, `CWE-942`)
+
+- **Core Issue:** The `/api/data` route copies any incoming `Origin` request header directly into `Access-Control-Allow-Origin` (`req.headers.origin || "*"`) while also sending `Access-Control-Allow-Credentials: true`. This lets any untrusted third-party site issue credentialed cross-origin requests from a victim's browser and read private API responses.
+- **How the `curl` Probe Verifies It:** VulnBox sends `GET /api/data` with an untrusted header `Origin: https://untrusted.example`. The unpatched server reflects `access-control-allow-origin: https://untrusted.example` together with `access-control-allow-credentials: true`, confirming live arbitrary-origin reflection.
+- **How the Fix Resolves It:** The patch validates `req.headers.origin` against an explicit allowlist (`const _allowedOrigins = new Set(["http://localhost:3000"])`) and only sets `Access-Control-Allow-Origin` for approved origins. Re-running the exact same `curl` probe confirms `access-control-allow-origin` is omitted for `https://untrusted.example`.
 
 **Active Loopback `curl` Probe Executed Inside Docker Sandbox:**
 ```bash
@@ -366,7 +401,17 @@ content-type: application/json
 
 ---
 
-#### 3. Additional Verified Patches in Node.js Sample Repo
+#### 3. Additional Findings & Verified Patches in Node.js Sample Repo
+
+- **`JS-TLS-001` (`server.mjs:10`, `CWE-295` — TLS Certificate Validation Disabled):**
+  - **Core Issue:** `upstreamTlsOptions` sets `rejectUnauthorized: false`, disabling TLS certificate verification on outbound connections and allowing MITM attacks.
+  - **Verification & Fix:** Verified via SAST + generated `node:test` regression test (`FAIL → PASS`). Setting `rejectUnauthorized: true` enforces strict certificate validation.
+- **`DEP-CVE-2021-23337` (`package.json:10`, `CWE-78` — `lodash` Command Injection in `template()`):**
+  - **Core Issue:** `lodash` `4.17.20` is vulnerable to command injection in `template()`; import/symbol reachability analysis confirms it is **`not_reachable`** in `server.mjs`.
+  - **Verification & Fix:** Verified via version regression test (`FAIL → PASS`) and existing `node --test` suite by upgrading to `^4.17.21`.
+- **`DEP-CVE-2021-44906` (`package.json:11`, `CWE-1321` — `minimist` Prototype Pollution):**
+  - **Core Issue:** `minimist` `1.2.5` is vulnerable to prototype pollution; reachability analysis marks it **`not_reachable`** in source while still validating a clean upgrade.
+  - **Verification & Fix:** Verified via version regression test (`FAIL → PASS`) and existing `node --test` suite by upgrading to `^1.2.8`.
 
 ```diff
 # patches/JS-TLS-001-c9bb02c4.patch (CWE-295)

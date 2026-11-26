@@ -201,15 +201,25 @@ class _PythonSecurityVisitor(ast.NodeVisitor):
                     for kw in node.keywords
                 )
                 if shell_true:
+                    cmd_arg = node.args[0] if node.args else next(
+                        (kw.value for kw in node.keywords if kw.arg == "args"), None
+                    )
+                    is_static_cmd = cmd_arg is not None and isinstance(cmd_arg, ast.Constant)
+                    sev_cmd: Severity = "low" if is_static_cmd else "critical"
+                    msg_cmd = (
+                        f"{name}() invoked with shell=True on a static command string; prefer an explicit argument list with shell=False."
+                        if is_static_cmd
+                        else f"{name}() invoked with shell=True risks shell command injection."
+                    )
                     self._add(
                         rule_id="PY-CMD-001",
                         cwe_id="CWE-78",
                         title="Subprocess Invocation with shell=True",
-                        severity="critical",
+                        severity=sev_cmd,
                         node=node,
-                        message=f"{name}() invoked with shell=True risks shell command injection.",
+                        message=msg_cmd,
                         recommended_fix="Pass an argument list and set shell=False.",
-                        metadata={"call": name},
+                        metadata={"call": name, "static_command": is_static_cmd},
                     )
 
         # PY-SQL-001: cursor.execute(f"SELECT ...")

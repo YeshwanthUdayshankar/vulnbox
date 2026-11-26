@@ -8,6 +8,8 @@ DEFAULT_SKIP_DIRS: frozenset[str] = frozenset(
     {
         ".git",
         ".venv",
+        ".vulnbox-cache",
+        ".yarn",
         "venv",
         "node_modules",
         "__pycache__",
@@ -19,7 +21,7 @@ DEFAULT_SKIP_DIRS: frozenset[str] = frozenset(
     }
 )
 
-TEST_DIR_NAMES: frozenset[str] = frozenset({"tests", "__tests__", "fixtures"})
+TEST_DIR_NAMES: frozenset[str] = frozenset({"tests", "test", "__tests__", "fixtures"})
 
 TEST_FILE_SUFFIXES: tuple[str, ...] = (
     "_test.py",

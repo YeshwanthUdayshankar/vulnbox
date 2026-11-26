@@ -72,3 +72,48 @@ def test_monorepo_nested_manifests_and_curl_pipe_bash_and_env_triage(tmp_path: P
         assert by_rule_file[("CFG-SECRET-001", "backend/.env")].severity == "high"
     finally:
         cleanup_workspace(ws)
+
+
+def test_real_world_precision_multistage_docker_yarn_test_dir_and_static_shell(tmp_path: Path):
+    # 1. Vendored .yarn release must be ignored
+    (tmp_path / ".yarn" / "releases").mkdir(parents=True)
+    (tmp_path / ".yarn" / "releases" / "yarn-4.0.cjs").write_text("eval(x); new Function(y);\n", encoding="utf-8")
+
+    # 2. Singular `pkg/test/` helper dir must be skipped
+    (tmp_path / "pkg" / "test").mkdir(parents=True)
+    (tmp_path / "pkg" / "test" / "helper.py").write_text(
+        "import os\ndef f(x):\n    return open(os.path.join('/tmp', x)).read()\n",
+        encoding="utf-8",
+    )
+
+    # 3. Docker multi-stage AS alias + ARG default should not trigger CFG-DOCKER-002
+    (tmp_path / "Dockerfile").write_text(
+        "ARG BASE_IMAGE=python:3.12-slim\n"
+        "FROM ${BASE_IMAGE} AS base\n"
+        "FROM base AS builder\n"
+        "FROM base\n"
+        "USER appuser\n",
+        encoding="utf-8",
+    )
+
+    # 4. Static literal vs dynamic subprocess(..., shell=True)
+    (tmp_path / "build_hook.py").write_text(
+        "import subprocess\n"
+        "def build(user_arg):\n"
+        "    subprocess.check_output('yarn build', shell=True)\n"
+        "    subprocess.check_output(f'yarn {user_arg}', shell=True)\n",
+        encoding="utf-8",
+    )
+
+    findings = run_all_analyzers(tmp_path)
+    assert not any(".yarn" in f.file_path for f in findings)
+    assert not any("pkg/test" in f.file_path for f in findings)
+    assert not any(f.rule_id == "CFG-DOCKER-002" for f in findings)
+
+    cmd_findings = sorted(
+        [f for f in findings if f.rule_id == "PY-CMD-001"],
+        key=lambda f: f.start_line,
+    )
+    assert len(cmd_findings) == 2
+    assert cmd_findings[0].severity == "low"
+    assert cmd_findings[1].severity == "critical"

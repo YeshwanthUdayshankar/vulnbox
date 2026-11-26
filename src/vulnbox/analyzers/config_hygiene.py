@@ -129,12 +129,30 @@ class ConfigHygieneAnalyzer:
 
         last_user: str | None = None
         last_user_line = 1
+        defined_stages: set[str] = {"scratch"}
+        arg_defaults: dict[str, str] = {}
 
         for idx, line in enumerate(lines, start=1):
+            arg_m = re.match(r"^\s*ARG\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(\S+)", line, re.IGNORECASE)
+            if arg_m:
+                arg_defaults[arg_m.group(1)] = arg_m.group(2).strip("'\"")
+
             from_m = FROM_RE.match(line)
             if from_m:
-                image = from_m.group(1)
-                if ":" not in image or image.endswith(":latest"):
+                raw_image = from_m.group(1)
+                stage_m = re.search(r"\bAS\s+([A-Za-z0-9_.-]+)\b", line, re.IGNORECASE)
+                if stage_m:
+                    defined_stages.add(stage_m.group(1).lower())
+
+                # Resolve simple ${ARG} / $ARG defaults if defined earlier in Dockerfile
+                image = raw_image
+                var_m = re.fullmatch(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?", raw_image)
+                if var_m and var_m.group(1) in arg_defaults:
+                    image = arg_defaults[var_m.group(1)]
+
+                is_stage_alias = image.lower() in defined_stages
+                is_unresolved_arg = image.startswith("$")
+                if not is_stage_alias and not is_unresolved_arg and (":" not in image or image.endswith(":latest")):
                     findings.append(
                         Finding(
                             finding_id=make_finding_id("CFG-DOCKER-002", rel, idx),

@@ -15,9 +15,19 @@ from rich.table import Table
 from vulnbox import __version__
 from vulnbox.engine import VulnBoxEngine
 from vulnbox.llm import GuardrailPolicy, LLMConfig
-from vulnbox.remediation import load_probe_specs
-from vulnbox.sandbox import DockerSandboxBackend, LocalSandboxBackend
+from vulnbox.remediation import load_mock_rules, load_probe_specs
+from vulnbox.sandbox import (
+    DockerSandboxBackend,
+    LocalSandboxBackend,
+    prune_dependency_images,
+)
 from vulnbox.ui import create_ui_server
+
+
+def _parse_services_opt(services: str | None) -> list[str]:
+    if not services:
+        return []
+    return [s.strip().lower() for s in services.split(",") if s.strip()]
 
 app = typer.Typer(
     name="vulnbox",
@@ -124,24 +134,76 @@ def probe(
     start_cmd: str | None = typer.Option(None, "--start-cmd", help="Override server start command"),
     health_path: str | None = typer.Option(None, "--health-path", help="Override healthcheck path"),
     backend: str = typer.Option("auto", "--backend", help="Sandbox backend: auto, docker, local"),
+    build_deps: bool = typer.Option(
+        False,
+        "--build-deps",
+        help="Build & cache a manifest-only Docker dependency layer (vulnbox-deps:<hash>)",
+    ),
+    image: str | None = typer.Option(
+        None, "--image", help="Custom pre-built Docker image tag for sandbox execution"
+    ),
+    mocks: Path | None = typer.Option(
+        None, "--mocks", exists=True, help="Optional JSON file with explicit MockRule overrides"
+    ),
+    mocks_strict: bool = typer.Option(
+        False, "--mocks-strict", help="Return HTTP 502 for unmocked outbound calls instead of inferred 200"
+    ),
+    mock_integrations: bool = typer.Option(
+        True,
+        "--mock-integrations/--no-mock-integrations",
+        help="Auto-mock outbound HTTP/HTTPS integrations with expected-shape 200 responses + Redis/SMTP shims",
+    ),
+    services: str | None = typer.Option(
+        None, "--services", help="Comma-separated air-gapped Docker sidecars (e.g. postgres,redis)"
+    ),
+    auth_header: str | None = typer.Option(
+        None, "--auth-header", help="Optional auth header for probed routes (e.g. 'Authorization: Bearer ...')"
+    ),
+    auth_jwt_claims: str | None = typer.Option(
+        None,
+        "--auth-jwt-claims",
+        help="JSON claims object to mint an HS256 test JWT signed with the sandbox dummy secret",
+    ),
 ) -> None:
     """Start the repo inside a scrubbed sandbox on 127.0.0.1 and run active curl probes."""
-    engine = VulnBoxEngine(backend=backend)
+    engine = VulnBoxEngine(backend=backend, image=image or "vulnbox-sandbox:latest")
     specs = load_probe_specs(probe_file)
+    mock_rules = load_mock_rules(mocks) if mocks else None
     try:
-        results = engine.probe(repo, specs=specs, start_cmd=start_cmd, health_path=health_path)
+        results = engine.probe(
+            repo,
+            specs=specs,
+            start_cmd=start_cmd,
+            health_path=health_path,
+            build_deps=build_deps,
+            image=image,
+            mock_integrations=mock_integrations,
+            mock_rules=mock_rules,
+            mocks_strict=mocks_strict,
+            services=_parse_services_opt(services),
+            auth_header=auth_header,
+            auth_jwt_claims=auth_jwt_claims,
+        )
     except ValueError as exc:
         console.print(f"[red]{exc}[/red]")
         raise typer.Exit(code=2) from exc
 
     any_error = False
     for res in results:
-        console.print(f"[bold]Probe:[/bold] {res.probe_id}")
+        console.print(f"[bold]Probe:[/bold] {res.probe_id} (mode={res.probe_mode})")
         console.print(f"  curl: {res.curl_command}")
-        console.print(
-            f"  HTTP {res.status_code} | matched_vulnerable={res.matched_vulnerable} | matched_fixed={res.matched_fixed}"
-        )
-        if res.error:
+        if res.skipped:
+            console.print(f"  [yellow]SKIPPED: {res.skip_reason}[/yellow]")
+        else:
+            console.print(
+                f"  HTTP {res.status_code} | matched_vulnerable={res.matched_vulnerable} | matched_fixed={res.matched_fixed}"
+            )
+        if res.outbound_calls:
+            hosts = ", ".join(sorted({c.host for c in res.outbound_calls}))
+            console.print(
+                f"  [cyan]Intercepted outbound calls ({len(res.outbound_calls)}): {hosts}[/cyan]"
+            )
+        if res.error and not res.skipped:
             console.print(f"  [red]error: {res.error}[/red]")
             any_error = True
 
@@ -167,6 +229,36 @@ def remediate(
         "--check-leaks",
         help="Enable active before/after heap slope and file-descriptor leak verification",
     ),
+    build_deps: bool = typer.Option(
+        False,
+        "--build-deps",
+        help="Build & cache a manifest-only Docker dependency layer (vulnbox-deps:<hash>)",
+    ),
+    image: str | None = typer.Option(
+        None, "--image", help="Custom pre-built Docker image tag for sandbox execution"
+    ),
+    mocks: Path | None = typer.Option(
+        None, "--mocks", exists=True, help="Optional JSON file with explicit MockRule overrides"
+    ),
+    mocks_strict: bool = typer.Option(
+        False, "--mocks-strict", help="Return HTTP 502 for unmocked outbound calls instead of inferred 200"
+    ),
+    mock_integrations: bool = typer.Option(
+        True,
+        "--mock-integrations/--no-mock-integrations",
+        help="Auto-mock outbound HTTP/HTTPS integrations with expected-shape 200 responses + Redis/SMTP shims",
+    ),
+    services: str | None = typer.Option(
+        None, "--services", help="Comma-separated air-gapped Docker sidecars (e.g. postgres,redis)"
+    ),
+    auth_header: str | None = typer.Option(
+        None, "--auth-header", help="Optional auth header for probed routes"
+    ),
+    auth_jwt_claims: str | None = typer.Option(
+        None,
+        "--auth-jwt-claims",
+        help="JSON claims object to mint an HS256 test JWT signed with the sandbox dummy secret",
+    ),
     llm: bool = typer.Option(False, "--llm", help="Enable guarded LLM synthesis for findings without deterministic patches"),
     llm_provider: str = typer.Option("ollama", "--llm-provider", help="LLM provider: ollama, openai, gemini, custom"),
     llm_model: str | None = typer.Option(None, "--llm-model", help="Override LLM model name"),
@@ -176,8 +268,9 @@ def remediate(
     out: Path = typer.Option(Path("vulnbox-out"), "--out", help="Output directory for report bundle"),
 ) -> None:
     """Run full end-to-end sandbox scan, active pre/post curl probing, patching, and dual verification."""
-    engine = VulnBoxEngine(backend=backend)
+    engine = VulnBoxEngine(backend=backend, image=image or "vulnbox-sandbox:latest")
     custom_probes = load_probe_specs(probe_file) if probe_file else []
+    mock_rules = load_mock_rules(mocks) if mocks else None
     llm_cfg = LLMConfig(provider=llm_provider, model=llm_model, base_url=llm_base_url) if llm else None
 
     report, written = engine.remediate(
@@ -192,6 +285,14 @@ def remediate(
         guardrail_policy=GuardrailPolicy(max_retries=llm_max_retries),
         max_workers=jobs,
         out_dir=out,
+        build_deps=build_deps,
+        image=image,
+        mock_integrations=mock_integrations,
+        mock_rules=mock_rules,
+        mocks_strict=mocks_strict,
+        services=_parse_services_opt(services),
+        auth_header=auth_header,
+        auth_jwt_claims=auth_jwt_claims,
     )
 
     verified_count = sum(1 for v in report.verifications if v.verified)
@@ -264,6 +365,16 @@ def verify_patch_cmd(
 
     if not result.verified:
         raise typer.Exit(code=1)
+
+
+@app.command("clean-cache")
+def clean_cache() -> None:
+    """Remove locally cached VulnBox Docker dependency images (vulnbox-deps:*)."""
+    removed = prune_dependency_images()
+    if removed:
+        console.print(f"[green]Removed {len(removed)} cached dependency image(s):[/green] {', '.join(removed)}")
+    else:
+        console.print("No cached vulnbox-deps:* Docker images found.")
 
 
 @app.command()

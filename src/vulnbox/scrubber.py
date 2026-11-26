@@ -62,8 +62,71 @@ PLACEHOLDER_VALUES = {
 }
 
 
+def _format_preserving_dummy_value(key_name: str, raw_val: str, is_secret_key: bool) -> str:
+    """Return a syntactically valid, zero-secret dummy value containing REDACTED_BY_VULNBOX_<KEY>.
+
+    Every generated value preserves the `REDACTED_BY_VULNBOX_<KEY>` marker while matching
+    DSN, URL, email, and minimum-length secret formats so frameworks like SQLAlchemy,
+    Pydantic, Redis, and JWT verifiers boot cleanly inside the air-gapped sandbox.
+    """
+    marker = f"REDACTED_BY_VULNBOX_{key_name}"
+    upper = key_name.upper()
+    low_val = raw_val.lower()
+
+    if low_val.startswith(("postgres://", "postgresql://")) or upper in ("POSTGRES_URL", "PG_URL"):
+        return f"postgresql://vulnbox:{marker}@127.0.0.1:5432/vulnbox"
+    if low_val.startswith("sqlite:") or upper in (
+        "DATABASE_URL",
+        "DB_URL",
+        "SQLALCHEMY_DATABASE_URI",
+    ):
+        return f"sqlite:////tmp/{marker}.db"
+    if low_val.startswith(("mysql://", "mysql+pymysql://")) or upper == "MYSQL_URL":
+        return f"mysql://vulnbox:{marker}@127.0.0.1:3306/vulnbox"
+    if low_val.startswith(("mongodb://", "mongodb+srv://")) or upper in ("MONGO_URL", "MONGODB_URI"):
+        return f"mongodb://127.0.0.1:27017/{marker}"
+    if low_val.startswith(("redis://", "rediss://")) or "REDIS_URL" in upper or "REDIS_URI" in upper:
+        return f"redis://:{marker}@127.0.0.1:6379/0"
+    if low_val.startswith(("smtp://", "smtps://")) or "SMTP_URL" in upper:
+        return f"smtp://vulnbox:{marker}@127.0.0.1:1025"
+    if low_val.startswith(("http://", "https://")) or upper.endswith(
+        ("_URL", "_URI", "_ENDPOINT", "_ORIGIN", "_BASE_URL", "_API_URL")
+    ):
+        return f"http://127.0.0.1:18080/mock/{marker}"
+    if ("@" in raw_val and "://" not in raw_val) or upper.endswith("_EMAIL"):
+        return f"{marker}@vulnbox.invalid"
+    if is_secret_key or any(
+        tok in upper for tok in ("SECRET", "JWT", "SIGNING", "KEY", "SALT", "PEPPER", "TOKEN")
+    ):
+        return f"{marker}_0123456789abcdef0123456789abcdef"
+    return marker
+
+
+def parse_workspace_env_vars(workspace_dir: Path) -> dict[str, str]:
+    """Read key=value entries from scrubbed `.env` files inside a sandbox workspace."""
+    env_vars: dict[str, str] = {}
+    for candidate in (".env", ".env.local", ".env.development"):
+        env_file = workspace_dir / candidate
+        if not env_file.is_file():
+            continue
+        try:
+            content = env_file.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        for line in content.splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            match = ENV_LINE_RE.match(line)
+            if match:
+                k = match.group(2)
+                v = match.group(3).strip().strip("\"'")
+                env_vars[k] = v
+    return env_vars
+
+
 def _classify_and_scrub_env_content(content: str) -> tuple[str, int, str]:
-    """Preserve env variable names, redact values, and classify secret risk.
+    """Preserve env variable names, redact values with format-preserving dummies, and classify risk.
 
     Classification:
       - 'real_secret': secret-named key with non-placeholder value
@@ -94,7 +157,8 @@ def _classify_and_scrub_env_content(content: str) -> tuple[str, int, str]:
                 elif low_val not in ("", "false", "true", "none", "null"):
                     has_real_secret = True
 
-            out_lines.append(f"{prefix}REDACTED_BY_VULNBOX_{key_name}")
+            dummy_val = _format_preserving_dummy_value(key_name, raw_val, is_secret_key)
+            out_lines.append(f"{prefix}{dummy_val}")
             redacted += 1
         else:
             out_lines.append(line)

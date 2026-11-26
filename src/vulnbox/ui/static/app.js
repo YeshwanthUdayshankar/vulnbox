@@ -478,6 +478,8 @@ document.getElementById("btn-remediate").addEventListener("click", async () => {
       max_workers: Number(document.getElementById("rem-jobs").value || 4),
       deep: document.getElementById("rem-deep-toggle").checked,
       check_leaks: document.getElementById("rem-leaks-toggle").checked,
+      mock_integrations: document.getElementById("rem-mock-toggle").checked,
+      build_deps: document.getElementById("rem-build-deps-toggle").checked,
       llm_enabled: document.getElementById("rem-llm-toggle").checked,
       llm_provider: document.getElementById("rem-llm-provider").value,
       llm_model: document.getElementById("rem-llm-model").value,
@@ -499,24 +501,45 @@ document.getElementById("btn-probe").addEventListener("click", async () => {
       start_cmd: document.getElementById("probe-start").value,
       backend: document.getElementById("probe-backend").value,
       probe_json: document.getElementById("probe-json").value,
+      mock_integrations: document.getElementById("probe-mock-toggle").checked,
+      mocks_json: document.getElementById("probe-mocks-json").value,
+      auth_header: document.getElementById("probe-auth-header").value,
+      auth_jwt_claims: document.getElementById("probe-jwt-claims").value,
+      image: document.getElementById("probe-image").value,
     });
     setStatus("", "");
     const out = document.getElementById("probe-results");
     out.replaceChildren(
-      ...(data.results || []).map((r) =>
-        el("div", { class: "card" }, [
+      ...(data.results || []).map((r) => {
+        const children = [
           el("div", { class: "finding-header" }, [
-            el("strong", { text: `Probe: ${r.probe_id}` }),
+            el("strong", { text: `Probe: ${r.probe_id} (${r.probe_mode || "http_server"})` }),
             el("div", { class: "doctor-bar" }, [
-              el("span", { class: `pill ${r.matched_vulnerable ? "err" : "ok"}`, text: `HTTP ${r.status_code ?? "ERR"}` }),
+              el("span", {
+                class: `pill ${r.skipped ? "warn" : r.matched_vulnerable ? "err" : "ok"}`,
+                text: r.skipped ? "SKIPPED" : `HTTP ${r.status_code ?? "ERR"}`,
+              }),
               el("span", { class: `pill ${r.matched_vulnerable ? "err" : "info"}`, text: `vulnerable=${r.matched_vulnerable}` }),
               el("span", { class: `pill ${r.matched_fixed ? "ok" : "warn"}`, text: `fixed=${r.matched_fixed}` }),
             ]),
           ]),
           el("pre", { text: r.curl_command }),
-          el("pre", { text: r.error || r.response_body_excerpt || JSON.stringify(r.response_headers, null, 2) }),
-        ])
-      )
+          el("pre", { text: r.skip_reason || r.error || r.response_body_excerpt || JSON.stringify(r.response_headers, null, 2) }),
+        ];
+        if (Array.isArray(r.outbound_calls) && r.outbound_calls.length > 0) {
+          children.push(
+            el("div", { class: "probe-box mt-10" }, [
+              el("div", { class: "pill info", text: `Intercepted Outbound Calls / SSRF Canary (${r.outbound_calls.length})` }),
+              el("pre", {
+                text: r.outbound_calls
+                  .map((c) => `${c.method} ${c.host}${c.path} -> HTTP ${c.status_code} [${c.matched_rule || "mock"}]`)
+                  .join("\n"),
+              }),
+            ])
+          );
+        }
+        return el("div", { class: "card" }, children);
+      })
     );
   } catch (err) {
     setStatus("error", err.message);

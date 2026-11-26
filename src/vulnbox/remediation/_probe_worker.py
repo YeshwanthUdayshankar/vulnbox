@@ -1,15 +1,19 @@
 """Standalone stdlib worker executed inside the sandbox to run a loopback HTTP probe.
 
-Starts the target server on 127.0.0.1:<port>, polls the health endpoint, sends a single
-loopback curl/urllib request, tears down the server process group cleanly, and emits JSON.
+Starts optional in-sandbox HTTP mock server + Redis/SMTP shims + Python/Node outbound
+HTTP preload interceptors, boots the target server on 127.0.0.1:<port>, polls the health
+endpoint, sends a loopback curl/urllib request, records intercepted outbound calls
+(SSRF canary), tears down all processes cleanly, and emits JSON.
 """
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -17,6 +21,23 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any
+
+
+def _pick_free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+def _load_local_module(mod_name: str, file_path: Path) -> Any | None:
+    if not file_path.is_file():
+        return None
+    spec = importlib.util.spec_from_file_location(mod_name, str(file_path))
+    if spec is None or spec.loader is None:
+        return None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
 
 def parse_curl_http_output(raw: str) -> tuple[int | None, dict[str, str], str]:
@@ -53,20 +74,75 @@ def main(cfg_path: str) -> None:
     body: str | None = cfg.get("body")
     marker_file: str | None = cfg.get("setup_marker_file")
     marker_content: str = cfg.get("setup_marker_content") or ""
+    mock_integrations: bool = bool(cfg.get("mock_integrations", True))
+    mock_rules: list[dict[str, Any]] = cfg.get("mock_rules") or []
+    mocks_strict: bool = bool(cfg.get("mocks_strict", False))
+    extra_env: dict[str, str] = cfg.get("extra_env") or {}
 
+    cwd = Path.cwd()
     base_url = f"http://127.0.0.1:{port}"
     created_marker: Path | None = None
     if marker_file:
         mp = Path(marker_file)
         if not mp.is_absolute():
-            mp = Path.cwd() / mp
+            mp = cwd / mp
         mp.parent.mkdir(parents=True, exist_ok=True)
         mp.write_text(marker_content, encoding="utf-8")
         created_marker = mp
 
     env = os.environ.copy()
+    env.update(extra_env)
     env["HOST"] = "127.0.0.1"
     env["PORT"] = str(port)
+
+    mock_server: Any = None
+    redis_shim: Any = None
+    smtp_shim: Any = None
+
+    if mock_integrations:
+        mock_mod = _load_local_module("_vb_mock_srv", cwd / ".vulnbox_mock_server.py")
+        if mock_mod is not None:
+            mock_port = _pick_free_port()
+            mock_server = mock_mod.VulnBoxMockServer(
+                port=mock_port,
+                rules=mock_rules,
+                strict=mocks_strict,
+            )
+            mock_server.start()
+            mock_url = f"http://127.0.0.1:{mock_port}"
+            env["VULNBOX_MOCK_URL"] = mock_url
+            env["HTTP_PROXY"] = mock_url
+            env["NO_PROXY"] = "127.0.0.1,localhost,::1"
+
+            py_preload_dir = cwd / ".vulnbox_http_preload"
+            if py_preload_dir.is_dir():
+                existing_pp = env.get("PYTHONPATH", "")
+                env["PYTHONPATH"] = (
+                    f"{py_preload_dir}{os.pathsep}{existing_pp}"
+                    if existing_pp
+                    else str(py_preload_dir)
+                )
+
+            node_preload = cwd / ".vulnbox_http_mock_preload.mjs"
+            if node_preload.is_file():
+                existing_no = env.get("NODE_OPTIONS", "").strip()
+                import_flag = f"--import={node_preload}"
+                env["NODE_OPTIONS"] = f"{existing_no} {import_flag}".strip()
+
+        shims_mod = _load_local_module("_vb_shims", cwd / ".vulnbox_service_shims.py")
+        if shims_mod is not None:
+            # Start lightweight Redis + SMTP shims only when real sidecar env isn't already provided
+            if "REDIS_URL" not in extra_env:
+                redis_shim = shims_mod.TinyRedisShim(port=0)
+                rport = redis_shim.start()
+                env["REDIS_URL"] = f"redis://127.0.0.1:{rport}/0"
+                env["REDIS_HOST"] = "127.0.0.1"
+                env["REDIS_PORT"] = str(rport)
+            if "SMTP_HOST" not in extra_env:
+                smtp_shim = shims_mod.TinySmtpShim(port=0)
+                sport = smtp_shim.start()
+                env["SMTP_HOST"] = "127.0.0.1"
+                env["SMTP_PORT"] = str(sport)
 
     proc = subprocess.Popen(
         ["/bin/sh", "-c", start_cmd],
@@ -81,6 +157,8 @@ def main(cfg_path: str) -> None:
         "status_code": None,
         "response_headers": {},
         "response_body_excerpt": "",
+        "outbound_calls": [],
+        "probe_mode": "http_server",
         "error": None,
     }
 
@@ -156,6 +234,13 @@ def main(cfg_path: str) -> None:
                     os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
                 except OSError:
                     pass
+        if mock_server is not None:
+            result["outbound_calls"] = mock_server.outbound_calls
+            mock_server.stop()
+        if redis_shim is not None:
+            redis_shim.stop()
+        if smtp_shim is not None:
+            smtp_shim.stop()
         if created_marker and created_marker.exists():
             try:
                 created_marker.unlink()

@@ -14,11 +14,13 @@ from vulnbox.models import (
     Finding,
     MemoryLeakProbeResult,
     MemoryLeakProbeSpec,
+    MockRule,
     PatchCandidate,
     RepoProfile,
     VerificationResult,
 )
 from vulnbox.registry import PluginRegistry
+from vulnbox.remediation.auth_helper import resolve_auth_headers
 from vulnbox.remediation.diff_utils import apply_unified_diff
 from vulnbox.remediation.dynamic_probe import infer_probe_for_finding, run_dynamic_probe
 from vulnbox.remediation.memory_probe import (
@@ -80,6 +82,12 @@ def verify_patch(
     policy: SandboxPolicy | None = None,
     registry: PluginRegistry | None = None,
     baseline_tests_override: tuple[bool, str] | None = None,
+    mock_integrations: bool = True,
+    mock_rules: list[MockRule] | None = None,
+    mocks_strict: bool = False,
+    extra_env: dict[str, str] | None = None,
+    auth_header: str | None = None,
+    auth_jwt_claims: str | dict[str, Any] | None = None,
 ) -> VerificationResult:
     """Verify a patch candidate in a fresh scrubbed sandbox before and after patching."""
     pol = policy or SandboxPolicy()
@@ -89,6 +97,11 @@ def verify_patch(
 
     with ScrubbedWorkspace(repo_path) as sws:
         ws = sws.path
+        auth_headers = resolve_auth_headers(
+            auth_header=auth_header,
+            auth_jwt_claims=auth_jwt_claims,
+            workspace_dir=ws,
+        )
         # 1. Baseline findings & existing tests
         baseline_findings = run_all_analyzers(
             ws,
@@ -112,7 +125,7 @@ def verify_patch(
             active_probe = infer_probe_for_finding(finding, ws, registry=registry)
 
         probe_before: DynamicProbeResult | None = None
-        if active_probe is not None and effective_start:
+        if active_probe is not None and (effective_start or probe_spec is not None):
             probe_before = run_dynamic_probe(
                 ws,
                 backend=backend,
@@ -120,10 +133,16 @@ def verify_patch(
                 spec=active_probe,
                 health_path=effective_health,
                 policy=pol,
+                mock_integrations=mock_integrations,
+                mock_rules=mock_rules,
+                mocks_strict=mocks_strict,
+                extra_env=extra_env,
+                auth_headers=auth_headers,
             )
             logs["dynamic_probe_before"] = (
                 f"{probe_before.curl_command}\n"
                 f"status={probe_before.status_code} matched_vulnerable={probe_before.matched_vulnerable} "
+                f"skipped={probe_before.skipped} reason={probe_before.skip_reason} "
                 f"error={probe_before.error}\n{probe_before.response_body_excerpt}"
             )
 
@@ -220,29 +239,41 @@ def verify_patch(
             f.rule_id in {bf.rule_id for bf in baseline_findings} for f in new_findings
         )
 
-        # 6. Active post-patch curl/HTTP probe (exact same probe!)
+        # 6. Active post-patch curl/HTTP probe (exact same probe; skipped gracefully if deps/services missing)
         probe_after: DynamicProbeResult | None = None
         dynamic_ok: bool | None = None
-        if active_probe is not None and effective_start:
-            probe_after = run_dynamic_probe(
-                ws,
-                backend=backend,
-                start_cmd=effective_start,
-                spec=active_probe,
-                health_path=effective_health,
-                policy=pol,
-            )
-            logs["dynamic_probe_after"] = (
-                f"{probe_after.curl_command}\n"
-                f"status={probe_after.status_code} matched_fixed={probe_after.matched_fixed} "
-                f"error={probe_after.error}\n{probe_after.response_body_excerpt}"
-            )
-            dynamic_ok = bool(
-                probe_before
-                and probe_before.matched_vulnerable
-                and probe_after.matched_fixed
-                and not probe_after.matched_vulnerable
-            )
+        if active_probe is not None and (effective_start or probe_spec is not None):
+            if probe_before is not None and probe_before.skipped:
+                dynamic_ok = None
+            else:
+                probe_after = run_dynamic_probe(
+                    ws,
+                    backend=backend,
+                    start_cmd=effective_start,
+                    spec=active_probe,
+                    health_path=effective_health,
+                    policy=pol,
+                    mock_integrations=mock_integrations,
+                    mock_rules=mock_rules,
+                    mocks_strict=mocks_strict,
+                    extra_env=extra_env,
+                    auth_headers=auth_headers,
+                )
+                logs["dynamic_probe_after"] = (
+                    f"{probe_after.curl_command}\n"
+                    f"status={probe_after.status_code} matched_fixed={probe_after.matched_fixed} "
+                    f"skipped={probe_after.skipped} reason={probe_after.skip_reason} "
+                    f"error={probe_after.error}\n{probe_after.response_body_excerpt}"
+                )
+                if probe_after.skipped:
+                    dynamic_ok = None
+                else:
+                    dynamic_ok = bool(
+                        probe_before
+                        and probe_before.matched_vulnerable
+                        and probe_after.matched_fixed
+                        and not probe_after.matched_vulnerable
+                    )
 
         # 6b. Active post-patch memory & FD leak stress probe (gracefully skipped if incompatible)
         mem_after: MemoryLeakProbeResult | None = None

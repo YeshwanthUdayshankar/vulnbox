@@ -14,10 +14,30 @@ from pathlib import Path
 from vulnbox.sandbox.base import ExecResult, SandboxBackend, SandboxPolicy
 
 
-def _build_sanitized_env(tmp_home: Path, extra: dict[str, str] | None = None) -> dict[str, str]:
+def find_target_venv_bin(repo_path: Path | None) -> Path | None:
+    """Locate an existing local virtualenv bin/Scripts directory inside a target repository."""
+    if repo_path is None:
+        return None
+    root = Path(repo_path).resolve()
+    for venv_name in (".venv", "venv"):
+        for sub in ("bin", "Scripts"):
+            cand = root / venv_name / sub
+            if cand.is_dir() and any((cand / exe).is_file() for exe in ("python", "python3", "python.exe")):
+                return cand
+    return None
+
+
+def _build_sanitized_env(
+    tmp_home: Path,
+    extra: dict[str, str] | None = None,
+    target_venv_bin: Path | None = None,
+) -> dict[str, str]:
     """Construct a minimal environment stripped of host secrets/credentials."""
     py_bin_dir = str(Path(sys.executable).parent)
-    default_path = f"{py_bin_dir}:/usr/local/bin:/usr/bin:/bin"
+    path_parts = [py_bin_dir, "/usr/local/bin", "/usr/bin", "/bin"]
+    if target_venv_bin is not None:
+        path_parts.insert(0, str(target_venv_bin))
+    default_path = os.pathsep.join(path_parts)
     env: dict[str, str] = {
         "PATH": default_path,
         "HOME": str(tmp_home),
@@ -27,7 +47,9 @@ def _build_sanitized_env(tmp_home: Path, extra: dict[str, str] | None = None) ->
         "PYTHONDONTWRITEBYTECODE": "1",
         "VULNBOX_SANDBOX": "local",
     }
-    if os.environ.get("VIRTUAL_ENV"):
+    if target_venv_bin is not None:
+        env["VIRTUAL_ENV"] = str(target_venv_bin.parent)
+    elif os.environ.get("VIRTUAL_ENV"):
         env["VIRTUAL_ENV"] = os.environ["VIRTUAL_ENV"]
     if extra:
         env.update(extra)
@@ -63,6 +85,9 @@ class LocalSandboxBackend(SandboxBackend):
 
     name = "local"
 
+    def __init__(self, target_repo_path: Path | None = None) -> None:
+        self.target_repo_path = target_repo_path
+
     def is_available(self) -> bool:
         return True
 
@@ -75,9 +100,14 @@ class LocalSandboxBackend(SandboxBackend):
     ) -> ExecResult:
         pol = policy or SandboxPolicy()
         start = time.monotonic()
+        target_venv_bin = find_target_venv_bin(self.target_repo_path)
 
         with tempfile.TemporaryDirectory(prefix="vulnbox-home-") as tmp_home_str:
-            sanitized_env = _build_sanitized_env(Path(tmp_home_str), extra=env)
+            sanitized_env = _build_sanitized_env(
+                Path(tmp_home_str),
+                extra=env,
+                target_venv_bin=target_venv_bin,
+            )
             proc = subprocess.Popen(
                 ["/bin/sh", "-c", command],
                 cwd=str(Path(workspace_dir).resolve()),

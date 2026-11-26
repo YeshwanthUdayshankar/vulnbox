@@ -35,9 +35,9 @@ After running end-to-end remediation inside the hardened Docker sandbox (`--netw
 
 ---
 
-## 4. Active Loopback `curl` Probe Runner
+## 4. Active Loopback `curl` Probe Runner & Integration Mocking
 
-Test any custom or preset declarative `DynamicProbeSpec` JSON against a repository booted strictly on `127.0.0.1` inside the sandbox to actively reproduce vulnerabilities before authoring a patch.
+Test any custom or preset declarative `DynamicProbeSpec` JSON against a repository booted strictly on `127.0.0.1` inside the sandbox to actively reproduce vulnerabilities before authoring a patch. Includes toggles for **Auto-Mock Integrations** (expected-shape HTTP 200 mocks, SSRF Canary outbound call logging, and zero-container Redis/SMTP shims), **Explicit Mock Rules JSON (`--mocks`)**, **Auth Header / HS256 Test-JWT Claims**, **Cached Docker Dependency Layers (`--build-deps`)**, and custom `--image` tags.
 
 ![VulnBox Web UI Active Loopback curl Probe Tab](images/ui-active-probe.png)
 

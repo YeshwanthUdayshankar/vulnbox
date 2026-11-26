@@ -17,7 +17,7 @@ from vulnbox._version import __version__
 from vulnbox.callgraph.ts_utils import available_tree_sitter_languages
 from vulnbox.engine import VulnBoxEngine
 from vulnbox.llm import GuardrailPolicy, LLMConfig
-from vulnbox.models import DynamicProbeSpec
+from vulnbox.models import DynamicProbeSpec, MockRule
 from vulnbox.registry import default_registry
 from vulnbox.reporting.markdown import render_markdown_report
 from vulnbox.reporting.sarif import build_sarif, validate_sarif
@@ -61,6 +61,7 @@ def _discover_sample_fixtures() -> list[dict[str, str]]:
         ("llm_sql_app", "LLM SQL Sample App"),
         ("py_leaky_app", "Python Deep/Leaky App"),
         ("node_leaky_app", "Node.js Deep/Leaky App"),
+        ("py_integrated_app", "Python Integrated/Mocked App"),
     ):
         cand = fixtures_dir / name
         if cand.is_dir():
@@ -107,6 +108,38 @@ def _parse_probe_specs_payload(raw_probe: Any) -> list[DynamicProbeSpec]:
             raise ValueError(f"Probe path must start with '/': {spec.path!r}")
         specs.append(spec)
     return specs
+
+
+def _parse_mock_rules_payload(raw_mocks: Any) -> list[MockRule] | None:
+    if not raw_mocks:
+        return None
+    if isinstance(raw_mocks, str):
+        text = raw_mocks.strip()
+        if not text:
+            return None
+        parsed = json.loads(text)
+    else:
+        parsed = raw_mocks
+    if isinstance(parsed, dict) and "rules" in parsed:
+        items = parsed["rules"]
+    elif isinstance(parsed, list):
+        items = parsed
+    else:
+        items = [parsed]
+    rules: list[MockRule] = []
+    for item in items:
+        rule = MockRule.model_validate(item)
+        rule.source = "user"
+        rules.append(rule)
+    return rules
+
+
+def _parse_services_payload(raw_services: Any) -> list[str]:
+    if not raw_services:
+        return []
+    if isinstance(raw_services, list):
+        return [str(s).strip().lower() for s in raw_services if str(s).strip()]
+    return [s.strip().lower() for s in str(raw_services).split(",") if s.strip()]
 
 
 def _require_repo_dir(raw_path: Any) -> Path:
@@ -342,8 +375,18 @@ class VulnBoxUIHandler(BaseHTTPRequestHandler):
         check_leaks = bool(body.get("check_leaks"))
         max_workers = int(body.get("max_workers") if body.get("max_workers") is not None else 4)
         max_workers = max(1, min(16, max_workers))
+        build_deps = bool(body.get("build_deps"))
+        image = (body.get("image") or "").strip() or None
+        mock_integrations = (
+            bool(body.get("mock_integrations")) if "mock_integrations" in body else True
+        )
+        mock_rules = _parse_mock_rules_payload(body.get("mocks_json"))
+        mocks_strict = bool(body.get("mocks_strict"))
+        services = _parse_services_payload(body.get("services"))
+        auth_header = (body.get("auth_header") or "").strip() or None
+        auth_jwt_claims = (body.get("auth_jwt_claims") or "").strip() or None
 
-        engine = VulnBoxEngine(backend=backend)
+        engine = VulnBoxEngine(backend=backend, image=image or "vulnbox-sandbox:latest")
         report, written = engine.remediate(
             repo_path=repo,
             start_cmd=start_cmd,
@@ -356,6 +399,14 @@ class VulnBoxUIHandler(BaseHTTPRequestHandler):
             guardrail_policy=GuardrailPolicy(max_retries=max_retries),
             max_workers=max_workers,
             out_dir=out_path,
+            build_deps=build_deps,
+            image=image,
+            mock_integrations=mock_integrations,
+            mock_rules=mock_rules,
+            mocks_strict=mocks_strict,
+            services=services,
+            auth_header=auth_header,
+            auth_jwt_claims=auth_jwt_claims,
         )
         run_id, md_text, sarif_doc = self._store_report_artifacts(report)
         self._send_json(
@@ -377,9 +428,32 @@ class VulnBoxUIHandler(BaseHTTPRequestHandler):
         specs = _parse_probe_specs_payload(body.get("probe_json"))
         if not specs:
             raise ValueError("Provide a valid DynamicProbeSpec JSON object or array.")
+        build_deps = bool(body.get("build_deps"))
+        image = (body.get("image") or "").strip() or None
+        mock_integrations = (
+            bool(body.get("mock_integrations")) if "mock_integrations" in body else True
+        )
+        mock_rules = _parse_mock_rules_payload(body.get("mocks_json"))
+        mocks_strict = bool(body.get("mocks_strict"))
+        services = _parse_services_payload(body.get("services"))
+        auth_header = (body.get("auth_header") or "").strip() or None
+        auth_jwt_claims = (body.get("auth_jwt_claims") or "").strip() or None
 
-        engine = VulnBoxEngine(backend=backend)
-        results = engine.probe(repo, specs=specs, start_cmd=start_cmd, health_path=health_path)
+        engine = VulnBoxEngine(backend=backend, image=image or "vulnbox-sandbox:latest")
+        results = engine.probe(
+            repo,
+            specs=specs,
+            start_cmd=start_cmd,
+            health_path=health_path,
+            build_deps=build_deps,
+            image=image,
+            mock_integrations=mock_integrations,
+            mock_rules=mock_rules,
+            mocks_strict=mocks_strict,
+            services=services,
+            auth_header=auth_header,
+            auth_jwt_claims=auth_jwt_claims,
+        )
         self._send_json(200, {"results": [r.model_dump() for r in results]})
 
     def _handle_verify_patch(self, body: dict[str, Any]) -> None:

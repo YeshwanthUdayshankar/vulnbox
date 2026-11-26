@@ -31,8 +31,13 @@ class DockerSandboxBackend(SandboxBackend):
 
     name = "docker"
 
-    def __init__(self, image: str = "vulnbox-sandbox:latest") -> None:
+    def __init__(
+        self,
+        image: str = "vulnbox-sandbox:latest",
+        network_override: str | None = None,
+    ) -> None:
         self.default_image = image
+        self.network_override = network_override
 
     def is_available(self) -> bool:
         if not shutil.which("docker"):
@@ -98,7 +103,9 @@ class DockerSandboxBackend(SandboxBackend):
         if container_name:
             cmd.extend(["--name", container_name])
 
-        if not pol.network_enabled:
+        if self.network_override:
+            cmd.extend(["--network", self.network_override])
+        elif not pol.network_enabled:
             cmd.append("--network=none")
 
         for k, v in safe_env.items():

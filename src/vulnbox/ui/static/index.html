@@ -82,6 +82,16 @@
         </div>
 
         <div class="checkbox-row">
+          <input id="rem-mock-toggle" type="checkbox" checked />
+          <label for="rem-mock-toggle" class="checkbox-label">Auto-Mock Integrations (<code>--mock-integrations</code>): Expected-shape HTTP 200 mocks, SSRF canary, and Redis/SMTP shims</label>
+        </div>
+
+        <div class="checkbox-row">
+          <input id="rem-build-deps-toggle" type="checkbox" />
+          <label for="rem-build-deps-toggle" class="checkbox-label">Build Cached Docker Dep Layer (<code>--build-deps</code>): Install manifest dependencies into cached <code>vulnbox-deps:&lt;hash&gt;</code></label>
+        </div>
+
+        <div class="checkbox-row">
           <input id="rem-deep-toggle" type="checkbox" />
           <label for="rem-deep-toggle" class="checkbox-label">Deep Scan (<code>--deep</code>): Sandbox runtime call-graph tracing + active memory/FD leak probing</label>
         </div>
@@ -206,6 +216,28 @@
               <option value="local">local</option>
             </select>
           </div>
+        </div>
+        <div class="grid-3 mt-12">
+          <div>
+            <label for="probe-auth-header">Auth Header (optional)</label>
+            <input id="probe-auth-header" type="text" placeholder="Authorization: Bearer ..." />
+          </div>
+          <div>
+            <label for="probe-jwt-claims">Test-JWT Claims JSON (optional)</label>
+            <input id="probe-jwt-claims" type="text" placeholder='{"sub":"tester","role":"admin"}' />
+          </div>
+          <div>
+            <label for="probe-image">Custom Docker Image (optional)</label>
+            <input id="probe-image" type="text" placeholder="vulnbox-sandbox:latest" />
+          </div>
+        </div>
+        <div class="checkbox-row">
+          <input id="probe-mock-toggle" type="checkbox" checked />
+          <label for="probe-mock-toggle" class="checkbox-label">Auto-Mock Integrations (expected-shape HTTP 200 mocks + SSRF canary + Redis/SMTP shims)</label>
+        </div>
+        <div class="mt-12">
+          <label for="probe-mocks-json">Optional Explicit Mock Rules JSON (<code>--mocks</code>)</label>
+          <textarea id="probe-mocks-json" placeholder='[{"host_pattern":"api.stripe.com","path_prefix":"/v1/charges","status":200,"json_body":{"id":"ch_mock","charge_status":"succeeded"}}]'></textarea>
         </div>
         <div class="mt-12">
           <label for="probe-json">Declarative Probe JSON (<code>DynamicProbeSpec</code>)</label>

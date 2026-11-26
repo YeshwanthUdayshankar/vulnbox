@@ -8,6 +8,7 @@ Sandboxed security testing, **active before/after loopback `curl` verification**
 - **Pluggable Hardened Sandbox**: Runs inside hardened Docker containers (`--network=none`, `--cap-drop=ALL`, `--read-only`, `--security-opt=no-new-privileges:true`, non-root UID, CPU/RAM/PID caps) with an automatic isolated local fallback when Docker daemon is unavailable.
 - **4-Layer + Deep Hybrid Analysis**: Python AST SAST, **Tree-sitter JS/TS SAST**, Dockerfile/config/secret hygiene, **Static Memory & Resource Leak Analysis (CWE-401 / CWE-772)**, and **Hybrid Call-Graph CVE Reachability** (static AST/Tree-sitter + opt-in `--deep` sandbox runtime tracing via Python 3.12 `sys.monitoring` & Node.js V8 Inspector).
 - **Active Before/After Loopback Verification (`curl` & Memory/FD Slope)**: Boots the target app on `127.0.0.1:<ephemeral_port>` inside the sandbox, runs reproducible `curl` probes (and opt-in `--check-leaks` / `--deep` heap-slope + `/proc/<pid>/fd` stress probes), applies candidate fixes, and re-runs the exact same probes to prove fixes work.
+- **Dependency-Aware Sandbox & Air-Gapped Integration Mocking**: Supports `--build-deps` (cached manifest-only Docker dependency layers `vulnbox-deps:<hash>` with `vulnbox clean-cache`), `--image <tag>`, automatic read-only target `.venv` reuse, graceful boot-skip on missing dependencies, **expected-shape HTTP 200 auto-mocking** (AST/JS response-key inference + `--mocks` + SSRF canary capture), stdlib **Redis RESP2 / SMTP shims**, opt-in `--services postgres,redis` on `--internal` Docker networks, **in-process FastAPI/Flask probing**, and **HS256 test-JWT minting** (`--auth-jwt-claims`).
 - **Dual-Verified Patching & Regression Tests**: Confirms SAST clean + active `curl` probe fixed + generated defensive regression test transitions `FAIL → PASS` + repo's existing test suite passes with zero regressions.
 - **Optional Guarded LLM Mode (`--llm`)**: Synthesizes patches for complex findings via any OpenAI-compatible model (local Ollama, OpenAI, Gemini, vLLM) gated by deterministic guardrails and the sandbox truth oracle.
 - **Standard Outputs**: Markdown report, verified `.patch` unified diffs, generated security regression tests, and schema-validated **SARIF 2.1.0** JSON.
@@ -34,6 +35,16 @@ uv run vulnbox remediate /path/to/repo --backend docker --out ./vulnbox-out
 # Deep mode: add sandbox runtime call-graph tracing (sys.monitoring / V8 Inspector)
 # + active before/after memory & file-descriptor leak slope verification
 uv run vulnbox remediate /path/to/repo --backend docker --deep --out ./vulnbox-out
+
+# Dependency-aware DAST + air-gapped integration mocks + test-JWT auth:
+uv run vulnbox probe /path/to/repo --probe probe.json --backend docker --build-deps \
+  --mocks mocks.json --auth-jwt-claims '{"sub":"tester","role":"admin"}'
+
+# Opt-in air-gapped Docker sidecars (--internal network, zero internet egress):
+uv run vulnbox remediate /path/to/repo --backend docker --build-deps --services postgres,redis
+
+# Prune locally cached vulnbox-deps:* Docker dependency images:
+uv run vulnbox clean-cache
 
 # Verify a custom/agent-authored patch + custom loopback curl probe
 uv run vulnbox verify-patch /path/to/repo --patch fix.patch --probe probe.json --backend docker

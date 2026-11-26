@@ -77,22 +77,50 @@ class Finding(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
+class MockRule(BaseModel):
+    """Declarative loopback integration mock rule served inside the air-gapped sandbox."""
+
+    host_pattern: str = "*"  # exact host, glob '*.stripe.com', or '*'
+    method: str = "*"  # HTTP method or '*'
+    path_prefix: str = "/"
+    status: int = 200
+    headers: dict[str, str] = Field(default_factory=lambda: {"Content-Type": "application/json"})
+    json_body: Any = None
+    text_body: str | None = None
+    source: str = "user"
+
+
+class OutboundCallRecord(BaseModel):
+    """Recorded outbound HTTP/HTTPS call intercepted inside the air-gapped sandbox (SSRF canary)."""
+
+    host: str
+    method: str = "GET"
+    path: str = "/"
+    status_code: int = 200
+    matched_rule: str | None = None
+    timestamp: float | None = None
+
+
 class ProbeExpectation(BaseModel):
-    """Assertions evaluated against an HTTP response during active probing."""
+    """Assertions evaluated against an HTTP response (and optional outbound SSRF calls)."""
 
     status_codes: list[int] = Field(default_factory=list)
     body_contains: list[str] = Field(default_factory=list)
     body_not_contains: list[str] = Field(default_factory=list)
     headers_contain: dict[str, str] = Field(default_factory=dict)
     headers_not_contain: dict[str, str] = Field(default_factory=dict)
+    outbound_hosts_contain: list[str] = Field(default_factory=list)
+    outbound_hosts_not_contain: list[str] = Field(default_factory=list)
 
     def matches(
         self,
         status_code: int | None,
         headers: dict[str, str],
         body: str,
+        outbound_calls: list[OutboundCallRecord] | None = None,
+        outbound_hosts: list[str] | None = None,
     ) -> bool:
-        """Return True if all configured expectations match the HTTP response."""
+        """Return True if all configured expectations match the HTTP response & outbound calls."""
         if status_code is None:
             return False
         if self.status_codes and status_code not in self.status_codes:
@@ -115,6 +143,16 @@ class ProbeExpectation(BaseModel):
                 forbidden_val == "" or forbidden_val.lower() in actual.lower()
             ):
                 return False
+
+        observed_hosts = [c.host.lower() for c in (outbound_calls or [])] + [
+            h.lower() for h in (outbound_hosts or [])
+        ]
+        for expected_host in self.outbound_hosts_contain:
+            if not any(expected_host.lower() in h for h in observed_hosts):
+                return False
+        for forbidden_host in self.outbound_hosts_not_contain:
+            if any(forbidden_host.lower() in h for h in observed_hosts):
+                return False
         return True
 
 
@@ -124,7 +162,7 @@ class DynamicProbeSpec(BaseModel):
     probe_id: str
     finding_id: str | None = None
     rule_id: str | None = None
-    description: str
+    description: str = ""
     method: HttpMethod = "GET"
     path: str = "/"
     headers: dict[str, str] = Field(default_factory=dict)
@@ -156,6 +194,10 @@ class DynamicProbeResult(BaseModel):
     response_body_excerpt: str = ""
     matched_vulnerable: bool = False
     matched_fixed: bool = False
+    skipped: bool = False
+    skip_reason: str | None = None
+    outbound_calls: list[OutboundCallRecord] = Field(default_factory=list)
+    probe_mode: Literal["http_server", "in_process"] = "http_server"
     error: str | None = None
 
 

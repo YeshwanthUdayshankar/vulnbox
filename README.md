@@ -40,7 +40,16 @@ uv run vulnbox ui
 
 ## Local Web UI (`vulnbox ui`)
 
-Run `uv run vulnbox ui` (or `uv run vulnbox ui --port 8787 --no-browser`) to launch the zero-dependency local dashboard at `http://127.0.0.1:8787`. It exposes every CLI workflow—**Remediate** (with optional guarded `--llm`), **Scan**, **Profile**, **Active `curl` Probe**, and **Verify Custom Patch**—with one-click sample fixture loaders, side-by-side before/after `curl` proof, syntax-highlighted unified diffs, Guardrail Audit Trail tables, and downloadable `report.md` / `findings.sarif.json` / `manifest.json` bundles.
+Start the zero-dependency local dashboard (`http://127.0.0.1:8787`) on any OS using the cross-platform startup scripts—all setup, virtual environments (`.venv/`), and package caches (`.vulnbox-cache/`) stay **100% local to the repository** with zero global or user-site installs:
+
+| OS / Shell | Command |
+| :--- | :--- |
+| **Linux / macOS (Bash/Zsh)** | `./start-ui.sh` *(add `--port 8787`, `--no-browser`, or `--install`)* |
+| **Windows (PowerShell / `pwsh`)** | `.\start-ui.ps1` |
+| **Windows (Command Prompt / Double-Click)** | `start-ui.bat` |
+| **Any OS (Direct Python)** | `python scripts/start_ui.py` *(or `uv run vulnbox ui`)* |
+
+It exposes every CLI workflow—**Remediate** (with optional guarded `--llm`), **Scan**, **Profile**, **Active `curl` Probe**, and **Verify Custom Patch**—with one-click sample fixture loaders, side-by-side before/after `curl` proof, syntax-highlighted unified diffs, Guardrail Audit Trail tables, and downloadable `report.md` / `findings.sarif.json` / `manifest.json` bundles.
 
 The UI server binds strictly to loopback (`127.0.0.1`), enforces a per-session CSRF token (`X-VulnBox-Token`) on all `POST /api/*` requests, validates `Host`/`Origin` headers, and sets strict `Content-Security-Policy` and `X-Frame-Options: DENY` headers.
 

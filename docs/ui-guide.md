@@ -1,11 +1,15 @@
 # VulnBox Local Web UI Guide (`vulnbox ui`)
 
-Launch the zero-dependency local Web UI backed by `VulnBoxEngine`:
+Launch the zero-dependency local Web UI backed by `VulnBoxEngine` on **Linux, macOS, or Windows**:
 
-```bash
-uv run vulnbox ui --port 8787
-# Opens http://127.0.0.1:8787 (add --no-browser to skip auto-open)
-```
+| OS / Shell | Command |
+| :--- | :--- |
+| **Linux / macOS** | `./start-ui.sh` |
+| **Windows (PowerShell / `pwsh`)** | `.\start-ui.ps1` |
+| **Windows (CMD / Double-click)** | `start-ui.bat` |
+| **Universal Python / `uv`** | `python scripts/start_ui.py` or `uv run vulnbox ui --port 8787` |
+
+All launchers keep setup, `.venv/`, and `uv`/`pip` caches (`.vulnbox-cache/`) **strictly local to the repository** (setting `PIP_REQUIRE_VIRTUALENV=1`, `PIP_USER=0`, `PYTHONNOUSERSITE=1`, `UV_PROJECT_ENVIRONMENT=.venv`, and `UV_CACHE_DIR=.vulnbox-cache/uv`). They accept `--host`, `--port`, `--no-browser`, `--install` (force re-sync), `--no-install`, and `--dry-run`, and respect `VULNBOX_UI_HOST`, `VULNBOX_UI_PORT`, and `VULNBOX_NO_BROWSER`. Opens `http://127.0.0.1:8787` by default.
 
 ## 1. Dashboard Overview & Guarded `--llm` Controls
 

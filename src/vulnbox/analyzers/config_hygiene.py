@@ -100,6 +100,9 @@ class ConfigHygieneAnalyzer:
                         )
                     )
                 else:
+                    rel_parts_lower = {p.lower() for p in Path(rel_file).parts}
+                    if rel_file.lower().endswith(".json") and (rel_parts_lower & {"lang", "langs", "locale", "locales", "i18n", "translations"}):
+                        continue
                     findings.append(
                         Finding(
                             finding_id=make_finding_id("CFG-SECRET-002", rel_file, 1),

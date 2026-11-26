@@ -361,6 +361,16 @@ def _analyze_node_leaks(
                         if obj and node_text(obj, raw) == cname:
                             mut_line = node.start_point[0] + 1
                 if mut_line is not None:
+                    # Only flag runtime mutations inside functions/methods/callbacks (skip one-time module init loops)
+                    inside_fn = False
+                    anc = node.parent
+                    while anc is not None:
+                        if anc.type in ("function_declaration", "function_expression", "arrow_function", "method_definition"):
+                            inside_fn = True
+                            break
+                        anc = anc.parent
+                    if not inside_fn:
+                        continue
                     route = call_graph.find_route_for_location(rel, mut_line) if call_graph else None
                     findings.append(
                         Finding(
@@ -441,6 +451,10 @@ def _analyze_node_leaks(
                 continue
             scope_txt = node_text(enclosing_scope, raw)
             if f"{obj_name}.off(" in scope_txt or f"{obj_name}.removeListener(" in scope_txt:
+                continue
+            # Skip short-lived local emitters created inside the same handler/loop (e.g. `const client = ...`)
+            root_ident = obj_name.split(".", 1)[0]
+            if re.search(rf"\b(?:const|let|var)\s+{re.escape(root_ident)}\b", scope_txt):
                 continue
 
             lineno = node.start_point[0] + 1

@@ -24,7 +24,12 @@ SENSITIVE_FILENAME_PATTERNS = (
     re.compile(r"^\.env(\..+)?$", re.IGNORECASE),
     re.compile(r"\.(pem|key|p12|pfx|jks)$", re.IGNORECASE),
     re.compile(r"^id_(rsa|ed25519|ecdsa)(\.pub)?$", re.IGNORECASE),
-    re.compile(r"^(\.npmrc|\.pypirc|credentials\.json|service[-_]account.*\.json)$", re.IGNORECASE),
+    re.compile(r"^(credentials\.json|service[-_]account.*\.json)$", re.IGNORECASE),
+)
+
+RC_AUTH_PATTERNS = re.compile(
+    r"(?:_authToken|_auth\b|_password|^\s*password\s*=|://[^/\s:@]+:[^/\s@]+@)",
+    re.IGNORECASE | re.MULTILINE,
 )
 
 SECRET_TOKEN_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
@@ -104,9 +109,18 @@ def _classify_and_scrub_env_content(content: str) -> tuple[str, int, str]:
     return "\n".join(out_lines) + ("\n" if content.endswith("\n") else ""), redacted, classification
 
 
-def _is_sensitive_filename(name: str) -> bool:
-    if name.lower().endswith((".example", ".sample", ".template")):
+def _is_sensitive_filename(name: str, src_file: Path | None = None) -> bool:
+    low = name.lower()
+    if low.endswith((".example", ".sample", ".template")):
         return False
+    if low in (".npmrc", ".pypirc"):
+        if src_file is None:
+            return True
+        try:
+            content = src_file.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            return True
+        return bool(RC_AUTH_PATTERNS.search(content))
     return any(p.search(name) for p in SENSITIVE_FILENAME_PATTERNS)
 
 
@@ -167,7 +181,7 @@ def create_scrubbed_workspace(
                 excluded_paths.append(rel_file)
                 continue
 
-            if _is_sensitive_filename(fname):
+            if _is_sensitive_filename(fname, src_file):
                 files_scrubbed.append(rel_file)
                 if fname.lower().startswith(".env"):
                     try:

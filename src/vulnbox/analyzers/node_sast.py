@@ -176,10 +176,21 @@ class NodeSASTAnalyzer:
                         )
                     )
 
-                # JS-CMD-001: exec / execSync with dynamic template or concatenation
+                # JS-CMD-001: child_process exec / execSync with dynamic template or concatenation
                 if tail in ("exec", "execSync") and arg_nodes:
                     first = arg_nodes[0]
-                    if first.type in ("template_string", "binary_expression") and _has_dynamic_arg(first, raw):
+                    first_txt = node_text(first, raw)
+                    receiver = fn_txt.rsplit(".", 1)[0] if "." in fn_txt else ""
+                    non_shell_receivers = {"r", "db", "knex", "pool", "conn", "connection", "stmt", "re", "regex"}
+                    is_sql_orm = (
+                        receiver.lower() in non_shell_receivers
+                        or bool(re.match(r"""^[`'"\s]*(?:SELECT|INSERT|UPDATE|DELETE|CREATE|DROP|ALTER|PRAGMA)\b""", first_txt, re.IGNORECASE))
+                    )
+                    if (
+                        not is_sql_orm
+                        and first.type in ("template_string", "binary_expression")
+                        and _has_dynamic_arg(first, raw)
+                    ):
                         findings.append(
                             Finding(
                                 finding_id=make_finding_id("JS-CMD-001", rel, lineno),

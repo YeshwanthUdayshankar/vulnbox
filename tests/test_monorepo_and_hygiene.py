@@ -117,3 +117,40 @@ def test_real_world_precision_multistage_docker_yarn_test_dir_and_static_shell(t
     assert len(cmd_findings) == 2
     assert cmd_findings[0].severity == "low"
     assert cmd_findings[1].severity == "critical"
+
+
+def test_node_and_scrubber_precision_orm_exec_local_emitters_npmrc_and_i18n(tmp_path: Path):
+    # 1. Benign .npmrc without auth tokens should NOT trigger CFG-SECRET-002
+    (tmp_path / ".npmrc").write_text("legacy-peer-deps=true\n", encoding="utf-8")
+
+    # 2. i18n locale JSON with placeholder token example should NOT trigger CFG-SECRET-002
+    (tmp_path / "src" / "lang").mkdir(parents=True)
+    (tmp_path / "src" / "lang" / "en.json").write_text(
+        json.dumps({"apiKeyHint": "Example OpenAI key: sk-1234567890abcdefghij1234"}),
+        encoding="utf-8",
+    )
+
+    # 3. Module-init loop (not in a function) should NOT trigger MEM-JS-001
+    (tmp_path / "src" / "i18n.js").write_text(
+        "const messages = {};\n"
+        "for (const k of ['en']) { messages[k] = { ok: true }; }\n",
+        encoding="utf-8",
+    )
+
+    # 4. ORM R.exec SQL + short-lived local client.on should NOT trigger JS-CMD-001 / MEM-JS-002
+    (tmp_path / "server.js").write_text(
+        "async function handle(req, res, slots) {\n"
+        "  await R.exec(`DELETE FROM items WHERE id NOT IN (${slots})`);\n"
+        "  const client = createClient();\n"
+        "  client.on('connect', () => res.end('ok'));\n"
+        "}\n",
+        encoding="utf-8",
+    )
+
+    scrub = create_scrubbed_workspace(tmp_path)
+    ws = Path(scrub.sandbox_dir)
+    try:
+        findings = run_all_analyzers(ws, scrub_summary=scrub)
+        assert not findings, f"Expected 0 false positives, got: {findings}"
+    finally:
+        cleanup_workspace(ws)

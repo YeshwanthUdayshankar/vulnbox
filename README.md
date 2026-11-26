@@ -57,19 +57,32 @@ It exposes every CLI workflow—**Remediate** (with optional guarded `--llm`), *
 
 The UI server binds strictly to loopback (`127.0.0.1`), enforces a per-session CSRF token (`X-VulnBox-Token`) on all `POST /api/*` requests, validates `Host`/`Origin` headers, and sets strict `Content-Security-Policy` and `X-Frame-Options: DENY` headers.
 
-![VulnBox Web UI Remediation Results](docs/images/ui-remediate-results.png)
+![VulnBox Web UI Deep Scan and Memory Leak Verification](docs/images/ui-deep-memory-leaks.png)
 
-See all UI screenshots (Dashboard + `--llm` controls, Remediation Diffs, and Active `curl` Probe tab) in **[docs/ui-guide.md](docs/ui-guide.md)**.
+See all UI screenshots (Dashboard + `--deep`/`--check-leaks`/`--llm` controls, Before/After Memory & FD Slope Proof, Remediation Diffs, and Active `curl` Probe tab) in **[docs/ui-guide.md](docs/ui-guide.md)**.
+
+## Hybrid Call Graph & Memory/FD Leak Detection (`--deep` / `--check-leaks`)
+
+Default `vulnbox scan` stays fast and deterministic—running Python AST, **Tree-sitter JS/TS AST**, config/secret hygiene, static **CWE-401 / CWE-772 memory & resource leak rules** (`MEM-PY-001..004`, `MEM-JS-001..004`), and cross-file static call-graph reachability.
+
+Pass `--deep` (or `--check-leaks`) to unlock full hybrid sandbox verification:
+
+| Capability | How It Works Inside the Sandbox | Fault-Tolerant Fallback |
+| :--- | :--- | :--- |
+| **Hybrid Call Graph (`--deep`)** | Merges cross-file Python AST + Tree-sitter JS/TS CST + FastAPI/Express route/DI edges with runtime edges captured via **Python 3.12+ `sys.monitoring` (PEP 669)** and **Node.js `node:inspector` Profiler + Precise Coverage**, resolving `getattr()` and dynamic subscript dispatch (`runtime_observed`) and attaching entrypoint-to-sink CVE `call_path` traces. | If a runtime hook or grammar is unavailable on the host, degrades cleanly back to static edges with zero crash. |
+| **Dynamic Memory & FD Leak Probing (`--check-leaks` / `--deep`)** | Runs warmup → baseline GC → repeated loopback stress requests → post-GC snapshots, computing OLS heap growth slope (`B/req`), $R^2$, `/proc/<pid>/fd` delta, and `file:line` allocation attribution. Verifies leak patches **before vs. after** (`LEAK -> FIXED`). | Pluggable `MemoryProfilerAdapter` chain: `python-tracemalloc` → `node-v8-inspector` → `os-proc-fallback` (Linux `/proc` RSS+FD for any binary) → graceful `skipped=True` (never breaks scans or patch verification on incompatible OS/runtimes). |
 
 ## End-to-End Sample Runs (Captured Docker Sandbox Output)
 
-All three bundled sample repositories were tested end-to-end inside the hardened **`vulnbox-sandbox:latest`** Docker container (`--network=none`, `--cap-drop=ALL`, `--read-only`, non-root user). Full captured CLI output, before/after `curl` HTTP responses, unified diffs, regression test transitions, and Guardrail Audit Trails live under `docs/`:
+Bundled sample repositories were tested end-to-end inside the hardened **`vulnbox-sandbox:latest`** Docker container (`--network=none`, `--cap-drop=ALL`, `--read-only`, non-root user, `memray` included). Full captured CLI output, before/after `curl` HTTP responses, unified diffs, regression test transitions, and Guardrail Audit Trails live under `docs/`:
 
-| Sample Repo | Mode | Findings | Verified Patches | Live `curl` Confirmed → Fixed | Full Capture |
+| Sample Repo | Mode | Findings | Verified Patches | Live Proof Confirmed → Fixed | Full Capture |
 | :--- | :--- | :---: | :---: | :---: | :--- |
-| [`tests/fixtures/py_sample_app`](tests/fixtures/py_sample_app) | Deterministic (`--backend docker`) | 8 | 7 / 7 | 2 (`PY-YAML-001`, `PY-PATH-001`) | [docs/sample-run-python.md](docs/sample-run-python.md) |
-| [`tests/fixtures/node_sample_app`](tests/fixtures/node_sample_app) | Deterministic (`--backend docker`) | 5 | 5 / 5 | 2 (`JS-PATH-001`, `JS-CORS-001`) | [docs/sample-run-node.md](docs/sample-run-node.md) |
-| [`tests/fixtures/llm_sql_app`](tests/fixtures/llm_sql_app) | Guarded LLM (`--llm` Ollama `qwen2.5:7b` + Docker) | 1 | 1 / 1 | 1 (`PY-SQL-001` + prompt-injection guardrail) | [docs/sample-run-llm-ollama.md](docs/sample-run-llm-ollama.md) |
+| [`tests/fixtures/py_sample_app`](tests/fixtures/py_sample_app) | Deterministic (`--backend docker`) | 8 | 7 / 7 | 2 `curl` (`PY-YAML-001`, `PY-PATH-001`) + CVE call path | [docs/sample-run-python.md](docs/sample-run-python.md) |
+| [`tests/fixtures/node_sample_app`](tests/fixtures/node_sample_app) | Deterministic (`--backend docker`) | 5 | 5 / 5 | 2 `curl` (`JS-PATH-001`, `JS-CORS-001`) | [docs/sample-run-node.md](docs/sample-run-node.md) |
+| [`tests/fixtures/py_leaky_app`](tests/fixtures/py_leaky_app) | Deep Hybrid (`--backend docker --deep`) | 2 | 2 / 2 | 2 Memory/FD (`16.9 KB/req → flat`, `FD +30 → 0`) + `getattr` resolved | [docs/ui-guide.md](docs/ui-guide.md) |
+| [`tests/fixtures/node_leaky_app`](tests/fixtures/node_leaky_app) | Deep Hybrid (`--backend docker --deep`) | 2 | 2 / 2 | 2 V8 Heap Leaks (`Map` + `EventEmitter.on`) + subscript resolved | [docs/ui-guide.md](docs/ui-guide.md) |
+| [`tests/fixtures/llm_sql_app`](tests/fixtures/llm_sql_app) | Guarded LLM (`--llm` Ollama `qwen2.5:7b` + Docker) | 1 | 1 / 1 | 1 `curl` (`PY-SQL-001` + prompt-injection guardrail) | [docs/sample-run-llm-ollama.md](docs/sample-run-llm-ollama.md) |
 | Public Benchmarks (`fastapi/full-stack-fastapi-template`, `OWASP/NodeGoat`) | Real-World Precision & Recall (`scan`) | 5 / 5 | — | Triage + Gap Analysis | [docs/benchmark-public-repos.md](docs/benchmark-public-repos.md) |
 
 ## Optional Guarded LLM Mode (`--llm`)

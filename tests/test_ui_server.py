@@ -6,6 +6,7 @@ import json
 import threading
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -58,12 +59,21 @@ def test_ui_serves_html_with_security_headers_and_csrf_protection(ui_server):
     with urllib.request.urlopen(f"{base_url}/", timeout=5) as resp:
         assert resp.status == 200
         hdrs = {k.lower(): v for k, v in resp.headers.items()}
-        assert "content-security-policy" in hdrs
+        csp = hdrs["content-security-policy"]
+        assert "script-src 'self'" in csp
+        assert "unsafe-inline" not in csp
         assert hdrs["x-frame-options"] == "DENY"
         assert hdrs["x-content-type-options"] == "nosniff"
         body = resp.read().decode("utf-8")
-        assert token in body
-        assert "VulnBox" in body
+        assert f'content="{token}"' in body
+        assert "/static/app.js" in body
+        assert "/static/styles.css" in body
+
+    # Static assets served cleanly
+    for asset_path, needle in (("/static/styles.css", "--accent"), ("/static/app.js", "X-VulnBox-Token")):
+        with urllib.request.urlopen(f"{base_url}{asset_path}", timeout=5) as resp:
+            assert resp.status == 200
+            assert needle in resp.read().decode("utf-8")
 
     # POST without CSRF token must be rejected with 403
     status, data = _post_json(
@@ -73,6 +83,25 @@ def test_ui_serves_html_with_security_headers_and_csrf_protection(ui_server):
     )
     assert status == 403
     assert "CSRF" in data["error"]
+
+
+def test_ui_handles_concurrent_scans_safely(ui_server):
+    base_url, token = ui_server
+    py_repo = str(FIXTURES / "py_sample_app")
+
+    def _run_scan(_idx: int) -> tuple[int, str]:
+        st, data = _post_json(
+            f"{base_url}/api/scan",
+            {"repo_path": py_repo, "backend": "local"},
+            token=token,
+        )
+        return st, data["run_id"]
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        results = list(pool.map(_run_scan, range(4)))
+
+    assert all(st == 200 for st, _ in results)
+    assert len({rid for _, rid in results}) == 4
 
 
 def test_ui_doctor_profile_scan_probe_remediate_and_verify_patch(ui_server):

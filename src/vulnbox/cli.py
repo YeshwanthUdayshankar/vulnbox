@@ -137,6 +137,7 @@ def remediate(
     llm_model: str | None = typer.Option(None, "--llm-model", help="Override LLM model name"),
     llm_base_url: str | None = typer.Option(None, "--llm-base-url", help="Override OpenAI-compatible API base URL"),
     llm_max_retries: int = typer.Option(2, "--llm-max-retries", min=0, max=5, help="Max guarded LLM retry attempts per finding"),
+    jobs: int = typer.Option(4, "--jobs", "-j", min=1, max=16, help="Max parallel sandbox patch verification workers"),
     out: Path = typer.Option(Path("vulnbox-out"), "--out", help="Output directory for report bundle"),
 ) -> None:
     """Run full end-to-end sandbox scan, active pre/post curl probing, patching, and dual verification."""
@@ -152,6 +153,7 @@ def remediate(
         advisories_path=advisories,
         llm_config=llm_cfg,
         guardrail_policy=GuardrailPolicy(max_retries=llm_max_retries),
+        max_workers=jobs,
         out_dir=out,
     )
 

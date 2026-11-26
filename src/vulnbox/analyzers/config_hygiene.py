@@ -7,7 +7,7 @@ from pathlib import Path
 
 from vulnbox.analyzers.base import SKIP_DIRS, extract_snippet, make_finding_id
 from vulnbox.constants import is_test_or_fixture_path
-from vulnbox.models import Finding, ScrubSummary
+from vulnbox.models import Finding, ScrubSummary, Severity
 
 FROM_RE = re.compile(r"^\s*FROM\s+([^\s]+)", re.IGNORECASE)
 USER_RE = re.compile(r"^\s*USER\s+([^\s]+)", re.IGNORECASE)
@@ -58,6 +58,7 @@ class ConfigHygieneAnalyzer:
                 fname = Path(rel_file).name
                 if fname.lower().startswith(".env") or fname.lower().endswith((".pem", ".key")):
                     env_cls = scrub_summary.env_classifications.get(rel_file, "real_secret")
+                    sev: Severity
                     if fname.lower().startswith(".env") and env_cls == "public_only":
                         sev = "low"
                         title = "Public-Only Environment File Present in Repository"
@@ -87,7 +88,7 @@ class ConfigHygieneAnalyzer:
                             cwe_id="CWE-798",
                             title=title,
                             category="secret",
-                            severity=sev,  # type: ignore[arg-type]
+                            severity=sev,
                             file_path=rel_file,
                             start_line=1,
                             end_line=1,

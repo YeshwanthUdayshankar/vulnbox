@@ -24,6 +24,7 @@ from vulnbox.models import (
     RepoProfile,
     VerificationResult,
 )
+from vulnbox.registry import PluginRegistry
 from vulnbox.remediation.patcher import make_unified_diff
 from vulnbox.remediation.regression_gen import generate_regression_test
 from vulnbox.remediation.verifier import verify_patch
@@ -126,6 +127,8 @@ def synthesize_and_verify_patch(
     health_path: str | None = None,
     advisories_path: Path | None = None,
     sandbox_policy: SandboxPolicy | None = None,
+    registry: PluginRegistry | None = None,
+    baseline_tests_override: tuple[bool, str] | None = None,
 ) -> tuple[PatchCandidate | None, VerificationResult | None, list[GuardrailEvent]]:
     """Run guarded LLM patch synthesis with deterministic sandbox feedback retries."""
     pol = policy or GuardrailPolicy()
@@ -200,7 +203,7 @@ def synthesize_and_verify_patch(
         reg_path = proposal.regression_test_path
         reg_code = proposal.regression_test_code
         if not reg_path or not reg_code:
-            fallback_reg = generate_regression_test(finding)
+            fallback_reg = generate_regression_test(finding, registry=registry)
             if fallback_reg:
                 reg_path, reg_code = fallback_reg
 
@@ -230,6 +233,8 @@ def synthesize_and_verify_patch(
             health_path=health_path,
             advisories_path=advisories_path,
             policy=sandbox_policy,
+            registry=registry,
+            baseline_tests_override=baseline_tests_override,
         )
         last_patch = candidate
         last_ver = ver

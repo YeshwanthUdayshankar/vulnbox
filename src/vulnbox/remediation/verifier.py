@@ -22,7 +22,7 @@ from vulnbox.sandbox.base import SandboxBackend, SandboxPolicy
 from vulnbox.scrubber import ScrubbedWorkspace
 
 
-def _run_existing_tests(
+def run_existing_tests(
     workspace_dir: Path,
     profile: RepoProfile,
     backend: SandboxBackend,
@@ -37,6 +37,9 @@ def _run_existing_tests(
         if res.exit_code != 0:
             return False, "\n\n".join(logs)
     return True, "\n\n".join(logs)
+
+
+_run_existing_tests = run_existing_tests
 
 
 def _run_regression_test(
@@ -66,6 +69,7 @@ def verify_patch(
     advisories_path: Path | None = None,
     policy: SandboxPolicy | None = None,
     registry: PluginRegistry | None = None,
+    baseline_tests_override: tuple[bool, str] | None = None,
 ) -> VerificationResult:
     """Verify a patch candidate in a fresh scrubbed sandbox before and after patching."""
     pol = policy or SandboxPolicy()
@@ -81,7 +85,10 @@ def verify_patch(
         )
         baseline_ids = {f.finding_id for f in baseline_findings}
 
-        baseline_tests_ok, baseline_test_log = _run_existing_tests(ws, profile, backend, pol)
+        if baseline_tests_override is not None:
+            baseline_tests_ok, baseline_test_log = baseline_tests_override
+        else:
+            baseline_tests_ok, baseline_test_log = run_existing_tests(ws, profile, backend, pol)
         logs["baseline_tests"] = baseline_test_log
 
         # 2. Active pre-patch curl/HTTP probe (if app is runnable & probe exists)

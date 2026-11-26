@@ -6,7 +6,7 @@ import ast
 from pathlib import Path
 
 from vulnbox.analyzers.base import extract_snippet, iter_source_files, make_finding_id
-from vulnbox.models import Finding
+from vulnbox.models import Finding, Severity
 
 SQL_KEYWORDS = ("select ", "insert ", "update ", "delete ", "drop ")
 
@@ -52,7 +52,7 @@ class _PythonSecurityVisitor(ast.NodeVisitor):
         rule_id: str,
         cwe_id: str,
         title: str,
-        severity: str,
+        severity: Severity,
         node: ast.AST,
         message: str,
         recommended_fix: str,
@@ -67,7 +67,7 @@ class _PythonSecurityVisitor(ast.NodeVisitor):
                 cwe_id=cwe_id,
                 title=title,
                 category="sast",
-                severity=severity,  # type: ignore[arg-type]
+                severity=severity,
                 file_path=self.rel_path,
                 start_line=start_line,
                 end_line=end_line,

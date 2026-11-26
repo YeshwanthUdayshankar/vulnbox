@@ -7,12 +7,13 @@ import secrets
 import shutil
 import sys
 import tempfile
+import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-from vulnbox import __version__
+from vulnbox._version import __version__
 from vulnbox.engine import VulnBoxEngine
 from vulnbox.llm import GuardrailPolicy, LLMConfig
 from vulnbox.models import DynamicProbeSpec
@@ -21,14 +22,18 @@ from vulnbox.reporting.sarif import build_sarif, validate_sarif
 from vulnbox.sandbox import DockerSandboxBackend, LocalSandboxBackend
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
+STATIC_ASSETS: dict[str, tuple[str, str]] = {
+    "/static/styles.css": ("styles.css", "text/css; charset=utf-8"),
+    "/static/app.js": ("app.js", "application/javascript; charset=utf-8"),
+}
 MAX_BODY_BYTES = 2 * 1024 * 1024  # 2 MiB max request body
 ALLOWED_HOSTS = {"127.0.0.1", "localhost", "::1"}
 
 SECURITY_HEADERS: dict[str, str] = {
     "Content-Security-Policy": (
         "default-src 'self'; "
-        "script-src 'self' 'unsafe-inline'; "
-        "style-src 'self' 'unsafe-inline'; "
+        "script-src 'self'; "
+        "style-src 'self'; "
         "img-src 'self' data:; "
         "connect-src 'self'; "
         "frame-ancestors 'none'; "
@@ -118,6 +123,7 @@ class VulnBoxUIServer(ThreadingHTTPServer):
         csrf_token: str | None = None,
     ) -> None:
         self.csrf_token: str = csrf_token or secrets.token_urlsafe(24)
+        self.artifacts_lock = threading.Lock()
         self.latest_artifacts: dict[str, dict[str, str]] = {}
         super().__init__(server_address, VulnBoxUIHandler)
 
@@ -186,6 +192,12 @@ class VulnBoxUIHandler(BaseHTTPRequestHandler):
             self._send_bytes(200, "text/html; charset=utf-8", html.encode("utf-8"))
             return
 
+        if parsed.path in STATIC_ASSETS:
+            fname, ctype = STATIC_ASSETS[parsed.path]
+            asset_bytes = (STATIC_DIR / fname).read_bytes()
+            self._send_bytes(200, ctype, asset_bytes)
+            return
+
         if parsed.path == "/api/doctor":
             self._send_json(200, _doctor_status())
             return
@@ -194,14 +206,16 @@ class VulnBoxUIHandler(BaseHTTPRequestHandler):
             parts = parsed.path.removeprefix("/api/artifact/").split("/", 1)
             if len(parts) == 2:
                 run_id, kind = parts
-                bundle = self.server.latest_artifacts.get(run_id)
-                if bundle and kind in bundle:
+                with self.server.artifacts_lock:
+                    bundle = self.server.latest_artifacts.get(run_id)
+                    content = bundle.get(kind) if bundle else None
+                if content is not None:
                     ctype = (
                         "text/markdown; charset=utf-8"
                         if kind == "report.md"
                         else "application/json; charset=utf-8"
                     )
-                    self._send_bytes(200, ctype, bundle[kind].encode("utf-8"))
+                    self._send_bytes(200, ctype, content.encode("utf-8"))
                     return
             self._send_json(404, {"error": "Artifact not found."})
             return
@@ -240,15 +254,15 @@ class VulnBoxUIHandler(BaseHTTPRequestHandler):
         validate_sarif(sarif_doc)
         sarif_text = json.dumps(sarif_doc, indent=2) + "\n"
         manifest_text = report.model_dump_json(indent=2) + "\n"
-        # Keep only the 10 most recent runs in memory
-        if len(self.server.latest_artifacts) >= 10:
-            oldest = next(iter(self.server.latest_artifacts))
-            self.server.latest_artifacts.pop(oldest, None)
-        self.server.latest_artifacts[run_id] = {
-            "report.md": md_text,
-            "findings.sarif.json": sarif_text,
-            "manifest.json": manifest_text,
-        }
+        with self.server.artifacts_lock:
+            if len(self.server.latest_artifacts) >= 10:
+                oldest = next(iter(self.server.latest_artifacts))
+                self.server.latest_artifacts.pop(oldest, None)
+            self.server.latest_artifacts[run_id] = {
+                "report.md": md_text,
+                "findings.sarif.json": sarif_text,
+                "manifest.json": manifest_text,
+            }
         return run_id, md_text, sarif_doc
 
     def _handle_profile(self, body: dict[str, Any]) -> None:

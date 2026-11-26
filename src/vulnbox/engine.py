@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from pathlib import Path
 
+from vulnbox._version import __version__ as TOOL_VERSION
 from vulnbox.analyzers import run_all_analyzers
 from vulnbox.llm import (
     GuardrailPolicy,
@@ -30,11 +32,10 @@ from vulnbox.remediation import (
     run_dynamic_probe,
     verify_patch,
 )
+from vulnbox.remediation.verifier import run_existing_tests
 from vulnbox.reporting import write_report_bundle
 from vulnbox.sandbox import SandboxBackend, SandboxPolicy, select_backend
 from vulnbox.scrubber import ScrubbedWorkspace
-
-TOOL_VERSION = "0.1.0"
 
 
 def _utc_now() -> str:
@@ -129,6 +130,7 @@ class VulnBoxEngine:
         llm_config: LLMConfig | None = None,
         llm_client: OpenAICompatLLMClient | None = None,
         guardrail_policy: GuardrailPolicy | None = None,
+        max_workers: int = 4,
         out_dir: Path | None = None,
     ) -> tuple[AuditReport, dict[str, Path]]:
         repo = Path(repo_path).resolve()
@@ -147,6 +149,7 @@ class VulnBoxEngine:
         patches: list[PatchCandidate] = []
         verifications: list[VerificationResult] = []
         unpatched_findings = []
+        baseline_tests_cache: tuple[bool, str] | None = None
 
         with ScrubbedWorkspace(repo) as sws:
             scrub = sws.summary
@@ -157,6 +160,11 @@ class VulnBoxEngine:
                 profile=prof,
                 registry=self.registry,
             )
+            if findings:
+                baseline_tests_cache = run_existing_tests(
+                    sws.path, prof, self.backend, self.sandbox_policy
+                )
+
             for f in findings:
                 patch = generate_patch_for_finding(f, sws.path, registry=self.registry)
                 if patch is None:
@@ -195,6 +203,8 @@ class VulnBoxEngine:
                         health_path=health_path,
                         advisories_path=advisories_path,
                         sandbox_policy=self.sandbox_policy,
+                        registry=self.registry,
+                        baseline_tests_override=baseline_tests_cache,
                     )
                     guardrail_events.extend(evs)
                     if cand is not None:
@@ -204,23 +214,30 @@ class VulnBoxEngine:
 
         finding_map = {f.finding_id: f for f in findings}
         already_verified_ids = {v.finding_id for v in verifications}
-        for patch in patches:
-            if patch.finding_id in already_verified_ids:
-                continue
-            ver = verify_patch(
+        pending_patches = [p for p in patches if p.finding_id not in already_verified_ids]
+
+        def _verify_one(p: PatchCandidate) -> VerificationResult:
+            return verify_patch(
                 repo_path=repo,
                 profile=prof,
-                patch=patch,
+                patch=p,
                 backend=self.backend,
-                finding=finding_map.get(patch.finding_id),
-                probe_spec=patch.probe_spec,
+                finding=finding_map.get(p.finding_id),
+                probe_spec=p.probe_spec,
                 start_cmd=start_cmd,
                 health_path=health_path,
                 advisories_path=advisories_path,
                 policy=self.sandbox_policy,
                 registry=self.registry,
+                baseline_tests_override=baseline_tests_cache,
             )
-            verifications.append(ver)
+
+        workers = max(1, min(max_workers, len(pending_patches) or 1))
+        if workers == 1 or len(pending_patches) <= 1:
+            verifications.extend(_verify_one(p) for p in pending_patches)
+        else:
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                verifications.extend(pool.map(_verify_one, pending_patches))
 
         report = AuditReport(
             tool_version=TOOL_VERSION,

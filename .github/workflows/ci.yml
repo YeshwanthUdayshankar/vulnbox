@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test-and-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Set up Python 3.12
+        run: uv python install 3.12
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install dependencies
+        run: uv sync --extra dev
+
+      - name: Lint with ruff
+        run: uv run ruff check src tests
+
+      - name: Run pytest suite
+        run: uv run pytest -v
+
+      - name: Dogfood VulnBox self-scan (expect 0 findings)
+        run: |
+          uv run vulnbox scan . --backend local --out /tmp/vulnbox-ci-self
+          uv run python -c '
+          import json
+          data = json.loads(open("/tmp/vulnbox-ci-self/manifest.json").read())
+          assert len(data["findings"]) == 0, f"Unexpected self-scan findings: {data[\"findings\"]}"
+          print("Self-scan clean: 0 findings.")
+          '

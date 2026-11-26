@@ -31,6 +31,7 @@ Test repositories in an isolated, secret-scrubbed sandbox, **actively confirm vu
    - Pass `--start-cmd "<cmd>"` and `--health-path "/health"` if the app uses a custom server entrypoint.
    - Pass `--advisories <advisories.json>` to check specific dependency CVEs and reachability.
    - Pass `--probe <probe.json>` to run custom loopback `curl` probes against specific endpoints.
+   - Pass `--llm --llm-provider ollama|openai|gemini|custom` to enable the built-in guarded LLM synthesis loop for findings without deterministic built-in patches (all LLM outputs are validated by deterministic guardrails and dual-verified inside the sandbox).
 
 3. **Author & verify custom patches for complex or custom-endpoint findings:**
    If a finding requires a custom multi-file fix or a custom endpoint probe:

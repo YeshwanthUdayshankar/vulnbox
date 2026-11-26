@@ -14,9 +14,14 @@ ReachabilityStatus = Literal[
     "reachable", "not_reachable", "under_investigation", "not_applicable"
 ]
 PatchStrategy = Literal[
-    "minimal_code_fix", "dependency_bump", "config_hardening", "agent_supplied"
+    "minimal_code_fix",
+    "dependency_bump",
+    "config_hardening",
+    "agent_supplied",
+    "llm_synthesized",
 ]
 HttpMethod = Literal["GET", "POST", "PUT", "DELETE", "OPTIONS", "HEAD"]
+GuardrailDecision = Literal["allow", "block", "warn"]
 
 
 class RepoProfile(BaseModel):
@@ -156,6 +161,32 @@ class PatchCandidate(BaseModel):
     regression_test_path: str | None = None
     regression_test_code: str | None = None
     probe_spec: DynamicProbeSpec | None = None
+    root_cause_explanation: str | None = None
+    probe_explanation: str | None = None
+    fix_explanation: str | None = None
+    llm_attempts: int = 0
+
+
+class GuardrailEvent(BaseModel):
+    """Auditable record of a deterministic guardrail check during LLM/agent execution."""
+
+    gate: str
+    decision: GuardrailDecision
+    finding_id: str | None = None
+    reason: str
+    details: dict[str, Any] = Field(default_factory=dict)
+
+
+class LLMPatchProposal(BaseModel):
+    """Strict structured JSON schema required from any LLM remediation response."""
+
+    root_cause_explanation: str = Field(min_length=5, max_length=2000)
+    probe_explanation: str | None = Field(default=None, max_length=2000)
+    fix_explanation: str = Field(min_length=5, max_length=2000)
+    unified_diff: str = Field(min_length=10)
+    regression_test_path: str | None = None
+    regression_test_code: str | None = None
+    probe_spec: DynamicProbeSpec | None = None
 
 
 class VerificationResult(BaseModel):
@@ -190,3 +221,6 @@ class AuditReport(BaseModel):
     findings: list[Finding] = Field(default_factory=list)
     patches: list[PatchCandidate] = Field(default_factory=list)
     verifications: list[VerificationResult] = Field(default_factory=list)
+    llm_enabled: bool = False
+    llm_model: str | None = None
+    guardrail_events: list[GuardrailEvent] = Field(default_factory=list)

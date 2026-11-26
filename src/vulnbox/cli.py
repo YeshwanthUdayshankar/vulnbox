@@ -14,7 +14,13 @@ from rich.table import Table
 
 from vulnbox import __version__
 from vulnbox.analyzers import run_all_analyzers
-from vulnbox.models import AuditReport, PatchCandidate
+from vulnbox.llm import (
+    GuardrailPolicy,
+    LLMConfig,
+    OpenAICompatLLMClient,
+    synthesize_and_verify_patch,
+)
+from vulnbox.models import AuditReport, GuardrailEvent, PatchCandidate
 from vulnbox.profiler import profile_repo
 from vulnbox.remediation import (
     generate_patch_for_finding,
@@ -173,6 +179,11 @@ def remediate(
     health_path: str | None = typer.Option(None, "--health-path", help="Override healthcheck path"),
     probe_file: Path | None = typer.Option(None, "--probe", help="Optional custom JSON probe spec(s)"),
     advisories: Path | None = typer.Option(None, "--advisories", help="Optional JSON advisory file"),
+    llm: bool = typer.Option(False, "--llm", help="Enable guarded LLM synthesis for findings without deterministic patches"),
+    llm_provider: str = typer.Option("ollama", "--llm-provider", help="LLM provider: ollama, openai, gemini, custom"),
+    llm_model: str | None = typer.Option(None, "--llm-model", help="Override LLM model name"),
+    llm_base_url: str | None = typer.Option(None, "--llm-base-url", help="Override OpenAI-compatible API base URL"),
+    llm_max_retries: int = typer.Option(2, "--llm-max-retries", min=0, max=5, help="Max guarded LLM retry attempts per finding"),
     out: Path = typer.Option(Path("vulnbox-out"), "--out", help="Output directory for report bundle"),
 ) -> None:
     """Run full end-to-end sandbox scan, active pre/post curl probing, patching, and dual verification."""
@@ -180,16 +191,24 @@ def remediate(
     prof = profile_repo(repo)
     custom_probes = load_probe_specs(probe_file) if probe_file else []
 
+    llm_cfg = LLMConfig(provider=llm_provider, model=llm_model, base_url=llm_base_url) if llm else None
+    llm_client = OpenAICompatLLMClient(llm_cfg) if llm_cfg else None
+    guardrail_policy = GuardrailPolicy(max_retries=llm_max_retries)
+    guardrail_events: list[GuardrailEvent] = []
+
     scrub = create_scrubbed_workspace(repo)
     ws = Path(scrub.sandbox_dir)
     patches: list[PatchCandidate] = []
     verifications = []
+    unpatched_findings = []
 
     try:
         findings = run_all_analyzers(ws, scrub_summary=scrub, advisories_path=advisories)
         for f in findings:
             patch = generate_patch_for_finding(f, ws)
             if patch is None:
+                if f.category != "secret":
+                    unpatched_findings.append(f)
                 continue
             reg = generate_regression_test(f)
             if reg:
@@ -203,11 +222,35 @@ def remediate(
                 matched_probe = infer_probe_for_finding(f, ws)
             patch.probe_spec = matched_probe
             patches.append(patch)
+
+        # Optional guarded LLM synthesis for findings without deterministic auto-patches
+        if llm_client is not None and unpatched_findings:
+            for f in unpatched_findings:
+                cand, ver, evs = synthesize_and_verify_patch(
+                    repo_path=repo,
+                    workspace_dir=ws,
+                    profile=prof,
+                    finding=f,
+                    backend=be,
+                    client=llm_client,
+                    policy=guardrail_policy,
+                    start_cmd=start_cmd,
+                    health_path=health_path,
+                    advisories_path=advisories,
+                )
+                guardrail_events.extend(evs)
+                if cand is not None:
+                    patches.append(cand)
+                if ver is not None:
+                    verifications.append(ver)
     finally:
         cleanup_workspace(ws)
 
     finding_map = {f.finding_id: f for f in findings}
+    already_verified_ids = {v.finding_id for v in verifications}
     for patch in patches:
+        if patch.finding_id in already_verified_ids:
+            continue
         ver = verify_patch(
             repo_path=repo,
             profile=prof,
@@ -230,15 +273,20 @@ def remediate(
         findings=findings,
         patches=patches,
         verifications=verifications,
+        llm_enabled=llm,
+        llm_model=llm_cfg.resolved_model() if llm_cfg else None,
+        guardrail_events=guardrail_events,
     )
     written = write_report_bundle(report, out)
 
     verified_count = sum(1 for v in verifications if v.verified)
     active_count = sum(1 for v in verifications if v.dynamic_confirmed_and_fixed is True)
+    blocked_count = sum(1 for g in guardrail_events if g.decision == "block")
     console.print(
         f"[bold green]Remediation bundle complete[/bold green]: "
         f"{len(findings)} findings, {verified_count}/{len(patches)} verified patches, "
-        f"{active_count} actively confirmed & fixed via live curl probe."
+        f"{active_count} actively confirmed & fixed via live curl probe"
+        + (f", {blocked_count} guardrail blocks." if llm else ".")
     )
     console.print(f"Report:  {written['markdown']}")
     console.print(f"SARIF:   {written['sarif']}")

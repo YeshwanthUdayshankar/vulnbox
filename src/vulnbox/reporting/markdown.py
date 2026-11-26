@@ -26,11 +26,13 @@ def render_markdown_report(report: AuditReport) -> str:
         f"| **Repository** | `{report.profile.repo_path}` |",
         f"| **Ecosystem** | `{report.profile.ecosystem}` |",
         f"| **Sandbox Backend** | `{report.sandbox_backend}` |",
+        f"| **LLM Assistance** | `{f'enabled ({report.llm_model})' if report.llm_enabled else 'disabled (deterministic only)'}` |",
         f"| **Timestamp (UTC)** | `{report.timestamp}` |",
         f"| **Files Scrubbed / Secrets Redacted** | {len(report.scrub_summary.files_scrubbed)} files / {report.scrub_summary.secrets_redacted} redactions |",
         f"| **Total Findings** | {total} |",
         f"| **Dual-Verified Patches** | {verified_count} / {len(report.patches)} |",
         f"| **Actively Confirmed & Fixed (Live `curl` Probe)** | {active_confirmed} |",
+        f"| **Guardrail Events (Blocks / Warnings)** | {sum(1 for g in report.guardrail_events if g.decision == 'block')} blocked / {sum(1 for g in report.guardrail_events if g.decision == 'warn')} warnings |",
         "",
         "## Findings Overview",
         "",
@@ -126,6 +128,17 @@ def render_markdown_report(report: AuditReport) -> str:
                 lines.append("")
 
         if patch is not None:
+            if patch.root_cause_explanation:
+                lines.append(f"- **Core Issue:** {patch.root_cause_explanation}")
+            if patch.probe_explanation:
+                lines.append(f"- **How the Probe Verifies It:** {patch.probe_explanation}")
+            if patch.fix_explanation:
+                lines.append(f"- **How the Fix Resolves It:** {patch.fix_explanation}")
+            if patch.strategy == "llm_synthesized":
+                lines.append(f"- **Patch Source:** `llm_synthesized` (attempts={patch.llm_attempts})")
+            if any((patch.root_cause_explanation, patch.probe_explanation, patch.fix_explanation)):
+                lines.append("")
+
             lines.extend(
                 [
                     f"#### Suggested Patch (`patches/{f.finding_id}.patch`)",
@@ -139,6 +152,23 @@ def render_markdown_report(report: AuditReport) -> str:
             if patch.regression_test_path:
                 lines.append(f"- **Generated Regression Test:** `{patch.regression_test_path}`")
                 lines.append("")
+
+    if report.guardrail_events:
+        lines.extend(
+            [
+                "---",
+                "",
+                "## Guardrail Audit Trail",
+                "",
+                "| Gate | Decision | Finding ID | Reason |",
+                "| :--- | :--- | :--- | :--- |",
+            ]
+        )
+        for ev in report.guardrail_events:
+            lines.append(
+                f"| `{ev.gate}` | **{ev.decision.upper()}** | `{ev.finding_id or '-'}` | {ev.reason} |"
+            )
+        lines.append("")
 
     lines.extend(
         [

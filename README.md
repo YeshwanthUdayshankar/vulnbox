@@ -452,14 +452,41 @@ Every `vulnbox remediate` run writes a self-contained review bundle (without tou
 
 ```text
 vulnbox-out/
-├── report.md                     # Executive summary, before/after curl proof, diffs, HITL checklist
+├── report.md                     # Executive summary, before/after curl proof, diffs, guardrail audit trail, HITL checklist
 ├── findings.sarif.json           # Schema-validated SARIF 2.1.0 report
-├── manifest.json                 # Full machine-readable AuditReport (headers, excerpts, logs)
+├── manifest.json                 # Full machine-readable AuditReport (headers, excerpts, logs, guardrail events)
 ├── patches/
 │   └── <finding_id>.patch        # Verified git-compatible unified diffs
 └── regression_tests/
     └── test_security_<id>.py     # (or security_<id>.test.mjs) permanent defensive tests
 ```
+
+## Optional Guarded LLM Mode (`--llm`)
+
+By default, `vulnbox` runs **100% deterministically** with zero LLM calls. For complex or custom findings that do not have a built-in rule-based auto-patch (such as custom SQL/command refactors or non-standard endpoints), you can opt into the **guarded LLM synthesis loop** using any OpenAI-compatible endpoint (local **Ollama**, **OpenAI**, **Gemini**, or **vLLM**):
+
+```bash
+# Local Ollama (no API key required)
+uv run vulnbox remediate /path/to/repo --backend docker --llm --llm-provider ollama --llm-model qwen2.5-coder:7b
+
+# OpenAI or Gemini (OpenAI-compatible endpoint)
+GEMINI_API_KEY=... uv run vulnbox remediate /path/to/repo --backend docker --llm --llm-provider gemini
+OPENAI_API_KEY=... uv run vulnbox remediate /path/to/repo --backend docker --llm --llm-provider openai
+```
+
+### Deterministic Guardrails (Non-Negotiable)
+
+Every LLM request and response passes through [`src/vulnbox/llm/guardrails.py`](src/vulnbox/llm/guardrails.py) before anything reaches the sandbox, and every decision is logged in the report's **Guardrail Audit Trail**:
+
+| Guardrail Gate | Enforcement |
+| :--- | :--- |
+| **Outbound Secret-Leakage Gate** | Blocks any outbound prompt containing unredacted credential patterns (`AKIA...`, `ghp_...`, `sk-...`, private keys) or exceeding prompt size budgets; only scrubbed sandbox copies are read. |
+| **Prompt-Injection Framing & AST Dominance** | Wraps repository code in `<untrusted_repo_file>` XML delimiters (escaping tag breakouts), flags injection patterns in source comments, and never allows an LLM to downgrade or dismiss deterministic findings. |
+| **Strict Structured JSON Output** | Requires a schema-validated `LLMPatchProposal` JSON object—the LLM never executes arbitrary shell commands. |
+| **Diff Safety & Anti-Test-Tampering Gate** | Rejects path traversal (`..`), protected paths (`.git/`, `.github/`, `.env*`), modifications to existing test files, `pytest.mark.skip`/`# nosec` suppressions, dangerous sink re-introductions (`shell=True`, `eval`, `verify=False`, `0o777`), and excessive diff sizes. |
+| **Loopback & Non-Destructive Probe Gate** | Confines LLM-proposed `DynamicProbeSpec` checks strictly to relative loopback paths (`127.0.0.1`), blocking external URLs, cloud metadata SSRF hosts (`169.254.169.254`), YAML RCE tags, shell metacharacters, and destructive SQL. |
+| **Regression Test Safety Gate** | Restricts generated tests to `tests/test_security_*.py` or `tests/security_*.test.mjs`, validates Python AST syntax, and blocks subprocess/destructive/outbound-network calls. |
+| **Sandbox Truth Oracle & Retry Budget** | Retries up to `--llm-max-retries` (default `2`) with sandbox failure feedback; an LLM patch is **never** marked `VERIFIED` unless `verify_patch()` passes all checks inside the isolated sandbox. |
 
 ## Agent Skill
 

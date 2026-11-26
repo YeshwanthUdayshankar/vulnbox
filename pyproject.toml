@@ -1,0 +1,44 @@
+[build-system]
+requires = ["hatchling>=1.25.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "vulnbox"
+version = "0.1.0"
+description = "Sandboxed vulnerability verification, active before/after probing, and dual-verified patch remediation CLI + Agent Skill"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.11"
+dependencies = [
+  "pydantic>=2.9.0",
+  "typer>=0.12.5",
+  "rich>=13.9.0",
+  "pyyaml>=6.0.2",
+  "jsonschema>=4.23.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.3.0",
+  "ruff>=0.7.0",
+]
+
+[project.scripts]
+vulnbox = "vulnbox.cli:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/vulnbox"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+norecursedirs = ["fixtures"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = ["tests/fixtures"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+ignore = ["B008", "E501"]

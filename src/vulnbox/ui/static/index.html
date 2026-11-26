@@ -70,6 +70,10 @@
             <label for="rem-out">Save Output Bundle To Directory (optional)</label>
             <input id="rem-out" type="text" placeholder="Leave blank for in-memory download" />
           </div>
+          <div>
+            <label for="rem-jobs">Parallel Verification Workers (<code>--jobs</code>)</label>
+            <input id="rem-jobs" type="number" min="1" max="16" value="4" />
+          </div>
         </div>
 
         <div class="mt-12">
@@ -143,6 +147,14 @@
           <div>
             <label for="scan-advisories">Custom Advisories JSON Path (optional)</label>
             <input id="scan-advisories" type="text" placeholder="/path/to/advisories.json" />
+          </div>
+          <div>
+            <label for="scan-start">Start Command Override (optional, for <code>--check-leaks</code>)</label>
+            <input id="scan-start" type="text" placeholder="auto-detected" />
+          </div>
+          <div>
+            <label for="scan-health">Healthcheck Path</label>
+            <input id="scan-health" type="text" value="/health" />
           </div>
         </div>
         <div class="checkbox-row">

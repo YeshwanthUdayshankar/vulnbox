@@ -130,3 +130,54 @@ def test_node_leaky_app_end_to_end_before_after_heap_verification(tmp_path: Path
     assert by_rule["MEM-JS-001"].memory_leak_confirmed_and_fixed is True
     assert by_rule["MEM-JS-002"].memory_leak_confirmed_and_fixed is True
     validate_sarif(build_sarif(report))
+
+
+def test_incompatible_memory_profiler_degrades_gracefully_without_breaking_verification() -> None:
+    """If no memory profiler is compatible (e.g., unsupported OS/runtime), scan & verify must not break."""
+    from vulnbox.analyzers import register_builtin_analyzers
+    from vulnbox.callgraph.ts_utils import available_tree_sitter_languages, get_parser_for_ext
+    from vulnbox.registry import PluginRegistry, default_registry
+
+    class _IncompatibleProfiler:
+        name = "mock-incompatible-profiler"
+        priority = 100
+
+        def check_compatibility(self, start_cmd: str, backend_name: str) -> tuple[bool, str]:
+            return False, "Simulated unsupported OS (no SIGUSR1 / no /proc)"
+
+        def prepare_sandbox(self, probe_dir, probe_dir_sb, start_cmd, is_docker):
+            raise AssertionError("Should never be invoked when incompatible")
+
+    # Build an isolated registry reusing built-in analyzers/patchers/tests/probes,
+    # but ONLY registering the incompatible memory profiler.
+    reg = PluginRegistry()
+    register_builtin_analyzers(reg)
+    reg._patchers.update(default_registry._patchers)
+    reg._category_patchers.update(default_registry._category_patchers)
+    reg._regression_tests.update(default_registry._regression_tests)
+    reg._category_regression_tests.update(default_registry._category_regression_tests)
+    reg._memory_probes.update(default_registry._memory_probes)
+    reg.register_memory_profiler(_IncompatibleProfiler())
+
+    engine = VulnBoxEngine(backend="local", registry=reg)
+
+    # 1. Scan with deep=True + check_leaks=True completes cleanly with skipped=True
+    scan_report, _ = engine.scan(FIXTURES / "py_leaky_app", deep=True, check_leaks=True)
+    assert len(scan_report.memory_probes) >= 2
+    assert all(mp.skipped and mp.skip_reason for mp in scan_report.memory_probes)
+
+    # 2. Remediate with deep=True + check_leaks=True still verifies patches cleanly (no false failure!)
+    rem_report, _ = engine.remediate(FIXTURES / "py_leaky_app", deep=True, check_leaks=True)
+    assert len(rem_report.verifications) >= 2
+    assert all(v.verified for v in rem_report.verifications)
+    assert all(v.memory_probe_before is not None and v.memory_probe_before.skipped for v in rem_report.verifications)
+    assert all(v.memory_leak_confirmed_and_fixed is None for v in rem_report.verifications)
+
+    # 3. Default registry falls back to language-agnostic os-proc-fallback for non-Python/Node binaries
+    selected, _ = default_registry.select_memory_profiler("./my-go-server", "docker")
+    assert selected is not None and selected.name == "os-proc-fallback"
+
+    # 4. Tree-sitter utility reports loaded grammars and returns None cleanly for unsupported extensions
+    assert "javascript" in available_tree_sitter_languages()
+    assert get_parser_for_ext(".unknown_ext") is None
+

@@ -246,6 +246,9 @@ class MemoryLeakProbeResult(BaseModel):
 
     probe_id: str
     endpoint: str
+    profiler_name: str = ""
+    skipped: bool = False
+    skip_reason: str | None = None
     samples: list[MemorySample] = Field(default_factory=list)
     bytes_per_request_slope: float = 0.0
     r_squared: float = 0.0

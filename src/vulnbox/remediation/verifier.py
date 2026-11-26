@@ -143,11 +143,14 @@ def verify_patch(
                 spec=active_mem_probe,
                 health_path=effective_health,
                 policy=pol,
+                registry=registry,
             )
             logs["memory_probe_before"] = (
-                f"endpoint={mem_before.endpoint} slope={mem_before.bytes_per_request_slope}B/req "
-                f"r2={mem_before.r_squared} fd_delta={mem_before.fd_delta} "
-                f"leak_detected={mem_before.leak_detected} error={mem_before.error}"
+                f"profiler={mem_before.profiler_name} skipped={mem_before.skipped} "
+                f"reason={mem_before.skip_reason} endpoint={mem_before.endpoint} "
+                f"slope={mem_before.bytes_per_request_slope}B/req r2={mem_before.r_squared} "
+                f"fd_delta={mem_before.fd_delta} leak_detected={mem_before.leak_detected} "
+                f"error={mem_before.error}"
             )
 
         # 3. Pre-patch regression test (should fail before patch)
@@ -241,30 +244,40 @@ def verify_patch(
                 and not probe_after.matched_vulnerable
             )
 
-        # 6b. Active post-patch memory & FD leak stress probe
+        # 6b. Active post-patch memory & FD leak stress probe (gracefully skipped if incompatible)
         mem_after: MemoryLeakProbeResult | None = None
         mem_ok: bool | None = None
         if check_leaks and active_mem_probe is not None and effective_start:
-            mem_after = run_memory_leak_probe(
-                ws,
-                backend=backend,
-                start_cmd=effective_start,
-                spec=active_mem_probe,
-                health_path=effective_health,
-                policy=pol,
-            )
-            logs["memory_probe_after"] = (
-                f"endpoint={mem_after.endpoint} slope={mem_after.bytes_per_request_slope}B/req "
-                f"r2={mem_after.r_squared} fd_delta={mem_after.fd_delta} "
-                f"leak_detected={mem_after.leak_detected} error={mem_after.error}"
-            )
-            mem_ok = bool(
-                mem_before
-                and mem_before.error is None
-                and mem_after.error is None
-                and mem_before.leak_detected
-                and not mem_after.leak_detected
-            )
+            if mem_before is not None and mem_before.skipped:
+                # Profiler is incompatible with this runtime/OS — degrade gracefully without failing verification
+                mem_ok = None
+            else:
+                mem_after = run_memory_leak_probe(
+                    ws,
+                    backend=backend,
+                    start_cmd=effective_start,
+                    spec=active_mem_probe,
+                    health_path=effective_health,
+                    policy=pol,
+                    registry=registry,
+                )
+                logs["memory_probe_after"] = (
+                    f"profiler={mem_after.profiler_name} skipped={mem_after.skipped} "
+                    f"reason={mem_after.skip_reason} endpoint={mem_after.endpoint} "
+                    f"slope={mem_after.bytes_per_request_slope}B/req r2={mem_after.r_squared} "
+                    f"fd_delta={mem_after.fd_delta} leak_detected={mem_after.leak_detected} "
+                    f"error={mem_after.error}"
+                )
+                if mem_after.skipped:
+                    mem_ok = None
+                else:
+                    mem_ok = bool(
+                        mem_before
+                        and mem_before.error is None
+                        and mem_after.error is None
+                        and mem_before.leak_detected
+                        and not mem_after.leak_detected
+                    )
 
         # 7. Post-patch regression test (must PASS)
         reg_passed_after: bool | None = None

@@ -48,6 +48,26 @@ class ReporterPlugin(Protocol):
     def write(self, report: AuditReport, out_dir: Path) -> Path: ...
 
 
+@runtime_checkable
+class MemoryProfilerAdapter(Protocol):
+    """Pluggable memory/FD profiler backend with graceful compatibility checks."""
+
+    name: str
+    priority: int  # Higher priority adapters are checked first
+
+    def check_compatibility(
+        self, start_cmd: str, backend_name: str
+    ) -> tuple[bool, str]: ...
+
+    def prepare_sandbox(
+        self,
+        probe_dir: Path,
+        probe_dir_sb: str,
+        start_cmd: str,
+        is_docker: bool,
+    ) -> dict[str, Any]: ...
+
+
 PatcherFn = Callable[[Finding, Path], PatchCandidate | None]
 RegressionTestFn = Callable[[Finding], tuple[str, str] | None]
 ProbeInferFn = Callable[[Finding, Path], DynamicProbeSpec | None]
@@ -65,6 +85,7 @@ class PluginRegistry:
         self._category_regression_tests: dict[str, RegressionTestFn] = {}
         self._probes: dict[str, ProbeInferFn] = {}
         self._memory_probes: dict[str, MemoryProbeInferFn] = {}
+        self._memory_profilers: dict[str, MemoryProfilerAdapter] = {}
         self._reporters: dict[str, ReporterPlugin] = {}
         self._entry_points_loaded: bool = False
 
@@ -144,6 +165,33 @@ class PluginRegistry:
 
     def get_memory_probe_inferrer(self, finding: Finding) -> MemoryProbeInferFn | None:
         return self._memory_probes.get(finding.rule_id)
+
+    # --- Pluggable Memory Profiler Backends ---
+
+    def register_memory_profiler(
+        self, profiler: MemoryProfilerAdapter
+    ) -> MemoryProfilerAdapter:
+        self._memory_profilers[profiler.name] = profiler
+        return profiler
+
+    def list_memory_profilers(self) -> list[MemoryProfilerAdapter]:
+        return sorted(
+            self._memory_profilers.values(),
+            key=lambda p: p.priority,
+            reverse=True,
+        )
+
+    def select_memory_profiler(
+        self, start_cmd: str, backend_name: str
+    ) -> tuple[MemoryProfilerAdapter | None, list[str]]:
+        """Pick the highest-priority compatible memory profiler or return skip reasons."""
+        reasons: list[str] = []
+        for profiler in self.list_memory_profilers():
+            ok, reason = profiler.check_compatibility(start_cmd, backend_name)
+            if ok:
+                return profiler, reasons
+            reasons.append(f"{profiler.name}: {reason}")
+        return None, reasons
 
     # --- Reporters ---
 

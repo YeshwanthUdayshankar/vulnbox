@@ -14,9 +14,11 @@ from typing import Any
 from urllib.parse import urlparse
 
 from vulnbox._version import __version__
+from vulnbox.callgraph.ts_utils import available_tree_sitter_languages
 from vulnbox.engine import VulnBoxEngine
 from vulnbox.llm import GuardrailPolicy, LLMConfig
 from vulnbox.models import DynamicProbeSpec
+from vulnbox.registry import default_registry
 from vulnbox.reporting.markdown import render_markdown_report
 from vulnbox.reporting.sarif import build_sarif, validate_sarif
 from vulnbox.sandbox import DockerSandboxBackend, LocalSandboxBackend
@@ -81,6 +83,8 @@ def _doctor_status() -> dict[str, Any]:
         "docker_ready": docker_ok,
         "local_ready": local_ok,
         "default_backend": "docker" if docker_ok else "local",
+        "tree_sitter_languages": available_tree_sitter_languages(),
+        "memory_profilers": [p.name for p in default_registry.list_memory_profilers()],
         "samples": _discover_sample_fixtures(),
     }
 
@@ -284,6 +288,8 @@ class VulnBoxUIHandler(BaseHTTPRequestHandler):
         out_path = Path(out_raw).expanduser().resolve() if out_raw else None
         deep = bool(body.get("deep"))
         check_leaks = bool(body.get("check_leaks"))
+        start_cmd = (body.get("start_cmd") or "").strip() or None
+        health_path = (body.get("health_path") or "").strip() or None
 
         engine = VulnBoxEngine(backend=backend)
         report, written = engine.scan(
@@ -291,6 +297,8 @@ class VulnBoxUIHandler(BaseHTTPRequestHandler):
             advisories_path=adv_path,
             deep=deep,
             check_leaks=check_leaks,
+            start_cmd=start_cmd,
+            health_path=health_path,
             out_dir=out_path,
         )
         run_id, md_text, sarif_doc = self._store_report_artifacts(report)
@@ -332,6 +340,8 @@ class VulnBoxUIHandler(BaseHTTPRequestHandler):
         out_path = Path(out_raw).expanduser().resolve() if out_raw else None
         deep = bool(body.get("deep"))
         check_leaks = bool(body.get("check_leaks"))
+        max_workers = int(body.get("max_workers") if body.get("max_workers") is not None else 4)
+        max_workers = max(1, min(16, max_workers))
 
         engine = VulnBoxEngine(backend=backend)
         report, written = engine.remediate(
@@ -344,6 +354,7 @@ class VulnBoxUIHandler(BaseHTTPRequestHandler):
             check_leaks=check_leaks,
             llm_config=llm_cfg,
             guardrail_policy=GuardrailPolicy(max_retries=max_retries),
+            max_workers=max_workers,
             out_dir=out_path,
         )
         run_id, md_text, sarif_doc = self._store_report_artifacts(report)

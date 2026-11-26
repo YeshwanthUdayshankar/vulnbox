@@ -124,6 +124,7 @@ def main(cfg_path: str) -> None:
     snap_file = Path(cfg["snap_file"])
     py_preload_dir: str | None = cfg.get("py_preload_dir")
     node_preload_file: str | None = cfg.get("node_preload_file")
+    use_sigusr1: bool = bool(cfg.get("use_sigusr1", True))
     ws_dir: str = cfg["workspace_dir"]
 
     env = os.environ.copy()
@@ -193,11 +194,12 @@ def main(cfg_path: str) -> None:
             # 1. Warmup loop (+ prime snapshot handler once so profiler buffers are pre-allocated)
             for i in range(warmup):
                 _send_http(_build_request_url(base_url, path, vary_param, i), method, headers, body)
-            _trigger_snapshot(proc.pid, snap_file, 1)
+            if use_sigusr1:
+                _trigger_snapshot(proc.pid, snap_file, 1)
 
             # 2. Baseline snapshot S0
             seq = 2
-            snap0 = _trigger_snapshot(proc.pid, snap_file, seq)
+            snap0 = _trigger_snapshot(proc.pid, snap_file, seq) if use_sigusr1 else None
             rss0, fd0 = _read_proc_rss_and_fds(proc.pid)
             heap0 = int(snap0["heap_bytes"]) if snap0 else rss0
             rss0 = int(snap0.get("rss_bytes", rss0)) if snap0 else rss0
@@ -223,7 +225,7 @@ def main(cfg_path: str) -> None:
                 )
                 if step % interval == 0 or step == measure:
                     seq += 1
-                    snap = _trigger_snapshot(proc.pid, snap_file, seq)
+                    snap = _trigger_snapshot(proc.pid, snap_file, seq) if use_sigusr1 else None
                     rss, fds = _read_proc_rss_and_fds(proc.pid)
                     heap = int(snap["heap_bytes"]) if snap else rss
                     rss = int(snap.get("rss_bytes", rss)) if snap else rss

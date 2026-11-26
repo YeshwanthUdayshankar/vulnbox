@@ -192,3 +192,48 @@ def test_ui_doctor_profile_scan_probe_remediate_and_verify_patch(ui_server):
     )
     assert st == 400
     assert "does not exist" in err_data["error"]
+
+
+def test_ui_deep_scan_memory_leaks_and_doctor_capabilities(ui_server: tuple[str, str]) -> None:
+    base_url, token = ui_server
+    leaky_repo = str(FIXTURES / "py_leaky_app")
+
+    with urllib.request.urlopen(f"{base_url}/api/doctor", timeout=5) as resp:
+        doc = json.loads(resp.read().decode("utf-8"))
+        assert "javascript" in doc["tree_sitter_languages"]
+        assert "python-tracemalloc" in doc["memory_profilers"]
+        assert "os-proc-fallback" in doc["memory_profilers"]
+
+    # Scan with deep + check_leaks returns call_graph_summary + live memory_probes
+    st, scan_data = _post_json(
+        f"{base_url}/api/scan",
+        {
+            "repo_path": leaky_repo,
+            "backend": "local",
+            "deep": True,
+            "check_leaks": True,
+        },
+        token=token,
+    )
+    assert st == 200
+    assert scan_data["report"]["call_graph_summary"]["runtime_resolved_count"] >= 1
+    assert len(scan_data["report"]["memory_probes"]) >= 2
+    assert any(mp["leak_detected"] for mp in scan_data["report"]["memory_probes"])
+
+    # Remediate with deep + max_workers + check_leaks verifies before/after memory & FD fixes
+    st, rem_data = _post_json(
+        f"{base_url}/api/remediate",
+        {
+            "repo_path": leaky_repo,
+            "backend": "local",
+            "deep": True,
+            "check_leaks": True,
+            "max_workers": 2,
+        },
+        token=token,
+    )
+    assert st == 200
+    vers = rem_data["report"]["verifications"]
+    assert len(vers) >= 2
+    assert all(v["verified"] for v in vers)
+    assert all(v["memory_leak_confirmed_and_fixed"] is True for v in vers)

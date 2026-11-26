@@ -19,11 +19,10 @@ from vulnbox.models import (
     MemorySample,
 )
 from vulnbox.registry import PluginRegistry, default_registry
+from vulnbox.remediation import memory_profilers as _memory_profilers  # noqa: F401
 from vulnbox.sandbox.base import SandboxBackend, SandboxPolicy
 
 _MEM_WORKER_SRC = Path(__file__).resolve().with_name("_mem_probe_worker.py")
-_PY_PRELOAD_SRC = Path(__file__).resolve().with_name("_py_mem_preload.py")
-_NODE_PRELOAD_SRC = Path(__file__).resolve().with_name("_node_mem_preload.mjs")
 
 _QUERY_PARAM_RE = re.compile(
     r"""(?:qs\.get|searchParams\.get|req\.query)\s*(?:\(\s*['"]([A-Za-z0-9_-]+)['"]|\.([A-Za-z0-9_-]+))"""
@@ -118,10 +117,29 @@ def run_memory_leak_probe(
     spec: MemoryLeakProbeSpec,
     health_path: str = "/health",
     policy: SandboxPolicy | None = None,
+    registry: PluginRegistry | None = None,
 ) -> MemoryLeakProbeResult:
-    """Execute a loopback memory & FD stress probe inside the isolated sandbox."""
+    """Execute a loopback memory & FD stress probe using the best compatible profiler adapter.
+
+    Gracefully returns `skipped=True` (never raises) when no registered memory profiler is
+    compatible with the host OS or target runtime.
+    """
     if not spec.path.startswith("/"):
         raise ValueError(f"Memory probe path must be relative to 127.0.0.1: {spec.path!r}")
+
+    reg = registry or default_registry
+    profiler, skip_reasons = reg.select_memory_profiler(start_cmd, backend.name)
+    if profiler is None:
+        return MemoryLeakProbeResult(
+            probe_id=spec.probe_id,
+            endpoint=f"{spec.method} {spec.path}",
+            profiler_name="none",
+            skipped=True,
+            skip_reason=(
+                "No compatible memory profiler for this runtime/OS: "
+                + ("; ".join(skip_reasons) or "none registered")
+            ),
+        )
 
     pol = policy or SandboxPolicy()
     port = _pick_free_port()
@@ -136,21 +154,17 @@ def run_memory_leak_probe(
     shutil.copy2(_MEM_WORKER_SRC, worker_file)
     worker_sb = f"{probe_dir_sb}/_mem_probe_worker.py"
 
-    py_preload_dir_sb: str | None = None
-    node_preload_sb: str | None = None
-    effective_start = start_cmd
-
-    if "node" in start_cmd.split()[0]:
-        node_preload = probe_dir / "_node_mem_preload.mjs"
-        shutil.copy2(_NODE_PRELOAD_SRC, node_preload)
-        node_preload_sb = f"{probe_dir_sb}/_node_mem_preload.mjs"
-    else:
-        py_dir = probe_dir / "pypreload"
-        py_dir.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(_PY_PRELOAD_SRC, py_dir / "sitecustomize.py")
-        py_preload_dir_sb = f"{probe_dir_sb}/pypreload"
-        if not is_docker and effective_start.startswith("python3 "):
-            effective_start = f"{shlex.quote(sys.executable)} {effective_start[len('python3 ') :]}"
+    try:
+        adapter_cfg = profiler.prepare_sandbox(probe_dir, probe_dir_sb, start_cmd, is_docker)
+    except Exception as exc:
+        shutil.rmtree(probe_dir, ignore_errors=True)
+        return MemoryLeakProbeResult(
+            probe_id=spec.probe_id,
+            endpoint=f"{spec.method} {spec.path}",
+            profiler_name=profiler.name,
+            skipped=True,
+            skip_reason=f"Profiler '{profiler.name}' failed to prepare sandbox: {exc}",
+        )
 
     snap_file_sb = f"{probe_dir_sb}/snap.json"
     cfg_file = probe_dir / "cfg.json"
@@ -158,7 +172,7 @@ def run_memory_leak_probe(
     cfg_file.write_text(
         json.dumps(
             {
-                "start_cmd": effective_start,
+                "start_cmd": adapter_cfg["start_cmd"],
                 "port": port,
                 "health_path": health_path,
                 "method": spec.method,
@@ -173,8 +187,9 @@ def run_memory_leak_probe(
                 "min_r_squared": spec.min_r_squared,
                 "max_allowed_fd_delta": spec.max_allowed_fd_delta,
                 "snap_file": snap_file_sb,
-                "py_preload_dir": py_preload_dir_sb,
-                "node_preload_file": node_preload_sb,
+                "py_preload_dir": adapter_cfg.get("py_preload_dir"),
+                "node_preload_file": adapter_cfg.get("node_preload_file"),
+                "use_sigusr1": adapter_cfg.get("use_sigusr1", True),
                 "workspace_dir": ws_in_sb,
             }
         ),
@@ -186,6 +201,14 @@ def run_memory_leak_probe(
 
     try:
         res = backend.run(workspace_dir, cmd, policy=pol)
+    except Exception as exc:
+        return MemoryLeakProbeResult(
+            probe_id=spec.probe_id,
+            endpoint=f"{spec.method} {spec.path}",
+            profiler_name=profiler.name,
+            skipped=True,
+            skip_reason=f"Profiler '{profiler.name}' sandbox execution failed: {exc}",
+        )
     finally:
         shutil.rmtree(probe_dir, ignore_errors=True)
 
@@ -200,13 +223,20 @@ def run_memory_leak_probe(
         return MemoryLeakProbeResult(
             probe_id=spec.probe_id,
             endpoint=f"{spec.method} {spec.path}",
-            error=f"Memory probe worker produced no JSON (rc={res.exit_code}): {res.stderr.strip() or res.stdout.strip()}",
+            profiler_name=profiler.name,
+            skipped=True,
+            skip_reason=(
+                f"Profiler '{profiler.name}' produced no JSON (rc={res.exit_code}): "
+                f"{res.stderr.strip() or res.stdout.strip()}"
+            ),
         )
 
     data = json.loads(raw_line)
     return MemoryLeakProbeResult(
         probe_id=spec.probe_id,
         endpoint=f"{spec.method} {spec.path}",
+        profiler_name=profiler.name,
+        skipped=False,
         samples=[MemorySample.model_validate(s) for s in data.get("samples", ())],
         bytes_per_request_slope=float(data.get("bytes_per_request_slope", 0.0)),
         r_squared=float(data.get("r_squared", 0.0)),

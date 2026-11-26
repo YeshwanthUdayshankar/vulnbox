@@ -75,6 +75,9 @@ function renderReportView(container, data) {
   const patchById = Object.fromEntries(patches.map((p) => [p.finding_id, p]));
   const verifiedCount = verifications.filter((v) => v.verified).length;
   const activeCount = verifications.filter((v) => v.dynamic_confirmed_and_fixed === true).length;
+  const memFixedCount = verifications.filter((v) => v.memory_leak_confirmed_and_fixed === true).length;
+  const scanMemProbes = report.memory_probes || [];
+  const scanMemLeaks = scanMemProbes.filter((m) => m.leak_detected).length;
   const blockedCount = guardrails.filter((g) => g.decision === "block").length;
 
   const summaryCard = el("div", { class: "card" }, [
@@ -90,6 +93,10 @@ function renderReportView(container, data) {
       el("div", { class: "kpi" }, [el("div", { class: "label", text: "Total Findings" }), el("div", { class: "val", text: String(findings.length) })]),
       el("div", { class: "kpi" }, [el("div", { class: "label", text: "Verified Patches" }), el("div", { class: "val", text: `${verifiedCount} / ${patches.length}` })]),
       el("div", { class: "kpi" }, [el("div", { class: "label", text: "Live curl Confirmed -> Fixed" }), el("div", { class: "val", text: String(activeCount) })]),
+      el("div", { class: "kpi" }, [
+        el("div", { class: "label", text: verifications.length > 0 ? "Memory/FD Leaks Fixed" : "Active Memory Leaks" }),
+        el("div", { class: "val", text: verifications.length > 0 ? String(memFixedCount) : `${scanMemLeaks} / ${scanMemProbes.length}` }),
+      ]),
       el("div", { class: "kpi" }, [el("div", { class: "label", text: "Secrets Scrubbed" }), el("div", { class: "val", text: String(report.scrub_summary.secrets_redacted || 0) })]),
       el("div", { class: "kpi" }, [el("div", { class: "label", text: "Backend / LLM" }), el("div", { class: "val val-sm", text: report.llm_enabled ? `${report.sandbox_backend} + ${report.llm_model}` : report.sandbox_backend })]),
       el("div", { class: "kpi" }, [el("div", { class: "label", text: "Guardrail Blocks" }), el("div", { class: "val", text: String(blockedCount) })]),
@@ -117,6 +124,11 @@ function renderReportView(container, data) {
       if (ver.dynamic_confirmed_and_fixed === true) {
         badges.push(el("span", { class: "pill ok", text: "LIVE CURL: CONFIRMED -> FIXED" }));
       }
+      if (ver.memory_leak_confirmed_and_fixed === true) {
+        badges.push(el("span", { class: "pill ok", text: "MEM/FD LEAK: CONFIRMED -> FIXED" }));
+      } else if (ver.memory_probe_before && ver.memory_probe_before.skipped) {
+        badges.push(el("span", { class: "pill warn", text: "MEM PROBE SKIPPED (INCOMPATIBLE)" }));
+      }
     }
 
     const fCard = el("div", { class: "finding-card" }, [
@@ -126,6 +138,15 @@ function renderReportView(container, data) {
       ]),
       el("p", { class: "finding-msg", text: f.message }),
     ]);
+
+    if (f.metadata && Array.isArray(f.metadata.call_path) && f.metadata.call_path.length > 0) {
+      fCard.appendChild(
+        el("p", {
+          class: "explain-line mono",
+          text: `Reachability Call Path: ${f.metadata.call_path.join(" -> ")}`,
+        })
+      );
+    }
 
     if (f.snippet) {
       fCard.appendChild(el("pre", { text: f.snippet }));
@@ -156,27 +177,38 @@ function renderReportView(container, data) {
     if (ver && ver.memory_probe_before) {
       const mb = ver.memory_probe_before;
       const ma = ver.memory_probe_after;
-      const mcmp = el("div", { class: "probe-compare" }, [
-        el("div", { class: "probe-box" }, [
-          el("div", {
-            class: `pill ${mb.leak_detected ? "err" : "ok"}`,
-            text: `BEFORE PATCH MEM: ${mb.bytes_per_request_slope} B/req (R²=${mb.r_squared}), FD Δ=${mb.fd_delta}`,
-          }),
-          el("pre", { text: mb.retainer_summary || `Endpoint: ${mb.endpoint}\nHeap growth: ${mb.total_heap_growth_bytes} B` }),
-        ]),
-      ]);
-      if (ma) {
-        mcmp.appendChild(
+      if (mb.skipped) {
+        fCard.appendChild(
           el("div", { class: "probe-box" }, [
-            el("div", {
-              class: `pill ${ma.leak_detected ? "err" : "ok"}`,
-              text: `AFTER PATCH MEM: ${ma.bytes_per_request_slope} B/req (R²=${ma.r_squared}), FD Δ=${ma.fd_delta}`,
-            }),
-            el("pre", { text: ma.retainer_summary || `Endpoint: ${ma.endpoint}\nHeap growth: ${ma.total_heap_growth_bytes} B` }),
+            el("div", { class: "pill warn", text: `MEMORY PROBE SKIPPED (${mb.profiler_name || "none"})` }),
+            el("pre", { text: mb.skip_reason || "Memory profiler incompatible with target runtime/OS." }),
           ])
         );
+      } else {
+        const mcmp = el("div", { class: "probe-compare" }, [
+          el("div", { class: "probe-box" }, [
+            el("div", {
+              class: `pill ${mb.leak_detected ? "err" : "ok"}`,
+              text: `BEFORE PATCH MEM (${mb.profiler_name || "auto"}): ${mb.bytes_per_request_slope} B/req (R²=${mb.r_squared}), FD Δ=${mb.fd_delta}`,
+            }),
+            el("pre", { text: mb.retainer_summary || `Endpoint: ${mb.endpoint}\nHeap growth: ${mb.total_heap_growth_bytes} B` }),
+          ]),
+        ]);
+        if (ma) {
+          mcmp.appendChild(
+            el("div", { class: "probe-box" }, [
+              el("div", {
+                class: `pill ${ma.skipped ? "warn" : ma.leak_detected ? "err" : "ok"}`,
+                text: ma.skipped
+                  ? `AFTER PATCH MEM SKIPPED (${ma.profiler_name || "none"})`
+                  : `AFTER PATCH MEM: ${ma.bytes_per_request_slope} B/req (R²=${ma.r_squared}), FD Δ=${ma.fd_delta}`,
+              }),
+              el("pre", { text: ma.skip_reason || ma.retainer_summary || `Endpoint: ${ma.endpoint}\nHeap growth: ${ma.total_heap_growth_bytes} B` }),
+            ])
+          );
+        }
+        fCard.appendChild(mcmp);
       }
-      fCard.appendChild(mcmp);
     }
 
     if (patch) {
@@ -211,20 +243,57 @@ function renderReportView(container, data) {
   }
   container.appendChild(detailsWrap);
 
+  if (verifications.length === 0 && scanMemProbes.length > 0) {
+    const mpCard = el("div", { class: "card" }, [el("h3", { text: "Active Memory & FD Leak Probes (Scan)" })]);
+    for (const mp of scanMemProbes) {
+      mpCard.appendChild(
+        el("div", { class: "probe-box mt-10" }, [
+          el("div", {
+            class: `pill ${mp.skipped ? "warn" : mp.leak_detected ? "err" : "ok"}`,
+            text: mp.skipped
+              ? `${mp.endpoint} — SKIPPED (${mp.profiler_name || "none"})`
+              : `${mp.endpoint} (${mp.profiler_name || "auto"}): ${mp.bytes_per_request_slope} B/req (R²=${mp.r_squared}), FD Δ=${mp.fd_delta}, leak=${mp.leak_detected}`,
+          }),
+          el("pre", { text: mp.skip_reason || mp.retainer_summary || `Heap growth: ${mp.total_heap_growth_bytes} B` }),
+        ])
+      );
+    }
+    container.appendChild(mpCard);
+  }
+
   if (report.call_graph_summary) {
     const cg = report.call_graph_summary;
     const provs = Object.entries(cg.edges_by_provenance || {})
       .map(([k, v]) => `${k}: ${v}`)
       .join(" | ");
-    container.appendChild(
-      el("div", { class: "card" }, [
-        el("h3", { text: "Hybrid Call Graph Coverage" }),
-        el("p", {
-          class: "mono",
-          text: `Nodes: ${cg.total_nodes} | Edges: ${cg.total_edges} (${provs || "none"}) | Runtime-Resolved Dynamic Sites: ${cg.runtime_resolved_count} | Remaining Unresolved: ${(cg.unresolved_sites || []).length}`,
-        }),
-      ])
-    );
+    const cgChildren = [
+      el("h3", { text: "Hybrid Call Graph Coverage" }),
+      el("p", {
+        class: "mono",
+        text: `Nodes: ${cg.total_nodes} | Edges: ${cg.total_edges} (${provs || "none"}) | Runtime-Resolved Dynamic Sites: ${cg.runtime_resolved_count} | Remaining Unresolved: ${(cg.unresolved_sites || []).length}`,
+      }),
+    ];
+    if ((cg.entrypoints || []).length > 0) {
+      cgChildren.push(
+        el("details", {}, [
+          el("summary", { text: `View Detected Entrypoints (${cg.entrypoints.length})` }),
+          el("pre", { text: cg.entrypoints.join("\n") }),
+        ])
+      );
+    }
+    if ((cg.unresolved_sites || []).length > 0) {
+      cgChildren.push(
+        el("details", {}, [
+          el("summary", { text: `View Remaining Unresolved Dynamic Sites (${cg.unresolved_sites.length})` }),
+          el("pre", {
+            text: cg.unresolved_sites
+              .map((u) => `${u.file_path}:${u.line} [${u.reason}] ${u.expression}`)
+              .join("\n"),
+          }),
+        ])
+      );
+    }
+    container.appendChild(el("div", { class: "card" }, cgChildren));
   }
 
   if (guardrails.length > 0) {
@@ -278,12 +347,15 @@ async function loadDoctor() {
     const resp = await fetch("/api/doctor");
     const doc = await resp.json();
     const bar = document.getElementById("doctor-bar");
+    const tsLangs = (doc.tree_sitter_languages || []).join("/") || "none";
+    const memProfs = (doc.memory_profilers || []).length;
     bar.replaceChildren(
       el("span", { class: "pill ok", text: `Python ${doc.python}` }),
       el("span", { class: `pill ${doc.node ? "ok" : "warn"}`, text: doc.node ? "Node OK" : "Node Missing" }),
       el("span", { class: `pill ${doc.curl ? "ok" : "warn"}`, text: doc.curl ? "curl OK" : "urllib Fallback" }),
       el("span", { class: `pill ${doc.docker_ready ? "ok" : "warn"}`, text: doc.docker_ready ? "Docker READY" : "Docker Unavailable" }),
-      el("span", { class: "pill ok", text: "Local Sandbox READY" })
+      el("span", { class: "pill info", text: `Tree-sitter: ${tsLangs}` }),
+      el("span", { class: "pill info", text: `Memory Profilers: ${memProfs}` })
     );
 
     if (doc.samples && doc.samples.length > 0) {
@@ -380,6 +452,8 @@ document.getElementById("btn-scan").addEventListener("click", async () => {
       repo_path: document.getElementById("scan-repo").value,
       backend: document.getElementById("scan-backend").value,
       advisories_path: document.getElementById("scan-advisories").value,
+      start_cmd: document.getElementById("scan-start").value,
+      health_path: document.getElementById("scan-health").value,
       deep: document.getElementById("scan-deep-toggle").checked,
       check_leaks: document.getElementById("scan-leaks-toggle").checked,
     });
@@ -401,6 +475,7 @@ document.getElementById("btn-remediate").addEventListener("click", async () => {
       advisories_path: document.getElementById("rem-advisories").value,
       out_dir: document.getElementById("rem-out").value,
       probe_json: document.getElementById("rem-probe").value,
+      max_workers: Number(document.getElementById("rem-jobs").value || 4),
       deep: document.getElementById("rem-deep-toggle").checked,
       check_leaks: document.getElementById("rem-leaks-toggle").checked,
       llm_enabled: document.getElementById("rem-llm-toggle").checked,

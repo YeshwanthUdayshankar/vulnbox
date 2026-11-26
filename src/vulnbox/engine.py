@@ -112,6 +112,7 @@ class VulnBoxEngine:
                             spec=mspec,
                             health_path=effective_health,
                             policy=self.sandbox_policy,
+                            registry=self.registry,
                         )
                         memory_probes.append(mres)
 

@@ -105,17 +105,21 @@ def collect_runtime_call_graph(
             if backend.name != "docker" and test_cmd.startswith("python3 "):
                 test_cmd = f"{shlex.quote(sys.executable)} {test_cmd[len('python3 ') :]}"
 
-            backend.run(
-                workspace_dir,
-                test_cmd,
-                env={
-                    "PYTHONPATH": f"{py_hook_sb}:{ws_path_in_sandbox}",
-                    "VULNBOX_TRACE_WORKSPACE": ws_path_in_sandbox,
-                    "VULNBOX_TRACE_OUT": py_out_sb,
-                },
-                policy=pol,
-            )
-            combined.merge(_load_trace_payload(py_out, "python", static_graph))
+            try:
+                backend.run(
+                    workspace_dir,
+                    test_cmd,
+                    env={
+                        "PYTHONPATH": f"{py_hook_sb}:{ws_path_in_sandbox}",
+                        "VULNBOX_TRACE_WORKSPACE": ws_path_in_sandbox,
+                        "VULNBOX_TRACE_OUT": py_out_sb,
+                    },
+                    policy=pol,
+                )
+                combined.merge(_load_trace_payload(py_out, "python", static_graph))
+            except Exception:
+                # Degrade gracefully if runtime tracing is incompatible in this environment
+                pass
 
         if "node" in profile.test_commands:
             node_hook = hook_dir / "_node_trace_hook.mjs"
@@ -124,17 +128,21 @@ def collect_runtime_call_graph(
             node_out_sb = f"{hook_dir_in_sandbox}/node_trace.json"
             node_hook_sb = f"{hook_dir_in_sandbox}/_node_trace_hook.mjs"
 
-            backend.run(
-                workspace_dir,
-                profile.test_commands["node"],
-                env={
-                    "NODE_OPTIONS": f"--import file://{node_hook_sb}",
-                    "VULNBOX_TRACE_WORKSPACE": ws_path_in_sandbox,
-                    "VULNBOX_TRACE_OUT": node_out_sb,
-                },
-                policy=pol,
-            )
-            combined.merge(_load_trace_payload(node_out, "javascript", static_graph))
+            try:
+                backend.run(
+                    workspace_dir,
+                    profile.test_commands["node"],
+                    env={
+                        "NODE_OPTIONS": f"--import file://{node_hook_sb}",
+                        "VULNBOX_TRACE_WORKSPACE": ws_path_in_sandbox,
+                        "VULNBOX_TRACE_OUT": node_out_sb,
+                    },
+                    policy=pol,
+                )
+                combined.merge(_load_trace_payload(node_out, "javascript", static_graph))
+            except Exception:
+                # Degrade gracefully if Node version does not support --import / inspector
+                pass
     finally:
         shutil.rmtree(hook_dir, ignore_errors=True)
 

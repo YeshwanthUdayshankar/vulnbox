@@ -1,0 +1,20 @@
+[build-system]
+requires = ["hatchling>=1.25.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "vulnbox-go"
+version = "0.1.0"
+description = "Reference Go security analyzer plugin pack for VulnBox (via vulnbox.plugins entry point)"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.11"
+dependencies = [
+  "vulnbox>=0.1.0",
+]
+
+[project.entry-points."vulnbox.plugins"]
+go = "vulnbox_go:register"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/vulnbox_go"]

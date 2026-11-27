@@ -1,0 +1,7 @@
+- id: vulnbox-scan
+  name: VulnBox Security Scan (Air-Gapped)
+  description: Run VulnBox static, lockfile CVE reachability, config hygiene, and memory leak checks before commit.
+  entry: vulnbox scan . --backend local --fail-on high
+  language: python
+  pass_filenames: false
+  always_run: true

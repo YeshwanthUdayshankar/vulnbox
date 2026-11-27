@@ -10,6 +10,7 @@ from vulnbox.models import AuditReport
 from vulnbox.registry import PluginRegistry, default_registry
 from vulnbox.reporting.markdown import render_markdown_report
 from vulnbox.reporting.sarif import build_sarif, validate_sarif
+from vulnbox.reporting.vex import build_cyclonedx_vex, build_openvex
 
 
 def resolve_repo_output_dir(out_dir: Path, repo_path: Path) -> Path:
@@ -51,10 +52,30 @@ class JsonManifestReporter:
         return path
 
 
+class OpenVexReporter:
+    name = "openvex"
+
+    def write(self, report: AuditReport, out_dir: Path) -> Path:
+        path = out_dir / "openvex.json"
+        path.write_text(json.dumps(build_openvex(report), indent=2) + "\n", encoding="utf-8")
+        return path
+
+
+class CycloneDxVexReporter:
+    name = "cyclonedx_vex"
+
+    def write(self, report: AuditReport, out_dir: Path) -> Path:
+        path = out_dir / "cyclonedx.vex.json"
+        path.write_text(json.dumps(build_cyclonedx_vex(report), indent=2) + "\n", encoding="utf-8")
+        return path
+
+
 def register_builtin_reporters(registry: PluginRegistry = default_registry) -> None:
     registry.register_reporter(SarifReporter())
     registry.register_reporter(MarkdownReporter())
     registry.register_reporter(JsonManifestReporter())
+    registry.register_reporter(OpenVexReporter())
+    registry.register_reporter(CycloneDxVexReporter())
 
 
 register_builtin_reporters(default_registry)

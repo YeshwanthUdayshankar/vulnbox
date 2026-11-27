@@ -6,7 +6,9 @@ Sandboxed security testing, **active before/after loopback `curl` verification**
 
 - **Zero-Mutation Secret-Scrubbed Sandbox**: Copies your repository to an ephemeral workspace, strips `.git/config`, and scrubs `.env`/keys/tokens before running anything—never mutating your working tree.
 - **Pluggable Hardened Sandbox**: Runs inside hardened Docker containers (`--network=none`, `--cap-drop=ALL`, `--read-only`, `--security-opt=no-new-privileges:true`, non-root UID, CPU/RAM/PID caps) with an automatic isolated local fallback when Docker daemon is unavailable.
-- **4-Layer + Deep Hybrid Analysis**: Python AST SAST, **Tree-sitter JS/TS SAST**, Dockerfile/config/secret hygiene, **Static Memory & Resource Leak Analysis (CWE-401 / CWE-772)**, and **Hybrid Call-Graph CVE Reachability** (static AST/Tree-sitter + opt-in `--deep` sandbox runtime tracing via Python 3.12 `sys.monitoring` & Node.js V8 Inspector).
+- **4-Layer + Deep Hybrid Analysis & Taint Tracking**: Intra-procedural source→sink taint tracking (Python AST + **Tree-sitter JS/TS AST**) covering OWASP rule families (SQLi, CMDi, Path Traversal, **SSRF**, **SSTI**, **XXE**, **JWT**, **XSS**, **NoSQLi**, **Open Redirect**, **Prototype Pollution**, hardcoded secrets, weak PRNGs), Dockerfile/config/secret hygiene, **Static Memory & Resource Leak Analysis (CWE-401 / CWE-772)**, and **Hybrid Call-Graph CVE Reachability** with **lockfile-accurate parsing** (`package-lock.json`, `yarn.lock`, `pnpm-lock.yaml`, `poetry.lock`, `uv.lock`), **offline-cached OSV.dev + CISA KEV + EPSS** enrichment (`vulnbox sync-advisories`), and opt-in `--deep` runtime tracing (`sys.monitoring` / V8 Inspector).
+- **CI Gating, OpenVEX / CycloneDX VEX & GitHub Code Scanning**: `--fail-on <severity>`, stable `--baseline` / `--write-baseline`, inline suppressions (`# vulnbox: ignore[RULE-ID]`), schema-validated **SARIF 2.1.0** with `partialFingerprints` & `security-severity`, **OpenVEX v0.2.0** & **CycloneDX 1.5 VEX** (`not_affected: vulnerable_code_not_in_execute_path`), plus a reusable GitHub Action ([`action.yml`](action.yml)) and [`.pre-commit-hooks.yaml`](.pre-commit-hooks.yaml).
+- **MCP Server Mode & Extensible Language Plugins**: Run `vulnbox mcp` to expose `profile`, `scan`, `probe`, and `verify_patch` to any MCP-compatible agent (Claude Code, Cursor, Antigravity, Windsurf), plus a reference **Go plugin pack** ([`plugins/vulnbox-go/`](plugins/vulnbox-go/)) proving the `vulnbox.plugins` entry-point API. See **[docs/threat-model.md](docs/threat-model.md)** for sandbox security boundaries.
 - **Active Before/After Loopback Verification (`curl` & Memory/FD Slope)**: Boots the target app on `127.0.0.1:<ephemeral_port>` inside the sandbox, runs reproducible `curl` probes (and opt-in `--check-leaks` / `--deep` heap-slope + `/proc/<pid>/fd` stress probes), applies candidate fixes, and re-runs the exact same probes to prove fixes work.
 - **Dependency-Aware Sandbox & Air-Gapped Integration Mocking**: Supports `--build-deps` (cached manifest-only Docker dependency layers `vulnbox-deps:<hash>` with `vulnbox clean-cache`), `--image <tag>`, automatic read-only target `.venv` reuse, graceful boot-skip on missing dependencies, **expected-shape HTTP 200 auto-mocking** (AST/JS response-key inference + `--mocks` + SSRF canary capture), stdlib **Redis RESP2 / SMTP shims**, opt-in `--services postgres,redis` on `--internal` Docker networks, **in-process FastAPI/Flask probing**, and **HS256 test-JWT minting** (`--auth-jwt-claims`).
 - **Dual-Verified Patching & Regression Tests**: Confirms SAST clean + active `curl` probe fixed + generated defensive regression test transitions `FAIL → PASS` + repo's existing test suite passes with zero regressions.
@@ -42,6 +44,17 @@ uv run vulnbox probe /path/to/repo --probe probe.json --backend docker --build-d
 
 # Opt-in air-gapped Docker sidecars (--internal network, zero internet egress):
 uv run vulnbox remediate /path/to/repo --backend docker --build-deps --services postgres,redis
+
+# Sync offline OSV.dev + CISA KEV + EPSS advisory cache (stays air-gapped during scan/remediate):
+uv run vulnbox sync-advisories /path/to/repo
+
+# CI gating with --fail-on, baselines, OpenVEX/CycloneDX VEX, and SARIF fingerprints:
+uv run vulnbox scan /path/to/repo --backend local --fail-on high --out ./vulnbox-out
+uv run vulnbox scan /path/to/repo --write-baseline .vulnbox-baseline.json
+uv run vulnbox scan /path/to/repo --baseline .vulnbox-baseline.json --fail-on high
+
+# Start stdio MCP server mode for Claude Code / Cursor / Antigravity / any MCP agent:
+uv run vulnbox mcp
 
 # Prune locally cached vulnbox-deps:* Docker dependency images:
 uv run vulnbox clean-cache
@@ -142,7 +155,9 @@ Every `vulnbox remediate` run writes a self-contained review bundle (without tou
 ```text
 vulnbox-out/<repo_name>/
 ├── report.md                     # Executive summary, before/after curl proof, diffs, guardrail audit trail, HITL checklist
-├── findings.sarif.json           # Schema-validated SARIF 2.1.0 report
+├── findings.sarif.json           # Schema-validated SARIF 2.1.0 with partialFingerprints & security-severity
+├── openvex.json                  # OpenVEX v0.2.0 statements (not_affected: vulnerable_code_not_in_execute_path)
+├── cyclonedx.vex.json            # CycloneDX 1.5 VEX enriched with reachability, EPSS, and CISA KEV
 ├── manifest.json                 # Full machine-readable AuditReport (headers, excerpts, logs, guardrail events)
 ├── patches/
 │   └── <finding_id>.patch        # Verified git-compatible unified diffs
@@ -166,12 +181,19 @@ engine = VulnBoxEngine(backend="docker")
 report, artifacts = engine.remediate("/path/to/repo", out_dir="./vulnbox-out")
 ```
 
-To distribute a third-party language or rule pack (e.g., Go, Java, OSV, OpenVEX), advertise an entry point in your package's `pyproject.toml`:
+To distribute a third-party language or rule pack (see the reference Go pack at [`plugins/vulnbox-go/`](plugins/vulnbox-go/)), advertise an entry point in your package's `pyproject.toml`:
 
 ```toml
 [project.entry-points."vulnbox.plugins"]
-my_pack = "my_vulnbox_pack:register"  # callable taking (registry: PluginRegistry) -> None
+go = "vulnbox_go:register"  # callable taking (registry: PluginRegistry) -> None
 ```
+
+## CI Integration (GitHub Action & Pre-Commit) & Threat Model
+
+- **GitHub Action:** Use [`action.yml`](action.yml) to sync offline OSV/KEV/EPSS advisories, gate PRs with `fail-on: high`, emit OpenVEX/CycloneDX VEX, and upload `findings.sarif.json` (with `partialFingerprints` & `security-severity`) to GitHub Code Scanning.
+- **Pre-Commit Hook:** Reference [`.pre-commit-hooks.yaml`](.pre-commit-hooks.yaml) (`id: vulnbox-scan`) in `.pre-commit-config.yaml`.
+- **Inline Suppressions:** Add `# vulnbox: ignore[PY-SQL-001]` (Python) or `// vulnbox: ignore[JS-XSS-001]` (JS/TS) on the same or preceding line.
+- **Sandbox Threat Model:** See [`docs/threat-model.md`](docs/threat-model.md) for assets, trust boundaries, Docker vs. local sandbox guarantees, and explicit non-goals.
 
 ## Agent Skill
 

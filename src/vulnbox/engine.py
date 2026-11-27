@@ -53,6 +53,7 @@ from vulnbox.sandbox import (
     select_backend,
 )
 from vulnbox.scrubber import ScrubbedWorkspace
+from vulnbox.suppressions import filter_by_baseline, load_baseline, write_baseline
 
 
 def _utc_now() -> str:
@@ -127,6 +128,9 @@ class VulnBoxEngine:
         out_dir: Path | None = None,
         build_deps: bool = False,
         image: str | None = None,
+        advisory_cache_dir: Path | None = None,
+        baseline_path: Path | None = None,
+        write_baseline_path: Path | None = None,
     ) -> tuple[AuditReport, dict[str, Path]]:
         repo = Path(repo_path).resolve()
         prof = profile_repo(repo)
@@ -155,7 +159,12 @@ class VulnBoxEngine:
                     profile=prof,
                     registry=self.registry,
                     call_graph=cg,
+                    advisory_cache_dir=advisory_cache_dir,
                 )
+                if write_baseline_path is not None:
+                    write_baseline(findings, write_baseline_path)
+                if baseline_path is not None and baseline_path.is_file():
+                    findings, _ = filter_by_baseline(findings, load_baseline(baseline_path))
                 if effective_check_leaks and effective_start:
                     for f in findings:
                         if f.category not in ("memory_leak", "resource_leak"):

@@ -10,8 +10,17 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-from vulnbox.analyzers.base import SKIP_DIRS, iter_source_files, make_finding_id, safe_ast_parse
-from vulnbox.constants import is_test_or_fixture_path
+from vulnbox.analyzers.advisory_feed import (
+    load_offline_enrichment,
+    load_offline_osv_advisories,
+)
+from vulnbox.analyzers.base import iter_source_files, make_finding_id, safe_ast_parse
+from vulnbox.analyzers.lockfiles import (
+    InstalledPackage,
+    is_version_below,
+    parse_node_dependencies,
+    parse_python_dependencies,
+)
 from vulnbox.models import Finding, ReachabilityStatus, Severity
 
 
@@ -93,100 +102,16 @@ BUILTIN_ADVISORIES: list[Advisory] = [
     ),
 ]
 
-VERSION_NUM_RE = re.compile(r"(\d+)")
-REQ_LINE_RE = re.compile(r"^\s*([A-Za-z0-9_.-]+)\s*(==|<=|>=|~=|!=|<|>)\s*([0-9][A-Za-z0-9_.*+-]*)")
+def _is_version_below(installed: str, threshold: str, ecosystem: str = "python") -> bool:
+    return is_version_below(installed, threshold, ecosystem=ecosystem)
 
 
-def _parse_version(ver: str) -> tuple[int, ...]:
-    cleaned = ver.strip().lstrip("^~>=<v")
-    parts = [int(m) for m in VERSION_NUM_RE.findall(cleaned)]
-    return tuple(parts[:4]) if parts else (0,)
+def _parse_python_dependencies(workspace_dir: Path) -> list[InstalledPackage]:
+    return parse_python_dependencies(workspace_dir)
 
 
-def _is_version_below(installed: str, threshold: str) -> bool:
-    return _parse_version(installed) < _parse_version(threshold)
-
-
-UV_LOCK_PKG_RE = re.compile(r'^\[\[package\]\]\s*\nname\s*=\s*"([^"]+)"\s*\nversion\s*=\s*"([^"]+)"', re.MULTILINE)
-PYPROJECT_DEP_RE = re.compile(r'"([A-Za-z0-9_.-]+)(?:\[[^\]]+\])?\s*(==|<=|>=|~=|!=|<|>)\s*([0-9][A-Za-z0-9_.*+-]*)')
-
-
-def _iter_manifest_files(workspace_dir: Path, names: tuple[str, ...]) -> list[Path]:
-    found: list[Path] = []
-    for path in sorted(workspace_dir.rglob("*")):
-        if not path.is_file():
-            continue
-        rel = path.relative_to(workspace_dir)
-        if any(part in SKIP_DIRS for part in rel.parts) or is_test_or_fixture_path(rel):
-            continue
-        if len(rel.parts) <= 4 and path.name in names:
-            found.append(path)
-    return found
-
-
-def _parse_python_dependencies(workspace_dir: Path) -> list[tuple[str, str, str, int]]:
-    """Return list of (package_lower, version, manifest_rel_path, line_no) across monorepo."""
-    deps: list[tuple[str, str, str, int]] = []
-    seen_keys: set[tuple[str, str]] = set()
-
-    for req_file in _iter_manifest_files(workspace_dir, ("requirements.txt",)):
-        rel = str(req_file.relative_to(workspace_dir))
-        for idx, line in enumerate(req_file.read_text(encoding="utf-8", errors="ignore").splitlines(), start=1):
-            stripped = line.split("#", 1)[0].strip()
-            if not stripped:
-                continue
-            m = REQ_LINE_RE.match(stripped)
-            if m:
-                pkg = m.group(1).lower()
-                deps.append((pkg, m.group(3), rel, idx))
-                seen_keys.add((pkg, rel))
-
-    for lock_file in _iter_manifest_files(workspace_dir, ("uv.lock",)):
-        rel = str(lock_file.relative_to(workspace_dir))
-        raw = lock_file.read_text(encoding="utf-8", errors="ignore")
-        for m in UV_LOCK_PKG_RE.finditer(raw):
-            pkg, ver = m.group(1).lower(), m.group(2)
-            line_no = raw[: m.start()].count("\n") + 1
-            deps.append((pkg, ver, rel, line_no))
-            seen_keys.add((pkg, rel))
-
-    for pyproj in _iter_manifest_files(workspace_dir, ("pyproject.toml",)):
-        rel = str(pyproj.relative_to(workspace_dir))
-        for idx, line in enumerate(pyproj.read_text(encoding="utf-8", errors="ignore").splitlines(), start=1):
-            for m in PYPROJECT_DEP_RE.finditer(line):
-                pkg, op, ver = m.group(1).lower(), m.group(2), m.group(3)
-                if op in ("==", "<=", "<", "~="):
-                    deps.append((pkg, ver, rel, idx))
-                    seen_keys.add((pkg, rel))
-
-    return deps
-
-
-def _parse_node_dependencies(workspace_dir: Path) -> list[tuple[str, str, str, int]]:
-    deps: list[tuple[str, str, str, int]] = []
-    for pkg_file in _iter_manifest_files(workspace_dir, ("package.json",)):
-        rel = str(pkg_file.relative_to(workspace_dir))
-        try:
-            raw = pkg_file.read_text(encoding="utf-8")
-            data = json.loads(raw)
-        except (OSError, json.JSONDecodeError):
-            continue
-        lines = raw.splitlines()
-        for section in ("dependencies", "devDependencies"):
-            entries = data.get(section) or {}
-            if not isinstance(entries, dict):
-                continue
-            for pkg, ver in entries.items():
-                if not isinstance(ver, str):
-                    continue
-                line_no = 1
-                needle = f'"{pkg}"'
-                for i, line in enumerate(lines, start=1):
-                    if needle in line:
-                        line_no = i
-                        break
-                deps.append((pkg.lower(), ver, rel, line_no))
-    return deps
+def _parse_node_dependencies(workspace_dir: Path) -> list[InstalledPackage]:
+    return parse_node_dependencies(workspace_dir)
 
 
 def _check_python_reachability(
@@ -295,36 +220,67 @@ def _check_node_reachability(
     return "not_reachable", imported_files
 
 
-def load_advisories(advisories_path: Path | None = None) -> list[Advisory]:
-    """Load built-in advisories plus optional user-provided JSON advisory file."""
-    advisories = list(BUILTIN_ADVISORIES)
+def load_advisories(
+    advisories_path: Path | None = None,
+    cache_dir: Path | None = None,
+) -> list[Advisory]:
+    """Load built-in advisories + offline cached OSV.dev feed + optional user JSON file."""
+    advisories: list[Advisory] = list(BUILTIN_ADVISORIES)
+    seen: set[tuple[str, str, str]] = {
+        (a.advisory_id, a.ecosystem, a.package.lower()) for a in advisories
+    }
+
+    for cached in load_offline_osv_advisories(cache_dir):
+        try:
+            adv = Advisory.model_validate(cached)
+        except Exception:
+            continue
+        key = (adv.advisory_id, adv.ecosystem, adv.package.lower())
+        if key not in seen:
+            seen.add(key)
+            advisories.append(adv)
+
     if advisories_path and advisories_path.is_file():
         raw: Any = json.loads(advisories_path.read_text(encoding="utf-8"))
         items = raw if isinstance(raw, list) else raw.get("advisories", [])
         for item in items:
-            advisories.append(Advisory.model_validate(item))
+            adv = Advisory.model_validate(item)
+            key = (adv.advisory_id, adv.ecosystem, adv.package.lower())
+            if key not in seen:
+                seen.add(key)
+                advisories.append(adv)
     return advisories
 
 
 class DependencyReachabilityAnalyzer:
-    """Checks manifests against advisories and verifies static code reachability."""
+    """Checks lockfiles/manifests against advisories and verifies static/hybrid reachability."""
 
     name = "dependency-reachability"
 
-    def __init__(self, advisories_path: Path | None = None) -> None:
-        self.advisories = load_advisories(advisories_path)
+    def __init__(
+        self,
+        advisories_path: Path | None = None,
+        cache_dir: Path | None = None,
+    ) -> None:
+        self.cache_dir = cache_dir
+        self.advisories = load_advisories(advisories_path, cache_dir=cache_dir)
 
     def analyze(self, workspace_dir: Path, call_graph: Any | None = None) -> list[Finding]:
         findings: list[Finding] = []
         py_deps = _parse_python_dependencies(workspace_dir)
         node_deps = _parse_node_dependencies(workspace_dir)
+        kev_cves, epss_scores = load_offline_enrichment(self.cache_dir)
 
         for adv in self.advisories:
             target_deps = py_deps if adv.ecosystem == "python" else node_deps
-            for pkg, installed_ver, manifest, line_no in target_deps:
+            for dep in target_deps:
+                pkg = dep.name
+                installed_ver = dep.version
+                manifest = dep.manifest
+                line_no = dep.line_no
                 if pkg != adv.package.lower():
                     continue
-                if not _is_version_below(installed_ver, adv.affected_below):
+                if not _is_version_below(installed_ver, adv.affected_below, ecosystem=adv.ecosystem):
                     continue
 
                 if adv.ecosystem == "python":
@@ -358,14 +314,28 @@ class DependencyReachabilityAnalyzer:
                 rule_id = f"DEP-{adv.advisory_id}"
                 cite_text = f" Citations: {', '.join(citations)}." if citations else ""
                 path_text = f" Call path: {' -> '.join(call_path)}." if call_path else ""
+                is_kev = adv.advisory_id in kev_cves
+                epss_info = epss_scores.get(adv.advisory_id)
+                risk_tags: list[str] = []
+                if is_kev:
+                    risk_tags.append("CISA-KEV")
+                if epss_info:
+                    risk_tags.append(f"EPSS={epss_info['epss']:.3f}")
+                risk_text = f" Risk intel: {', '.join(risk_tags)}." if risk_tags else ""
+
                 meta: dict[str, Any] = {
                     "ecosystem": adv.ecosystem,
                     "package": adv.package,
                     "installed_version": installed_ver,
+                    "version_source": "lockfile" if dep.is_lockfile else "manifest_range",
                     "fixed_version": adv.fixed_version,
                     "advisory_id": adv.advisory_id,
                     "citations": citations,
+                    "cisa_kev": is_kev,
                 }
+                if epss_info:
+                    meta["epss_score"] = epss_info["epss"]
+                    meta["epss_percentile"] = epss_info["percentile"]
                 if call_path:
                     meta["call_path"] = call_path
                     meta["call_path_provenance"] = call_path_provenance
@@ -383,9 +353,10 @@ class DependencyReachabilityAnalyzer:
                         end_line=line_no,
                         snippet=f"{manifest}:{line_no}: {pkg} ({installed_ver})",
                         message=(
-                            f"Dependency '{adv.package}' version '{installed_ver}' is affected by "
+                            f"Dependency '{adv.package}' version '{installed_ver}' "
+                            f"({'lockfile' if dep.is_lockfile else 'manifest range'}) is affected by "
                             f"{adv.advisory_id} (< {adv.affected_below}). Reachability: {reachability}."
-                            f"{cite_text}{path_text}"
+                            f"{risk_text}{cite_text}{path_text}"
                         ),
                         reachability=reachability,
                         recommended_fix=f"Upgrade '{adv.package}' in {manifest} to >= {adv.fixed_version}.",

@@ -27,6 +27,7 @@ class AnalysisContext:
     profile: RepoProfile | None = None
     scrub_summary: ScrubSummary | None = None
     advisories_path: Path | None = None
+    advisory_cache_dir: Path | None = None
     call_graph: Any | None = None
 
 

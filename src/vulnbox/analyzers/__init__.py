@@ -12,6 +12,7 @@ from vulnbox.analyzers.node_sast import NodeSASTAnalyzer
 from vulnbox.analyzers.python_sast import PythonSASTAnalyzer
 from vulnbox.models import Finding, RepoProfile, ScrubSummary
 from vulnbox.registry import AnalysisContext, PluginRegistry, default_registry
+from vulnbox.suppressions import apply_inline_suppressions
 
 
 class _PythonSASTPlugin:
@@ -39,9 +40,9 @@ class _DependencyReachabilityPlugin:
     name = "dependency-reachability"
 
     def run(self, ctx: AnalysisContext) -> list[Finding]:
-        return DependencyReachabilityAnalyzer(ctx.advisories_path).analyze(
-            ctx.workspace_dir, call_graph=ctx.call_graph
-        )
+        return DependencyReachabilityAnalyzer(
+            ctx.advisories_path, cache_dir=ctx.advisory_cache_dir
+        ).analyze(ctx.workspace_dir, call_graph=ctx.call_graph)
 
 
 class _MemoryLeaksPlugin:
@@ -70,8 +71,10 @@ def run_all_analyzers(
     profile: RepoProfile | None = None,
     registry: PluginRegistry | None = None,
     call_graph: Any | None = None,
+    advisory_cache_dir: Path | None = None,
+    respect_suppressions: bool = True,
 ) -> list[Finding]:
-    """Run all registered analyzers (including entry_points plugins) and deduplicate findings."""
+    """Run all registered analyzers (including entry_points plugins), deduplicate, and apply suppressions."""
     reg = registry or default_registry
     if reg is default_registry:
         reg.load_entry_point_plugins()
@@ -81,6 +84,7 @@ def run_all_analyzers(
         profile=profile,
         scrub_summary=scrub_summary,
         advisories_path=advisories_path,
+        advisory_cache_dir=advisory_cache_dir,
         call_graph=call_graph,
     )
     findings: list[Finding] = []
@@ -93,6 +97,8 @@ def run_all_analyzers(
         if f.finding_id not in seen:
             seen.add(f.finding_id)
             deduped.append(f)
+    if respect_suppressions:
+        deduped, _ = apply_inline_suppressions(deduped, workspace_dir)
     return deduped
 
 

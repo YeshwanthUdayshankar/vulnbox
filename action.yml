@@ -1,0 +1,90 @@
+name: "VulnBox Sandboxed Security Scan"
+description: "Run air-gapped SAST, lockfile CVE reachability (OpenVEX/CycloneDX VEX), and memory leak analysis with SARIF 2.1.0 upload."
+branding:
+  icon: "shield"
+  color: "blue"
+
+inputs:
+  path:
+    description: "Repository directory to scan"
+    required: false
+    default: "."
+  fail-on:
+    description: "Fail the workflow if findings meet or exceed severity (low, medium, high, critical)"
+    required: false
+    default: "high"
+  baseline:
+    description: "Optional baseline JSON path to suppress accepted findings"
+    required: false
+    default: ""
+  deep:
+    description: "Enable --deep runtime call-graph tracing & memory/FD leak probing"
+    required: false
+    default: "false"
+  sync-advisories:
+    description: "Sync OSV.dev + CISA KEV + EPSS offline advisory cache before scanning"
+    required: false
+    default: "true"
+  upload-sarif:
+    description: "Upload findings.sarif.json to GitHub Code Scanning"
+    required: false
+    default: "true"
+  out-dir:
+    description: "Output directory for report bundle (report.md, findings.sarif.json, openvex.json, cyclonedx.vex.json)"
+    required: false
+    default: "vulnbox-out"
+
+outputs:
+  sarif-path:
+    description: "Path to the generated SARIF 2.1.0 report"
+    value: ${{ steps.scan.outputs.sarif_path }}
+  openvex-path:
+    description: "Path to the generated OpenVEX v0.2.0 report"
+    value: ${{ steps.scan.outputs.openvex_path }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Set up Python 3.12
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+
+    - name: Install VulnBox
+      shell: bash
+      run: python3 -m pip install --quiet "${{ github.action_path }}"
+
+    - name: Sync offline advisory cache (OSV + KEV + EPSS)
+      if: ${{ inputs.sync-advisories == 'true' }}
+      shell: bash
+      run: vulnbox sync-advisories "${{ inputs.path }}"
+
+    - name: Run VulnBox scan
+      id: scan
+      shell: bash
+      run: |
+        ARGS=("scan" "${{ inputs.path }}" "--backend" "local" "--out" "${{ inputs.out-dir }}")
+        if [ -n "${{ inputs.fail-on }}" ]; then
+          ARGS+=("--fail-on" "${{ inputs.fail-on }}")
+        fi
+        if [ -n "${{ inputs.baseline }}" ]; then
+          ARGS+=("--baseline" "${{ inputs.baseline }}")
+        fi
+        if [ "${{ inputs.deep }}" = "true" ]; then
+          ARGS+=("--deep")
+        fi
+        set +e
+        vulnbox "${ARGS[@]}"
+        SCAN_RC=$?
+        set -e
+        SARIF=$(find "${{ inputs.out-dir }}" -name "findings.sarif.json" | head -n 1)
+        VEX=$(find "${{ inputs.out-dir }}" -name "openvex.json" | head -n 1)
+        echo "sarif_path=${SARIF}" >> "$GITHUB_OUTPUT"
+        echo "openvex_path=${VEX}" >> "$GITHUB_OUTPUT"
+        exit $SCAN_RC
+
+    - name: Upload SARIF to GitHub Code Scanning
+      if: ${{ always() && inputs.upload-sarif == 'true' && steps.scan.outputs.sarif_path != '' }}
+      uses: github/codeql-action/upload-sarif@v3
+      with:
+        sarif_file: ${{ steps.scan.outputs.sarif_path }}

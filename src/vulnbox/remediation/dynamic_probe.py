@@ -170,6 +170,32 @@ def _probe_js_cors(finding: Finding, workspace_dir: Path) -> DynamicProbeSpec | 
     )
 
 
+@default_registry.register_probe("PY-SSRF-001", "JS-SSRF-001")
+def _probe_ssrf_canary(finding: Finding, workspace_dir: Path) -> DynamicProbeSpec | None:
+    source = _read_finding_source(finding, workspace_dir)
+    if not source or "/fetch" not in source:
+        return None
+    return DynamicProbeSpec(
+        probe_id=f"probe-{finding.finding_id}",
+        finding_id=finding.finding_id,
+        rule_id=finding.rule_id,
+        description=(
+            "Send GET /fetch?url=http://169.254.169.254/latest/meta-data/ inside the air-gapped "
+            "sandbox and assert the SSRF canary records 169.254.169.254 pre-patch and blocks it post-patch."
+        ),
+        method="GET",
+        path="/fetch?url=http://169.254.169.254/latest/meta-data/",
+        vulnerable_expectation=ProbeExpectation(
+            status_codes=[200],
+            outbound_hosts_contain=["169.254.169.254"],
+        ),
+        fixed_expectation=ProbeExpectation(
+            status_codes=[400, 403],
+            outbound_hosts_not_contain=["169.254.169.254"],
+        ),
+    )
+
+
 def infer_probe_for_finding(
     finding: Finding,
     workspace_dir: Path,

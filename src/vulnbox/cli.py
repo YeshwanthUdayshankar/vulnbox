@@ -13,14 +13,17 @@ from rich.console import Console
 from rich.table import Table
 
 from vulnbox import __version__
+from vulnbox.analyzers.advisory_feed import sync_advisory_cache
 from vulnbox.engine import VulnBoxEngine
 from vulnbox.llm import GuardrailPolicy, LLMConfig
+from vulnbox.mcp_server import serve_mcp_stdio
 from vulnbox.remediation import load_mock_rules, load_probe_specs
 from vulnbox.sandbox import (
     DockerSandboxBackend,
     LocalSandboxBackend,
     prune_dependency_images,
 )
+from vulnbox.suppressions import should_fail_ci
 from vulnbox.ui import create_ui_server
 
 
@@ -109,6 +112,20 @@ def scan(
     image: str | None = typer.Option(
         None, "--image", help="Custom pre-built Docker image tag for sandbox execution"
     ),
+    advisory_cache: Path | None = typer.Option(
+        None, "--advisory-cache", help="Offline advisory cache directory (OSV/KEV/EPSS)"
+    ),
+    baseline: Path | None = typer.Option(
+        None, "--baseline", exists=True, help="Baseline JSON file of accepted finding fingerprints"
+    ),
+    write_baseline_path: Path | None = typer.Option(
+        None, "--write-baseline", help="Write current finding fingerprints to a baseline JSON file"
+    ),
+    fail_on: str | None = typer.Option(
+        None,
+        "--fail-on",
+        help="Exit non-zero if any finding meets or exceeds severity (low, medium, high, critical)",
+    ),
     out: Path = typer.Option(Path("vulnbox-out"), "--out", help="Output directory for report bundle"),
 ) -> None:
     """Scrub a repository and run SAST, config hygiene, memory leak, and call-graph reachability analysis."""
@@ -121,6 +138,9 @@ def scan(
         out_dir=out,
         build_deps=build_deps,
         image=image,
+        advisory_cache_dir=advisory_cache,
+        baseline_path=baseline,
+        write_baseline_path=write_baseline_path,
     )
 
     console.print(f"[bold]Scan complete[/bold]: {len(report.findings)} findings found.")
@@ -135,6 +155,14 @@ def scan(
         console.print(f"Memory probes:   {leaked}/{len(report.memory_probes)} confirmed active leaks")
     console.print(f"Markdown report: {written['markdown']}")
     console.print(f"SARIF 2.1.0:     {written['sarif']}")
+    if "openvex" in written:
+        console.print(f"OpenVEX v0.2.0:  {written['openvex']}")
+    if "cyclonedx_vex" in written:
+        console.print(f"CycloneDX VEX:   {written['cyclonedx_vex']}")
+
+    if should_fail_ci(report.findings, fail_on):
+        console.print(f"[bold red]CI Gate failed[/bold red]: finding(s) >= {fail_on} severity.")
+        raise typer.Exit(code=1)
 
 
 @app.command()
@@ -416,6 +444,36 @@ def verify_patch_cmd(
         raise typer.Exit(code=1)
 
 
+@app.command("sync-advisories")
+def sync_advisories_cmd(
+    repo: Path | None = typer.Argument(
+        None,
+        exists=True,
+        file_okay=False,
+        resolve_path=True,
+        help="Optional repository whose lockfile dependencies will be queried against OSV.dev",
+    ),
+    cache_dir: Path | None = typer.Option(
+        None, "--cache-dir", help="Directory to store offline OSV/KEV/EPSS JSON caches"
+    ),
+    no_kev: bool = typer.Option(False, "--no-kev", help="Skip syncing CISA KEV catalog"),
+    no_epss: bool = typer.Option(False, "--no-epss", help="Skip syncing FIRST EPSS scores"),
+) -> None:
+    """Sync OSV.dev, CISA KEV, and FIRST EPSS feeds to a local offline cache for air-gapped scans."""
+    summary = sync_advisory_cache(
+        repo_path=repo,
+        cache_dir=cache_dir,
+        include_kev=not no_kev,
+        include_epss=not no_epss,
+    )
+    console.print(
+        f"[bold green]Offline advisory cache updated[/bold green] at {summary['cache_dir']}: "
+        f"{summary['osv_advisories_cached']} OSV advisories, "
+        f"{summary['kev_cves_cached']} CISA KEV CVEs, "
+        f"{summary['epss_scores_cached']} EPSS scores."
+    )
+
+
 @app.command("clean-cache")
 def clean_cache() -> None:
     """Remove locally cached VulnBox Docker dependency images (vulnbox-deps:*)."""
@@ -424,6 +482,12 @@ def clean_cache() -> None:
         console.print(f"[green]Removed {len(removed)} cached dependency image(s):[/green] {', '.join(removed)}")
     else:
         console.print("No cached vulnbox-deps:* Docker images found.")
+
+
+@app.command("mcp")
+def mcp_cmd() -> None:
+    """Start the stdio MCP (Model Context Protocol) server exposing scan, probe, and verify-patch tools."""
+    serve_mcp_stdio()
 
 
 @app.command()

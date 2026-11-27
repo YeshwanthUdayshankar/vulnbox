@@ -11,9 +11,37 @@ from vulnbox.analyzers.base import (
     make_finding_id,
     safe_ast_parse,
 )
+from vulnbox.analyzers.taint import PythonTaintTracker
 from vulnbox.models import Finding, Severity
 
 SQL_KEYWORDS = ("select ", "insert ", "update ", "delete ", "drop ")
+_SECURITY_RANDOM_HINTS = (
+    "token",
+    "secret",
+    "password",
+    "passwd",
+    "nonce",
+    "otp",
+    "session",
+    "csrf",
+    "api_key",
+    "apikey",
+    "reset",
+    "auth",
+    "invite",
+)
+_PLACEHOLDER_SECRET_FRAGMENTS = (
+    "redacted_by_vulnbox",
+    "changeme",
+    "changethis",
+    "placeholder",
+    "example",
+    "your-secret",
+    "your_secret",
+    "dummy",
+    "test-secret",
+    "dev-secret",
+)
 
 
 def _dotted_name(node: ast.AST) -> str:
@@ -58,11 +86,22 @@ def _contains_sql_keyword(node: ast.AST) -> bool:
 
 
 class _PythonSecurityVisitor(ast.NodeVisitor):
-    def __init__(self, rel_path: str, lines: list[str]) -> None:
+    def __init__(self, rel_path: str, lines: list[str], source: str = "") -> None:
         self.rel_path = rel_path
         self.lines = lines
+        self.source = source
+        self.has_defusedxml = "defusedxml" in source
         self.findings: list[Finding] = []
         self._func_stack: list[ast.FunctionDef | ast.AsyncFunctionDef] = []
+        self._taint_stack: list[PythonTaintTracker] = []
+
+    @property
+    def _current_taint(self) -> PythonTaintTracker | None:
+        return self._taint_stack[-1] if self._taint_stack else None
+
+    @property
+    def _current_func_name(self) -> str:
+        return self._func_stack[-1].name if self._func_stack else ""
 
     def _add(
         self,
@@ -96,38 +135,64 @@ class _PythonSecurityVisitor(ast.NodeVisitor):
             )
         )
 
-    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
-        self._func_stack.append(node)
-        self._check_path_traversal_in_func(node)
+    def visit_Assign(self, node: ast.Assign) -> None:
+        # PY-SECRET-001: Hardcoded Flask/Django SECRET_KEY or app.secret_key literal
+        if isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
+            val = node.value.value.strip()
+            low_val = val.lower()
+            if len(val) >= 6 and not any(frag in low_val for frag in _PLACEHOLDER_SECRET_FRAGMENTS):
+                for tgt in node.targets:
+                    is_secret_target = False
+                    if isinstance(tgt, ast.Name) and tgt.id == "SECRET_KEY":
+                        is_secret_target = True
+                    elif isinstance(tgt, ast.Attribute) and tgt.attr == "secret_key":
+                        is_secret_target = True
+                    elif (
+                        isinstance(tgt, ast.Subscript)
+                        and isinstance(tgt.slice, ast.Constant)
+                        and tgt.slice.value == "SECRET_KEY"
+                    ):
+                        is_secret_target = True
+                    if is_secret_target:
+                        self._add(
+                            rule_id="PY-SECRET-001",
+                            cwe_id="CWE-798",
+                            title="Hardcoded Application SECRET_KEY",
+                            severity="high",
+                            node=node,
+                            message="Hardcoded SECRET_KEY / app.secret_key enables session cookie forgery.",
+                            recommended_fix="Load SECRET_KEY from an environment variable (e.g. os.environ['SECRET_KEY']).",
+                        )
         self.generic_visit(node)
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        taint = PythonTaintTracker(node)
+        self._func_stack.append(node)
+        self._taint_stack.append(taint)
+        self._check_path_traversal_in_func(node, taint)
+        self.generic_visit(node)
+        self._taint_stack.pop()
         self._func_stack.pop()
 
     def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        taint = PythonTaintTracker(node)
         self._func_stack.append(node)
-        self._check_path_traversal_in_func(node)
+        self._taint_stack.append(taint)
+        self._check_path_traversal_in_func(node, taint)
         self.generic_visit(node)
+        self._taint_stack.pop()
         self._func_stack.pop()
 
     def _check_path_traversal_in_func(
-        self, func: ast.FunctionDef | ast.AsyncFunctionDef
+        self,
+        func: ast.FunctionDef | ast.AsyncFunctionDef,
+        taint: PythonTaintTracker,
     ) -> None:
-        """Detect os.path.join used for file reads without path confinement checks."""
+        """Detect os.path.join used for file reads without per-variable path confinement."""
         if Path(self.rel_path).name == "setup.py":
             return
-        src = ast.get_source_segment("\n".join(self.lines), func) or ""
-        has_confinement = (
-            "is_relative_to" in src
-            or ("resolve(" in src and "startswith(" in src)
-            or ("realpath(" in src and "startswith(" in src)
-            or ("abspath(" in src and "startswith(" in src)
-            or "commonpath(" in src
-            or "re.fullmatch(" in src
-            or "_RE.match(" in src
-        )
-        if has_confinement:
-            return
 
-        join_nodes: list[ast.Call] = []
+        join_nodes: list[tuple[ast.Call, str | None]] = []
         has_file_read = False
         for child in ast.walk(func):
             if isinstance(child, ast.Call):
@@ -135,24 +200,70 @@ class _PythonSecurityVisitor(ast.NodeVisitor):
                 if name == "os.path.join" and len(child.args) >= 2 and any(
                     _is_dynamic_expr(a) for a in child.args[1:]
                 ):
-                    join_nodes.append(child)
+                    # Verify whether any dynamic segment is NOT path-sanitized
+                    taint_src: str | None = None
+                    any_unsanitized = False
+                    for arg in child.args[1:]:
+                        if not _is_dynamic_expr(arg):
+                            continue
+                        src_hit = taint.is_tainted(arg, "path")
+                        if src_hit:
+                            taint_src = src_hit
+                            any_unsanitized = True
+                        elif not any(
+                            isinstance(sub, ast.Name) and sub.id in taint.sanitized["path"]
+                            for sub in ast.walk(arg)
+                        ):
+                            any_unsanitized = True
+                    # Also check if the assigned target variable of os.path.join is confined later
+                    if any_unsanitized:
+                        join_nodes.append((child, taint_src))
                 if name in ("open", "Path.read_text", "Path.read_bytes") or (
                     isinstance(child.func, ast.Attribute)
                     and child.func.attr in ("read_text", "read_bytes", "open")
                 ):
                     has_file_read = True
 
-        if join_nodes and has_file_read:
-            node = join_nodes[0]
-            has_http_context = bool(func.decorator_list) or any(
-                tok in src
-                for tok in ("request.", "parse_qs", "query_params", "req.", "flask", "FastAPI", "do_GET", "do_POST")
-            )
+        # Check if the resulting path variable from os.path.join was explicitly confined by is_relative_to / realpath+startswith
+        unconfined: list[tuple[ast.Call, str | None]] = []
+        for jnode, jsrc in join_nodes:
+            # Find if jnode is assigned to a var that is later in taint.sanitized["path"]
+            assigned_sanitized = False
+            for sub in ast.walk(func):
+                if isinstance(sub, ast.Assign) and sub.value is jnode:
+                    for tgt in sub.targets:
+                        if isinstance(tgt, ast.Name) and tgt.id in taint.sanitized["path"]:
+                            assigned_sanitized = True
+                elif isinstance(sub, ast.Assign) and isinstance(sub.value, ast.Call):
+                    # e.g. target = (BASE / filename).resolve() or Path(os.path.join(...)).resolve()
+                    if any(ch is jnode for ch in ast.walk(sub.value)):
+                        for tgt in sub.targets:
+                            if isinstance(tgt, ast.Name) and tgt.id in taint.sanitized["path"]:
+                                assigned_sanitized = True
+            if not assigned_sanitized and not (
+                # Also accept `Path(os.path.join(...)).resolve().is_relative_to(...)` inline
+                any(
+                    isinstance(sub, ast.Call)
+                    and _dotted_name(sub.func).endswith(".is_relative_to")
+                    for sub in ast.walk(func)
+                )
+                and any(
+                    v in taint.sanitized["path"] for v in taint.sanitized["path"]
+                )
+            ):
+                unconfined.append((jnode, jsrc))
+
+        if unconfined and has_file_read:
+            node, taint_src = unconfined[0]
             direct_user_arg = any(
-                isinstance(a, ast.Name) and a.id.lower() in {"name", "filename", "filepath", "file_path", "path", "rel_path", "target", "user_path"}
+                isinstance(a, ast.Name)
+                and a.id.lower() in {"name", "filename", "filepath", "file_path", "path", "rel_path", "target", "user_path"}
                 for a in node.args[1:]
             )
-            path_sev: Severity = "high" if (has_http_context or direct_user_arg) else "low"
+            path_sev: Severity = (
+                "high" if (taint.is_route_handler or taint_src is not None or direct_user_arg) else "low"
+            )
+            taint_note = f" (taint source: {taint_src})" if taint_src else ""
             self._add(
                 rule_id="PY-PATH-001",
                 cwe_id="CWE-22",
@@ -160,14 +271,18 @@ class _PythonSecurityVisitor(ast.NodeVisitor):
                 severity=path_sev,
                 node=node,
                 message=(
-                    f"Function '{func.name}' constructs a file path with os.path.join() "
+                    f"Function '{func.name}' constructs a file path with os.path.join(){taint_note} "
                     "without verifying the resolved path remains inside the allowed base directory."
                 ),
                 recommended_fix=(
                     "Resolve both the base directory and target path using Path.resolve() "
                     "and enforce target.is_relative_to(base_dir) before reading."
                 ),
-                metadata={"function": func.name, "http_context": has_http_context},
+                metadata={
+                    "function": func.name,
+                    "http_context": taint.is_route_handler,
+                    **({"taint_source": taint_src} if taint_src else {}),
+                },
             )
 
     def visit_Call(self, node: ast.Call) -> None:
@@ -337,6 +452,207 @@ class _PythonSecurityVisitor(ast.NodeVisitor):
                     recommended_fix="Set debug=False in production entrypoints.",
                 )
 
+        # PY-SSRF-001: Tainted URL passed to HTTP client (requests / httpx / urllib)
+        taint = self._current_taint
+        is_http_client = (
+            name in ("urllib.request.urlopen", "urlopen")
+            or any(name.startswith(p) for p in ("requests.", "httpx."))
+            or (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr in ("get", "post", "put", "delete", "patch", "head", "request")
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id in ("session", "client", "http", "requests", "httpx")
+            )
+        )
+        if taint is not None and is_http_client:
+            url_arg: ast.AST | None = None
+            for kw in node.keywords:
+                if kw.arg == "url":
+                    url_arg = kw.value
+                    break
+            if url_arg is None and node.args:
+                # session.request(method, url, ...) takes url at index 1
+                idx = 1 if name.endswith(".request") and len(node.args) >= 2 else 0
+                url_arg = node.args[idx]
+            if url_arg is not None and not isinstance(url_arg, ast.Constant):
+                ssrf_src = taint.is_tainted(url_arg, "ssrf", require_http=True)
+                if ssrf_src:
+                    self._add(
+                        rule_id="PY-SSRF-001",
+                        cwe_id="CWE-918",
+                        title="Server-Side Request Forgery (SSRF)",
+                        severity="high",
+                        node=node,
+                        message=(
+                            f"{name}() fetches a user-controlled URL (source: {ssrf_src}) "
+                            "without host allowlisting or private/metadata IP validation."
+                        ),
+                        recommended_fix=(
+                            "Validate URL scheme (https only), resolve DNS, and reject loopback/private/link-local "
+                            "(169.254.169.254) IP ranges against an explicit host allowlist."
+                        ),
+                        metadata={"call": name, "taint_source": ssrf_src},
+                    )
+
+        # PY-SSTI-001: Dynamic Server-Side Template Injection (render_template_string / jinja2.Template)
+        if (
+            name in ("render_template_string", "flask.render_template_string", "jinja2.Template")
+            and node.args
+            and _is_dynamic_expr(node.args[0])
+        ):
+            self._add(
+                rule_id="PY-SSTI-001",
+                cwe_id="CWE-1336",
+                title="Server-Side Template Injection (SSTI)",
+                severity="critical",
+                node=node,
+                message=f"{name}() compiles a dynamic template string, allowing arbitrary server-side code execution.",
+                recommended_fix="Use render_template() with a static template file and pass user data strictly as context variables.",
+                metadata={"call": name},
+            )
+
+        # PY-XXE-001: Unsafe XML parser / resolve_entities=True
+        if not self.has_defusedxml:
+            if name in (
+                "xml.etree.ElementTree.fromstring",
+                "xml.etree.ElementTree.parse",
+                "ET.fromstring",
+                "ET.parse",
+                "xml.sax.parse",
+                "xml.sax.parseString",
+                "xml.dom.minidom.parse",
+                "xml.dom.minidom.parseString",
+                "minidom.parseString",
+            ) and node.args and _is_dynamic_expr(node.args[0]):
+                self._add(
+                    rule_id="PY-XXE-001",
+                    cwe_id="CWE-611",
+                    title="XML External Entity (XXE) / Unsafe XML Parser",
+                    severity="high",
+                    node=node,
+                    message=f"{name}() uses stdlib XML parsing vulnerable to entity expansion/XXE attacks.",
+                    recommended_fix="Use defusedxml (e.g. defusedxml.ElementTree.fromstring) instead of stdlib xml modules.",
+                    metadata={"call": name},
+                )
+            elif name.endswith("XMLParser") and any(
+                kw.arg == "resolve_entities"
+                and isinstance(kw.value, ast.Constant)
+                and kw.value.value is True
+                for kw in node.keywords
+            ):
+                self._add(
+                    rule_id="PY-XXE-001",
+                    cwe_id="CWE-611",
+                    title="XXE Enabled via XMLParser(resolve_entities=True)",
+                    severity="high",
+                    node=node,
+                    message="XMLParser explicitly enables resolve_entities=True, exposing the app to XXE file disclosure.",
+                    recommended_fix="Set resolve_entities=False and no_network=True on XMLParser().",
+                    metadata={"call": name},
+                )
+
+        # PY-JWT-001: JWT verification disabled or alg=none
+        if name in ("jwt.decode", "jose.jwt.decode"):
+            bad_jwt = False
+            for kw in node.keywords:
+                if kw.arg == "verify" and isinstance(kw.value, ast.Constant) and kw.value.value is False:
+                    bad_jwt = True
+                elif kw.arg == "options" and isinstance(kw.value, ast.Dict):
+                    for k_n, v_n in zip(kw.value.keys, kw.value.values, strict=False):
+                        if (
+                            isinstance(k_n, ast.Constant)
+                            and k_n.value == "verify_signature"
+                            and isinstance(v_n, ast.Constant)
+                            and v_n.value is False
+                        ):
+                            bad_jwt = True
+                elif kw.arg == "algorithms":
+                    if isinstance(kw.value, ast.Constant) and str(kw.value.value).lower() == "none":
+                        bad_jwt = True
+                    elif isinstance(kw.value, (ast.List, ast.Tuple)):
+                        if any(
+                            isinstance(e, ast.Constant) and str(e.value).lower() == "none"
+                            for e in kw.value.elts
+                        ):
+                            bad_jwt = True
+            if bad_jwt:
+                self._add(
+                    rule_id="PY-JWT-001",
+                    cwe_id="CWE-347",
+                    title="JWT Signature Verification Disabled or alg=none",
+                    severity="critical",
+                    node=node,
+                    message="jwt.decode() disables signature verification or permits the 'none' algorithm, allowing token forgery.",
+                    recommended_fix="Enforce verify_signature=True with an explicit allowlist such as algorithms=['HS256'] or ['RS256'].",
+                    metadata={"call": name},
+                )
+
+        # PY-RAND-001: Non-cryptographic random module used in security token/secret contexts
+        if name in (
+            "random.choice",
+            "random.choices",
+            "random.randint",
+            "random.randrange",
+            "random.random",
+            "random.getrandbits",
+            "random.sample",
+        ):
+            lineno = getattr(node, "lineno", 1)
+            ctx_line = (self.lines[lineno - 1] if 1 <= lineno <= len(self.lines) else "").lower()
+            fn_low = self._current_func_name.lower()
+            if any(h in fn_low or h in ctx_line for h in _SECURITY_RANDOM_HINTS):
+                self._add(
+                    rule_id="PY-RAND-001",
+                    cwe_id="CWE-338",
+                    title="Insecure Pseudo-Random Generator Used for Security Value",
+                    severity="medium",
+                    node=node,
+                    message=f"{name}() uses a predictable PRNG in a security-sensitive context.",
+                    recommended_fix="Use Python's cryptographically secure `secrets` module (e.g. secrets.token_urlsafe(32)).",
+                    metadata={"call": name},
+                )
+
+        # PY-NOSQL-001: MongoDB $where or tainted request dict passed directly to .find()/.find_one()
+        if isinstance(node.func, ast.Attribute) and node.func.attr in ("find", "find_one", "update_one", "delete_one") and node.args:
+            q_arg = node.args[0]
+            has_where = False
+            if isinstance(q_arg, ast.Dict):
+                for k_n, v_n in zip(q_arg.keys, q_arg.values, strict=False):
+                    if isinstance(k_n, ast.Constant) and k_n.value == "$where" and _is_dynamic_expr(v_n):
+                        has_where = True
+            nosql_src = taint.is_tainted(q_arg, "nosql", require_http=True) if taint is not None else None
+            if has_where or (nosql_src and isinstance(q_arg, (ast.Name, ast.Attribute, ast.Call))):
+                self._add(
+                    rule_id="PY-NOSQL-001",
+                    cwe_id="CWE-943",
+                    title="NoSQL Query Injection",
+                    severity="high",
+                    node=node,
+                    message="Dynamic $where clause or unsanitized user-controlled query object passed to NoSQL query.",
+                    recommended_fix="Validate and coerce expected scalar fields (e.g. str(val)) and avoid $where JavaScript expressions.",
+                    metadata={"call": name},
+                )
+
+        # PY-REDIR-001: Tainted URL passed to redirect() / RedirectResponse()
+        if (
+            taint is not None
+            and name in ("redirect", "flask.redirect", "RedirectResponse", "fastapi.responses.RedirectResponse")
+            and node.args
+            and not isinstance(node.args[0], ast.Constant)
+        ):
+            redir_src = taint.is_tainted(node.args[0], "redirect", require_http=True)
+            if redir_src:
+                self._add(
+                    rule_id="PY-REDIR-001",
+                    cwe_id="CWE-601",
+                    title="Open Redirect via User-Controlled URL",
+                    severity="medium",
+                    node=node,
+                    message=f"{name}() redirects to user-controlled target (source: {redir_src}) without verifying a safe relative path or host allowlist.",
+                    recommended_fix="Verify urlparse(target).netloc == '' and target.startswith('/') (not '//') before redirecting.",
+                    metadata={"call": name, "taint_source": redir_src},
+                )
+
         self.generic_visit(node)
 
 
@@ -354,7 +670,7 @@ class PythonSASTAnalyzer:
             except (OSError, SyntaxError):
                 continue
             rel = str(py_file.relative_to(workspace_dir))
-            visitor = _PythonSecurityVisitor(rel, source.splitlines())
+            visitor = _PythonSecurityVisitor(rel, source.splitlines(), source=source)
             visitor.visit(tree)
             findings.extend(visitor.findings)
         return findings

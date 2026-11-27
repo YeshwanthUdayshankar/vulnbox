@@ -9,9 +9,17 @@ from typing import Any
 import jsonschema
 
 from vulnbox.models import AuditReport, Severity
+from vulnbox.suppressions import compute_finding_fingerprint
 
 SARIF_SCHEMA_URL = "https://json.schemastore.org/sarif-2.1.0.json"
 LOCAL_SCHEMA_PATH = Path(__file__).resolve().parent.parent / "schemas" / "sarif_2_1_0.schema.json"
+
+_SECURITY_SEVERITY_SCORE: dict[str, str] = {
+    "critical": "9.5",
+    "high": "8.0",
+    "medium": "5.5",
+    "low": "2.5",
+}
 
 
 def _severity_to_sarif_level(severity: Severity) -> str:
@@ -37,6 +45,7 @@ def build_sarif(report: AuditReport) -> dict[str, Any]:
                 "properties": {
                     "cwe": f.cwe_id,
                     "category": f.category,
+                    "security-severity": _SECURITY_SEVERITY_SCORE.get(f.severity, "5.5"),
                     "tags": ["security", f.cwe_id, f.category],
                 },
             }
@@ -46,12 +55,17 @@ def build_sarif(report: AuditReport) -> dict[str, Any]:
             "findingId": f.finding_id,
             "cwe": f.cwe_id,
             "severity": f.severity,
+            "security-severity": _SECURITY_SEVERITY_SCORE.get(f.severity, "5.5"),
             "category": f.category,
             "reachability": f.reachability,
             "recommendedFix": f.recommended_fix,
         }
         if f.metadata.get("call_path"):
             props["callPath"] = f.metadata["call_path"]
+        if f.metadata.get("epss_score") is not None:
+            props["epssScore"] = f.metadata["epss_score"]
+        if f.metadata.get("cisa_kev") is not None:
+            props["cisaKev"] = bool(f.metadata["cisa_kev"])
         if ver is not None:
             props["patchVerified"] = ver.verified
             props["patchId"] = ver.patch_id
@@ -84,6 +98,9 @@ def build_sarif(report: AuditReport) -> dict[str, Any]:
                 "ruleId": f.rule_id,
                 "level": _severity_to_sarif_level(f.severity),
                 "message": {"text": f.message},
+                "partialFingerprints": {
+                    "primaryLocationLineHash": compute_finding_fingerprint(f),
+                },
                 "locations": [
                     {
                         "physicalLocation": {

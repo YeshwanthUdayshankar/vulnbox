@@ -293,18 +293,63 @@ def test_reference_go_plugin_pack_sast_reachability_and_gomod_osv_symbols(tmp_pa
         ]
         assert len(dep_multi) == 1 and dep_multi[0].reachability == "under_investigation"
 
-        # Go stdlib CVE via `go 1.21.1` directive in go.mod (reachable via net/http.ListenAndServe)
-        go_stdlib = tmp_path / "go_stdlib"
-        go_stdlib.mkdir()
-        (go_stdlib / "go.mod").write_text("module example.com/std\n\ngo 1.21.1\n", encoding="utf-8")
-        (go_stdlib / "srv.go").write_text(
+        # Go stdlib CVE: real GO-2023-2102 ID (not invented -STDLIB)
+        # Case A: only `go 1.21.1` minimum language directive (no toolchain) -> low severity + lower_bound confidence
+        go_stdlib_min = tmp_path / "go_stdlib_min"
+        go_stdlib_min.mkdir()
+        (go_stdlib_min / "go.mod").write_text("module example.com/std\n\ngo 1.21.1\n", encoding="utf-8")
+        (go_stdlib_min / "srv.go").write_text(
             'package main\nimport "net/http"\nfunc main() { _ = http.ListenAndServe(":8080", nil) }\n',
             encoding="utf-8",
         )
-        stdlib_hits = [
-            f for f in run_all_analyzers(go_stdlib, registry=reg) if f.rule_id == "DEP-GO-2023-2102-STDLIB"
+        stdlib_min_hits = [
+            f
+            for f in run_all_analyzers(go_stdlib_min, registry=reg)
+            if f.rule_id == "DEP-GO-2023-2102" and f.metadata["package"] == "stdlib"
         ]
-        assert len(stdlib_hits) == 1 and stdlib_hits[0].reachability == "reachable"
+        assert len(stdlib_min_hits) == 1
+        assert stdlib_min_hits[0].reachability == "reachable"
+        assert stdlib_min_hits[0].severity == "low"
+        assert stdlib_min_hits[0].metadata["version_source"] == "go_directive_lower_bound"
+        assert stdlib_min_hits[0].metadata["confidence"] == "low"
+
+        # Case B: `go 1.21` + `toolchain go1.23.1` -> patched build toolchain, ZERO stdlib findings!
+        go_stdlib_patched_tc = tmp_path / "go_stdlib_patched_tc"
+        go_stdlib_patched_tc.mkdir()
+        (go_stdlib_patched_tc / "go.mod").write_text(
+            "module example.com/std\n\ngo 1.21\n\ntoolchain go1.23.1\n",
+            encoding="utf-8",
+        )
+        (go_stdlib_patched_tc / "srv.go").write_text(
+            'package main\nimport "net/http"\nfunc main() { _ = http.ListenAndServe(":8080", nil) }\n',
+            encoding="utf-8",
+        )
+        assert [
+            f
+            for f in run_all_analyzers(go_stdlib_patched_tc, registry=reg)
+            if f.metadata.get("package") == "stdlib"
+        ] == []
+
+        # Case C: `go 1.21` + vulnerable `toolchain go1.21.1` -> HIGH severity + exact go_toolchain confidence!
+        go_stdlib_vuln_tc = tmp_path / "go_stdlib_vuln_tc"
+        go_stdlib_vuln_tc.mkdir()
+        (go_stdlib_vuln_tc / "go.mod").write_text(
+            "module example.com/std\n\ngo 1.21\n\ntoolchain go1.21.1\n",
+            encoding="utf-8",
+        )
+        (go_stdlib_vuln_tc / "srv.go").write_text(
+            'package main\nimport "net/http"\nfunc main() { _ = http.ListenAndServe(":8080", nil) }\n',
+            encoding="utf-8",
+        )
+        stdlib_tc_hits = [
+            f
+            for f in run_all_analyzers(go_stdlib_vuln_tc, registry=reg)
+            if f.rule_id == "DEP-GO-2023-2102" and f.metadata["package"] == "stdlib"
+        ]
+        assert len(stdlib_tc_hits) == 1
+        assert stdlib_tc_hits[0].severity == "high"
+        assert stdlib_tc_hits[0].metadata["version_source"] == "go_toolchain"
+        assert stdlib_tc_hits[0].metadata["confidence"] == "high"
 
         # Unimported in go.mod -> under_investigation (NEVER false not_affected)
         go_unimp = tmp_path / "go_unimp"

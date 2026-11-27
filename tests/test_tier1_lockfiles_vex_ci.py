@@ -204,9 +204,30 @@ def test_lockfiles_override_loose_manifest_ranges(tmp_path: Path):
 
     yarn_dir = tmp_path / "yarn_app"
     yarn_dir.mkdir()
-    (yarn_dir / "yarn.lock").write_text('"minimist@^1.2.0":\n  version "1.2.5"\n', encoding="utf-8")
+    (yarn_dir / "yarn.lock").write_text(
+        '"express@^4.18.0":\n  version "4.18.2"\n  dependencies:\n    minimist "^1.2.0"\n\n'
+        '"minimist@^1.2.0":\n  version "1.2.5"\n',
+        encoding="utf-8",
+    )
     y_deps = parse_node_dependencies(yarn_dir)
     assert any(d.name == "minimist" and d.version == "1.2.5" and d.is_lockfile for d in y_deps)
+    from vulnbox.analyzers.lockfiles import compute_reverse_dependents
+
+    yarn_rev = compute_reverse_dependents(yarn_dir, "node")
+    assert "express" in yarn_rev[Path(".")]["minimist"]
+
+    # Monorepo per-folder reverse-dependency graph isolation:
+    # svc_a has a uv.lock, while svc_b only has flat requirements.txt -> svc_b MUST NOT inherit svc_a's graph_known!
+    mono = tmp_path / "mono"
+    (mono / "svc_a").mkdir(parents=True)
+    (mono / "svc_b").mkdir(parents=True)
+    (mono / "svc_a" / "uv.lock").write_text('[[package]]\nname = "click"\nversion = "8.1.7"\n', encoding="utf-8")
+    (mono / "svc_b" / "requirements.txt").write_text("urllib3==2.0.5\nrequests==2.31.0\n", encoding="utf-8")
+    (mono / "svc_b" / "app.py").write_text("import urllib3\nurllib3.disable_warnings()\n", encoding="utf-8")
+    mono_deps = DependencyReachabilityAnalyzer().analyze(mono)
+    u3 = next(f for f in mono_deps if f.metadata["package"] == "urllib3")
+    assert u3.reachability == "under_investigation"
+    assert u3.metadata["reachability_basis"] == "imported_safe_symbols_but_has_dependents"
 
     pnpm_dir = tmp_path / "pnpm_app"
     pnpm_dir.mkdir()

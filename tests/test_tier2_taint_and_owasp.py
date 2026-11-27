@@ -117,8 +117,12 @@ def test_taint_engine_guard_soundness_reassignment_and_fastapi_depends(tmp_path:
     ssrf_lines = [f.start_line for f in findings if f.rule_id == "PY-SSRF-001"]
     assert len(ssrf_lines) == 1
 
-    # JS taint: `if (!p.startsWith('/')) return;` MUST NOT count as path confinement,
-    # and bare `next.startsWith('/')` MUST NOT count as an open-redirect guard!
+    # JS AST taint:
+    # 1. `if (!p.startsWith('/')) return;` MUST NOT count as path confinement
+    # 2. Unresolved `f = base + '/../etc/passwd'` MUST NOT be sanitized by `f.startsWith(base + path.sep)` even if `path.resolve(` appears elsewhere
+    # 3. Resolved `r = path.resolve(base, req.query.file)` checked with `r.startsWith(base + path.sep)` IS sanitized inside branch
+    # 4. `if (u.startsWith('/') || u.startsWith('//'))` and `if (u.startsWith('/') && !u.startsWith('//'))` (missing `/\`) MUST stay flagged as JS-REDIR-001
+    # 5. Full `u.startsWith('/') && !u.startsWith('//') && !u.startsWith('/\\')` and negated `||` early-exit ARE safe!
     from vulnbox.analyzers.taint import JsTaintTracker
     from vulnbox.callgraph.ts_utils import parse_source, walk_nodes
 
@@ -128,28 +132,47 @@ def test_taint_engine_guard_soundness_reassignment_and_fastapi_depends(tmp_path:
         "  const p = path.resolve('/srv/data', req.query.file);\n"
         "  if (!p.startsWith('/')) return;\n"
         "  const badTarget = p;\n"
-        "  const nxt = req.query.next;\n"
-        "  if (nxt.startsWith('/')) {\n"
-        "    res.redirect(nxt);\n"
+        "  const f = '/srv/data/' + req.query.file;\n"
+        "  if (f.startsWith('/srv/data' + path.sep)) {\n"
+        "    const unresolvedTarget = f;\n"
         "  }\n"
+        "  if (p.startsWith('/srv/data' + path.sep)) {\n"
+        "    const safeTarget = p;\n"
+        "  }\n"
+        "  const u1 = req.query.u1;\n"
+        "  if (u1.startsWith('/') || u1.startsWith('//')) { res.redirect(u1); }\n"
+        "  const u2 = req.query.u2;\n"
+        "  if (u2.startsWith('/') && !u2.startsWith('//')) { res.redirect(u2); }\n"
+        "  const u3 = req.query.u3;\n"
+        "  if (u3.startsWith('/') && !u3.startsWith('//') && !u3.startsWith('/\\\\')) { res.redirect(u3); }\n"
+        "}\n"
+        "function earlyExitHandler(req, res) {\n"
+        "  const u4 = req.query.next;\n"
+        "  if (!u4.startsWith('/') || u4.startsWith('//') || u4.startsWith('/\\\\')) return;\n"
+        "  res.redirect(u4);\n"
         "}\n"
     )
     tree, raw = parse_source(js_src, ".js")
     assert tree is not None
     tracker = JsTaintTracker(tree.root_node, raw)
-    # Find the `badTarget = p` rhs identifier `p` and verify it is NOT sanitized for `path`
-    assign_p = [
-        n.child_by_field_name("value")
-        for n in walk_nodes(tree.root_node)
-        if n.type == "variable_declarator"
-        and n.child_by_field_name("name") is not None
-        and raw[n.child_by_field_name("name").start_byte : n.child_by_field_name("name").end_byte] == b"badTarget"
-    ][0]
-    assert tracker.is_tainted(assign_p, "path") is not None
-    # Bare `nxt.startsWith('/')` must still be flagged as JS-REDIR-001
+
+    def _rhs(var_name: bytes):
+        return [
+            n.child_by_field_name("value")
+            for n in walk_nodes(tree.root_node)
+            if n.type == "variable_declarator"
+            and n.child_by_field_name("name") is not None
+            and raw[n.child_by_field_name("name").start_byte : n.child_by_field_name("name").end_byte] == var_name
+        ][0]
+
+    assert tracker.is_tainted(_rhs(b"badTarget"), "path") is not None
+    assert tracker.is_tainted(_rhs(b"unresolvedTarget"), "path") is not None
+    assert tracker.is_tainted(_rhs(b"safeTarget"), "path") is None
+
     (tmp_path / "js_redir.js").write_text(js_src, encoding="utf-8")
     js_redirs = [f for f in NodeSASTAnalyzer().analyze(tmp_path) if f.rule_id == "JS-REDIR-001"]
-    assert len(js_redirs) == 1
+    # Only u1 (`||`) and u2 (missing `/\`) should fire; u3 and u4 are properly guarded!
+    assert len(js_redirs) == 2
 
 
 def test_python_xxe_lxml_high_vs_stdlib_low_and_ast_defusedxml(tmp_path: Path):
@@ -251,10 +274,31 @@ def test_python_owasp_rule_families_detection_and_negative_guards(tmp_path: Path
         "        return redirect(nxt)\n"
         "    return redirect('/')\n"
         "\n"
+        "@app.route('/bypass-backslash')\n"
+        "def backslash_bypass_redir():\n"
+        "    nxt = request.args.get('next')\n"
+        "    if nxt.startswith('/') and not nxt.startswith('//'):\n"
+        "        return redirect(nxt)\n"
+        "    return redirect('/')\n"
+        "\n"
+        "@app.route('/bypass-wrong-idx')\n"
+        "def wrong_idx_bypass_redir():\n"
+        "    nxt = request.args.get('next')\n"
+        "    if nxt.startswith('/') and nxt[0] != 'a':\n"
+        "        return redirect(nxt)\n"
+        "    return redirect('/')\n"
+        "\n"
         "@app.route('/safe-go')\n"
         "def safe_redir():\n"
         "    nxt = request.args.get('next')\n"
-        "    if nxt.startswith('/') and not nxt.startswith('//'):\n"
+        "    if nxt.startswith('/') and not nxt.startswith(('//', '/\\\\')):\n"
+        "        return redirect(nxt)\n"
+        "    return redirect('/')\n"
+        "\n"
+        "@app.route('/safe-go-idx1')\n"
+        "def safe_redir_idx1():\n"
+        "    nxt = request.args.get('next')\n"
+        "    if nxt.startswith('/') and nxt[1] not in ('/', '\\\\'):\n"
         "        return redirect(nxt)\n"
         "    return redirect('/')\n",
         encoding="utf-8",
@@ -274,10 +318,10 @@ def test_python_owasp_rule_families_detection_and_negative_guards(tmp_path: Path
     ):
         assert expected in rule_ids, f"Missing expected rule {expected}; got {rule_ids}"
 
-    # Both unguarded `open_redir` AND bare-slash `proto_rel_bypass_redir` trigger PY-REDIR-001,
-    # while `safe_redir` (checks `/` AND `not //`) does NOT!
+    # open_redir, proto_rel_bypass_redir, backslash_bypass_redir, and wrong_idx_bypass_redir ALL fire (4),
+    # while safe_redir (rejects both // and /\) and safe_redir_idx1 (index 1 != / or \) do NOT!
     redir_lines = [f.start_line for f in findings if f.rule_id == "PY-REDIR-001"]
-    assert len(redir_lines) == 2
+    assert len(redir_lines) == 4
 
 
 def test_node_owasp_rule_families_detection(tmp_path: Path):

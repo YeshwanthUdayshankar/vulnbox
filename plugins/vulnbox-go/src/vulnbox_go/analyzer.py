@@ -61,12 +61,12 @@ BUILTIN_GO_ADVISORIES: list[Advisory] = [
         affected_ranges=[{"introduced": "0", "fixed": "0.17.0"}],
         severity="high",
         cwe_id="CWE-400",
-        title="HTTP/2 Rapid Reset DoS in golang.org/x/net/http2",
+        title="HTTP/2 Rapid Reset DoS in golang.org/x/net/http2 (CVE-2023-39325 / CVE-2023-44487)",
         imports=["golang.org/x/net/http2"],
         vulnerable_symbols=["ConfigureServer", "Server.ServeConn"],
     ),
     Advisory(
-        advisory_id="GO-2023-2102-STDLIB",
+        advisory_id="GO-2023-2102",
         ecosystem="go",
         package="stdlib",
         affected_below="1.21.3",
@@ -77,7 +77,7 @@ BUILTIN_GO_ADVISORIES: list[Advisory] = [
         ],
         severity="high",
         cwe_id="CWE-400",
-        title="HTTP/2 Rapid Reset DoS in Go net/http stdlib",
+        title="HTTP/2 Rapid Reset DoS in Go net/http stdlib (CVE-2023-39325 / CVE-2023-44487)",
         imports=["net/http"],
         vulnerable_symbols=["ListenAndServe", "ListenAndServeTLS", "Server.Serve"],
     ),
@@ -469,11 +469,20 @@ class GoSASTAnalyzer:
                 is_kev = adv.advisory_id in kev_cves
                 epss_info = epss_scores.get(adv.advisory_id)
                 cite_text = f" Citations: {', '.join(citations)}." if citations else ""
+                is_stdlib_lower_bound = adv.package == "stdlib" and not dep.is_lockfile
+                eff_severity = "low" if is_stdlib_lower_bound else adv.severity
+                version_src = (
+                    "go_directive_lower_bound"
+                    if is_stdlib_lower_bound
+                    else ("go_toolchain" if adv.package == "stdlib" else "lockfile")
+                )
+
                 meta: dict[str, Any] = {
                     "ecosystem": "go",
                     "package": adv.package,
                     "installed_version": dep.version,
-                    "version_source": "lockfile",
+                    "version_source": version_src,
+                    "confidence": "low" if is_stdlib_lower_bound else "high",
                     "fixed_version": effective_fixed,
                     "advisory_id": adv.advisory_id,
                     "citations": citations,
@@ -485,7 +494,7 @@ class GoSASTAnalyzer:
                     meta["epss_percentile"] = epss_info["percentile"]
 
                 fix_cmd = (
-                    f"Upgrade Go toolchain in {dep.manifest} to >= go {effective_fixed}."
+                    f"Set `toolchain go{effective_fixed}` (or upgrade Go build toolchain to >= {effective_fixed}) in {dep.manifest}."
                     if adv.package == "stdlib"
                     else (
                         f"Run `go get {adv.package}@v{effective_fixed} && go mod tidy`."
@@ -493,24 +502,29 @@ class GoSASTAnalyzer:
                         else f"No fixed version of '{adv.package}' published yet for {adv.advisory_id}."
                     )
                 )
+                lower_bound_note = (
+                    " (Note: `go` directive specifies minimum language version, not necessarily the build toolchain; add a `toolchain goX.Y.Z` directive for exact matching.)"
+                    if is_stdlib_lower_bound
+                    else ""
+                )
 
                 findings.append(
                     Finding(
-                        finding_id=make_finding_id(rule_id, dep.manifest, dep.line_no),
+                        finding_id=make_finding_id(rule_id, f"{dep.manifest}:{adv.package}", dep.line_no),
                         rule_id=rule_id,
                         cwe_id=adv.cwe_id,
                         title=f"{adv.title} ({adv.package} {'go' if adv.package == 'stdlib' else 'v'}{dep.version})",
                         category="dependency",
-                        severity=adv.severity,
+                        severity=eff_severity,
                         file_path=dep.manifest,
                         start_line=dep.line_no,
                         end_line=dep.line_no,
                         snippet=f"{dep.manifest}:{dep.line_no}: {dep.name} {dep.version}",
                         message=(
                             f"Go {'stdlib' if adv.package == 'stdlib' else 'module'} '{adv.package}' "
-                            f"{dep.version} (go.mod) is affected by {adv.advisory_id} "
+                            f"{dep.version} ({version_src}) is affected by {adv.advisory_id} "
                             f"({'fix: >= ' + effective_fixed if effective_fixed else 'no fix published yet'}). "
-                            f"Reachability: {reachability}.{cite_text}"
+                            f"Reachability: {reachability}.{cite_text}{lower_bound_note}"
                         ),
                         reachability=reachability,
                         recommended_fix=fix_cmd,

@@ -1,8 +1,8 @@
 """Flow-sensitive intra-procedural source-to-sink taint tracking for Python AST and JS/TS Tree-sitter.
 
-Replaces fragile file-wide string checks with branch-scoped, assignment-aware taint
-propagation and explicit sink-scoped sanitizer barriers (`path`, `ssrf`, `redirect`,
-`xss`, `nosql`).
+Both Python (`PythonTaintTracker`) and JavaScript/TypeScript (`JsTaintTracker`) walk real
+syntax trees (`ast` / Tree-sitter) with branch-scoped, polarity-aware guard extraction,
+per-variable path-resolution tracking, and assignment-driven sanitization invalidation.
 """
 
 from __future__ import annotations
@@ -148,7 +148,6 @@ def _is_non_tainted_annotation(ann: ast.AST | None) -> bool:
 def _has_trailing_path_separator(arg: ast.AST) -> bool:
     """Return True iff `arg` enforces a directory boundary separator (e.g. `base + os.sep` or `f'{base}/'`)."""
     if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
-        # Must be a non-trivial path prefix ending in separator (not bare "/" which matches every absolute path)
         return len(arg.value) > 1 and arg.value.endswith(("/", "\\"))
     if isinstance(arg, ast.BinOp) and isinstance(arg.op, ast.Add):
         right = arg.right
@@ -187,31 +186,31 @@ def _is_safe_path_regex(pattern_arg: ast.AST, *, require_end_anchor: bool = Fals
         body = body[:-2]
     if not body:
         return False
-    # Reject wildcards, dots (could allow `..`), slashes, backslashes, or negated classes `[^...]`
     if "." in body or "/" in body or "[^" in body:
         return False
     return bool(_SAFE_PATH_REGEX_BODY_RE.fullmatch(body))
 
 
-def _startswith_arg_checks_prefix(arg: ast.AST, prefix: str) -> bool:
+def _startswith_prefixes(arg: ast.AST) -> set[str]:
     if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
-        return arg.value == prefix
+        return {arg.value}
     if isinstance(arg, (ast.Tuple, ast.List)):
-        return any(
-            isinstance(elt, ast.Constant) and isinstance(elt.value, str) and elt.value == prefix
+        return {
+            elt.value
             for elt in arg.elts
-        )
-    return False
+            if isinstance(elt, ast.Constant) and isinstance(elt.value, str)
+        }
+    return set()
 
 
-def _extract_startswith_info(expr: ast.AST) -> tuple[str | None, ast.AST | None]:
+def _extract_startswith_info(expr: ast.AST) -> tuple[str | None, set[str]]:
     if isinstance(expr, ast.Call):
         cname = _dotted(expr.func)
         if (cname.endswith(".startswith") or cname == "startswith") and expr.args:
             recv = expr.func.value if isinstance(expr.func, ast.Attribute) else None
             if isinstance(recv, ast.Name):
-                return recv.id, expr.args[0]
-    return None, None
+                return recv.id, _startswith_prefixes(expr.args[0])
+    return None, set()
 
 
 def _has_host_or_netloc_attr(expr: ast.AST) -> bool:
@@ -221,28 +220,62 @@ def _has_host_or_netloc_attr(expr: ast.AST) -> bool:
     )
 
 
-def _rejects_protocol_relative(expr: ast.AST, var_name: str) -> bool:
-    """Check whether `expr` (holding True) rejects protocol-relative `//` or `/\\` URLs for `var_name`."""
-    # Pattern 1: `not x.startswith("//")` or `not x.startswith(("//", "/\\"))`
-    if isinstance(expr, ast.UnaryOp) and isinstance(expr.op, ast.Not):
-        recv_name, arg = _extract_startswith_info(expr.operand)
-        if recv_name == var_name and arg is not None and _startswith_arg_checks_prefix(arg, "//"):
-            return True
-    # Pattern 2: `x[1] != "/"` or `x[1] not in ("/", "\\")`
-    if isinstance(expr, ast.Compare) and len(expr.ops) == 1:
-        if isinstance(expr.ops[0], (ast.NotEq, ast.NotIn)) and isinstance(expr.left, ast.Subscript):
-            if isinstance(expr.left.value, ast.Name) and expr.left.value.id == var_name:
-                return True
+def _rejected_second_chars_for_var(expr: ast.AST, var_name: str, *, negated: bool = False) -> set[str]:
+    """Extract characters rejected at index 1 (or via startswith '//' / '/\\') for `var_name`.
+
+    When `negated=False`: returns chars guaranteed NOT to be at `var_name[1]` when `expr` is True.
+    When `negated=True`: returns chars guaranteed NOT to be at `var_name[1]` when `expr` is False.
+    """
+    rejected: set[str] = set()
+    # Pattern 1: `not x.startswith(("//", "/\\"))` (when negated=False) or `x.startswith(...)` (when negated=True)
+    target = expr.operand if (not negated and isinstance(expr, ast.UnaryOp) and isinstance(expr.op, ast.Not)) else (expr if negated else None)
+    if target is not None:
+        recv_name, prefixes = _extract_startswith_info(target)
+        if recv_name == var_name:
+            if "//" in prefixes:
+                rejected.add("/")
+            if "/\\" in prefixes:
+                rejected.add("\\")
+
+    # Pattern 2: strictly index 1 comparison (`x[1] != "/"` / `x[1] not in ("/", "\\")` when negated=False,
+    # or `x[1] == "/"` / `x[1] in ("/", "\\")` when negated=True)
+    if isinstance(expr, ast.Compare) and len(expr.ops) == 1 and isinstance(expr.left, ast.Subscript):
+        sub = expr.left
+        if (
+            isinstance(sub.value, ast.Name)
+            and sub.value.id == var_name
+            and isinstance(sub.slice, ast.Constant)
+            and sub.slice.value == 1
+        ):
+            op = expr.ops[0]
+            comp = expr.comparators[0]
+            if (not negated and isinstance(op, (ast.NotEq, ast.NotIn))) or (
+                negated and isinstance(op, (ast.Eq, ast.In))
+            ):
+                if isinstance(comp, ast.Constant) and isinstance(comp.value, str):
+                    for ch in comp.value:
+                        if ch in ("/", "\\"):
+                            rejected.add(ch)
+                elif isinstance(comp, (ast.Tuple, ast.List, ast.Set)):
+                    for elt in comp.elts:
+                        if isinstance(elt, ast.Constant) and elt.value in ("/", "\\"):
+                            rejected.add(elt.value)
+
     # Pattern 3: `not urlparse(x).netloc` / `urlparse(x).netloc == ""`
-    if isinstance(expr, ast.UnaryOp) and isinstance(expr.op, ast.Not):
-        if isinstance(expr.operand, ast.Attribute) and expr.operand.attr == "netloc":
-            if var_name in _expr_names(expr.operand):
-                return True
-    if isinstance(expr, ast.Compare) and len(expr.ops) == 1 and isinstance(expr.ops[0], ast.Eq):
-        if any(isinstance(s, ast.Attribute) and s.attr == "netloc" for s in ast.walk(expr)) and var_name in _expr_names(expr):
-            if any(isinstance(c, ast.Constant) and c.value == "" for c in expr.comparators):
-                return True
-    return False
+    if not negated:
+        if isinstance(expr, ast.UnaryOp) and isinstance(expr.op, ast.Not):
+            if isinstance(expr.operand, ast.Attribute) and expr.operand.attr == "netloc":
+                if var_name in _expr_names(expr.operand):
+                    return {"/", "\\"}
+        if isinstance(expr, ast.Compare) and len(expr.ops) == 1 and isinstance(expr.ops[0], ast.Eq):
+            if any(isinstance(s, ast.Attribute) and s.attr == "netloc" for s in ast.walk(expr)) and var_name in _expr_names(expr):
+                if any(isinstance(c, ast.Constant) and c.value == "" for c in expr.comparators):
+                    return {"/", "\\"}
+    else:
+        if isinstance(expr, ast.Attribute) and expr.attr == "netloc" and var_name in _expr_names(expr):
+            return {"/", "\\"}
+
+    return rejected
 
 
 def _block_always_exits(stmts: list[ast.stmt]) -> bool:
@@ -344,17 +377,19 @@ class PythonTaintTracker:
                 sub_g = self._extract_atomic_guards(val, resolved_vars)
                 for k, vs in sub_g.items():
                     guards[k].update(vs)
-                recv_name, sw_arg = _extract_startswith_info(val)
-                if recv_name and sw_arg is not None and _startswith_arg_checks_prefix(sw_arg, "/"):
+                recv_name, prefixes = _extract_startswith_info(val)
+                if recv_name and "/" in prefixes:
                     slash_vars.add(recv_name)
-            # Open-redirect requires BOTH `x.startswith("/")` AND protocol-relative `//` (or netloc) rejection
+            # Open-redirect requires `/` prefix AND rejection of BOTH `//` AND `/\` (or netloc == "")
             for v in slash_vars:
-                if any(_rejects_protocol_relative(val, v) for val in expr.values):
+                rej: set[str] = set()
+                for val in expr.values:
+                    rej.update(_rejected_second_chars_for_var(val, v, negated=False))
+                if {"/", "\\"}.issubset(rej):
                     guards["redirect"].add(v)
             return guards
 
         if isinstance(expr, ast.UnaryOp) and isinstance(expr.op, ast.Not):
-            # `not parsed.netloc` -> relative URL only (safe for redirect)
             if isinstance(expr.operand, ast.Attribute) and expr.operand.attr == "netloc":
                 guards["redirect"].update(_expr_names(expr.operand))
             return guards
@@ -367,13 +402,11 @@ class PythonTaintTracker:
             elif cname.endswith(".startswith") or cname == "startswith":
                 recv = expr.func.value if isinstance(expr.func, ast.Attribute) else None
                 recv_name = recv.id if isinstance(recv, ast.Name) else None
-                # Path confinement requires a resolved path AND a non-trivial trailing separator (`base + os.sep`)
                 if expr.args and _has_trailing_path_separator(expr.args[0]):
                     if recv_name and recv_name in resolved_vars:
                         guards["path"].add(recv_name)
                     elif recv is not None and self._is_path_resolve_expr(recv):
                         guards["path"].update(_expr_names(recv))
-                # Bare `x.startswith("/")` is NOT sufficient for open redirect (`//evil.com` bypasses it)
             elif cname == "re.fullmatch":
                 if len(expr.args) >= 2 and _is_safe_path_regex(expr.args[0], require_end_anchor=False):
                     guards["path"].update(_expr_names(expr.args[1]))
@@ -388,14 +421,12 @@ class PythonTaintTracker:
                 guards["redirect"].update(names)
         elif isinstance(expr, ast.Compare) and len(expr.ops) == 1:
             op = expr.ops[0]
-            # os.path.commonpath([base, target]) == base
             if (
                 isinstance(op, ast.Eq)
                 and isinstance(expr.left, ast.Call)
                 and _dotted(expr.left.func) in ("os.path.commonpath", "commonpath")
             ):
                 guards["path"].update(_expr_names(expr.left))
-            # Positive allowlist ONLY (`==` or `in`) on `.hostname` / `.netloc`; never `!=` / `not in` blocklists
             elif isinstance(op, (ast.Eq, ast.In)):
                 if _has_host_or_netloc_attr(expr):
                     names = _expr_names(expr)
@@ -419,10 +450,8 @@ class PythonTaintTracker:
         empty_false: dict[str, set[str]] = {k: set() for k in _SINK_KINDS}
 
         if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not):
-            # `if not <safe_cond>:` -> `<safe_cond>` holds in the FALSE branch (and after early exit)
             return empty_true, self._extract_atomic_guards(test.operand, resolved_vars)
 
-        # `if parsed.hostname not in ALLOWED_HOSTS: raise/abort` -> FALSE branch guarantees `in ALLOWED_HOSTS`
         if (
             isinstance(test, ast.Compare)
             and len(test.ops) == 1
@@ -435,24 +464,18 @@ class PythonTaintTracker:
                 return empty_true, empty_false
 
         if isinstance(test, ast.BoolOp) and isinstance(test.op, ast.Or):
-            # `if not A or not B: raise` -> both A and B hold in FALSE branch;
-            # also `if not x.startswith("/") or x.startswith("//"): abort(400)` -> redirect-safe in FALSE branch
             slash_vars_false: set[str] = set()
-            dbl_slash_rejected_false: set[str] = set()
+            rejected_chars_false: dict[str, set[str]] = {}
             for val in test.values:
                 if isinstance(val, ast.UnaryOp) and isinstance(val.op, ast.Not):
                     sub_g = self._extract_atomic_guards(val.operand, resolved_vars)
                     for k, vs in sub_g.items():
                         empty_false[k].update(vs)
-                    rname, sw_arg = _extract_startswith_info(val.operand)
-                    if rname and sw_arg is not None and _startswith_arg_checks_prefix(sw_arg, "/"):
+                    rname, prefixes = _extract_startswith_info(val.operand)
+                    if rname and "/" in prefixes:
                         slash_vars_false.add(rname)
                 else:
-                    # In `if x.startswith("//") or ...: abort`, FALSE branch guarantees `not x.startswith("//")`
-                    rname, sw_arg = _extract_startswith_info(val)
-                    if rname and sw_arg is not None and _startswith_arg_checks_prefix(sw_arg, "//"):
-                        dbl_slash_rejected_false.add(rname)
-                    elif (
+                    if (
                         isinstance(val, ast.Compare)
                         and len(val.ops) == 1
                         and isinstance(val.ops[0], ast.NotIn)
@@ -462,8 +485,13 @@ class PythonTaintTracker:
                             empty_false[k].update(vs)
                     elif isinstance(val, ast.Attribute) and val.attr == "netloc":
                         empty_false["redirect"].update(_expr_names(val))
-            for v in slash_vars_false & dbl_slash_rejected_false:
-                empty_false["redirect"].add(v)
+                    for vname in _expr_names(val):
+                        rej = _rejected_second_chars_for_var(val, vname, negated=True)
+                        if rej:
+                            rejected_chars_false.setdefault(vname, set()).update(rej)
+            for v in slash_vars_false:
+                if {"/", "\\"}.issubset(rejected_chars_false.get(v, set())):
+                    empty_false["redirect"].add(v)
             return empty_true, empty_false
 
         return self._extract_atomic_guards(test, resolved_vars), empty_false
@@ -712,35 +740,265 @@ _JS_TAINT_SOURCE_RE = re.compile(
     r"|\bnew\s+URLSearchParams\s*\(\s*(?:(?:window\.|document\.)?location\.(?:search|hash|href)|(?:req|request)\.(?:url|originalUrl|query))"
 )
 _JS_IDENT_RE = re.compile(r"\b[A-Za-z_$][A-Za-z0-9_$]*\b")
-_JS_PATH_SEP_GUARD_RE = re.compile(
-    r"\.startsWith\s*\([^)]*(?:path\.sep|\+\s*['\"]/['\"]|\$\{[^}]+\}/|['\"][^'\"]+['\"]\s*\+\s*['\"]/['\"])"
-)
-_JS_SAFE_REDIRECT_GUARD_RE = re.compile(
-    r"(?:startsWith\s*\(\s*['\"]/['\"]\s*\)[\s\S]*startsWith\s*\(\s*['\"]//['\"]\s*\))"
-    r"|(?:startsWith\s*\(\s*['\"]/['\"]\s*\)[\s\S]*(?:\[\s*1\s*\]\s*!==?\s*['\"]/['\"]|replace|URL\())"
-    r"|(?:/\^\\/\[\^/\\\\\]/)"
-)
+
+
+def _js_unwrap_parens(node: Any) -> Any:
+    while node is not None and node.type == "parenthesized_expression" and node.named_children:
+        node = node.named_children[0]
+    return node
+
+
+def _js_unquote_string(node: Any, raw: bytes) -> str | None:
+    if node is None:
+        return None
+    if node.type == "string":
+        txt = node_text(node, raw).strip()
+        if len(txt) >= 2 and txt[0] == txt[-1] and txt[0] in ("'", '"'):
+            inner = txt[1:-1]
+            # Decode common JS string escapes (`\\` -> `\`)
+            return inner.replace("\\\\", "\\")
+    return None
+
+
+def _js_is_path_resolve_node(node: Any, raw: bytes) -> bool:
+    for sub in walk_nodes(node):
+        if sub.type == "call_expression":
+            fn = sub.child_by_field_name("function")
+            if fn and node_text(fn, raw) in ("path.resolve", "fs.realpathSync", "realpathSync", "resolve"):
+                return True
+    return False
+
+
+def _js_arg_has_path_separator(arg_node: Any, raw: bytes) -> bool:
+    """Return True iff the Tree-sitter AST arg enforces a non-trivial trailing path separator."""
+    arg_node = _js_unwrap_parens(arg_node)
+    if arg_node is None:
+        return False
+    sval = _js_unquote_string(arg_node, raw)
+    if sval is not None:
+        return len(sval) > 1 and sval.endswith(("/", "\\"))
+    if arg_node.type == "binary_expression":
+        op = arg_node.child_by_field_name("operator")
+        right = arg_node.child_by_field_name("right")
+        if op and node_text(op, raw) == "+" and right is not None:
+            rtxt = node_text(right, raw).strip()
+            rsval = _js_unquote_string(right, raw)
+            return rtxt in ("path.sep", "sep") or rsval in ("/", "\\")
+    if arg_node.type == "template_string":
+        txt = node_text(arg_node, raw)
+        return txt.endswith(("/`", "\\`", "${path.sep}`")) and len(txt) > 3
+    return False
+
+
+def _js_call_parts(node: Any, raw: bytes) -> tuple[Any | None, str, list[Any]]:
+    """For a Tree-sitter `call_expression`, return `(receiver_node, method_or_fn_name, arg_nodes)`."""
+    node = _js_unwrap_parens(node)
+    if node is None or node.type != "call_expression":
+        return None, "", []
+    fn = node.child_by_field_name("function")
+    args = node.child_by_field_name("arguments")
+    arg_nodes = list(args.named_children) if args else []
+    if fn is None:
+        return None, "", arg_nodes
+    if fn.type == "member_expression":
+        obj = fn.child_by_field_name("object")
+        prop = fn.child_by_field_name("property")
+        return obj, node_text(prop, raw) if prop else "", arg_nodes
+    return None, node_text(fn, raw), arg_nodes
+
+
+def _js_flatten_logical(node: Any, raw: bytes, op_tok: str) -> list[Any]:
+    node = _js_unwrap_parens(node)
+    if node is not None and node.type == "binary_expression":
+        op = node.child_by_field_name("operator")
+        if op and node_text(op, raw) == op_tok:
+            left = node.child_by_field_name("left")
+            right = node.child_by_field_name("right")
+            return _js_flatten_logical(left, raw, op_tok) + _js_flatten_logical(right, raw, op_tok)
+    return [node] if node is not None else []
+
+
+def _js_is_negation(node: Any, raw: bytes) -> Any | None:
+    node = _js_unwrap_parens(node)
+    if node is not None and node.type == "unary_expression":
+        op = node.child_by_field_name("operator")
+        arg = node.child_by_field_name("argument")
+        if op and node_text(op, raw) == "!" and arg is not None:
+            return _js_unwrap_parens(arg)
+    return None
+
+
+def _js_rejected_second_chars(node: Any, raw: bytes, var_name: str, *, negated: bool = False) -> set[str]:
+    """Extract characters guaranteed NOT at `var_name[1]` from a Tree-sitter condition node."""
+    node = _js_unwrap_parens(node)
+    rejected: set[str] = set()
+    if node is None:
+        return rejected
+
+    # `!u.startsWith('//')` (negated=False) or `u.startsWith('//')` (negated=True)
+    inner = _js_is_negation(node, raw) if not negated else node
+    if inner is not None:
+        recv, mname, args = _js_call_parts(inner, raw)
+        if mname == "startsWith" and recv is not None and node_text(recv, raw) == var_name and args:
+            sval = _js_unquote_string(args[0], raw)
+            if sval == "//":
+                rejected.add("/")
+            elif sval == "/\\":
+                rejected.add("\\")
+
+    # `u[1] !== '/'` / `u[1] !== '\\'` (negated=False) or `u[1] === '/'` (negated=True)
+    if node.type == "binary_expression":
+        op = node.child_by_field_name("operator")
+        left = _js_unwrap_parens(node.child_by_field_name("left"))
+        right = _js_unwrap_parens(node.child_by_field_name("right"))
+        op_txt = node_text(op, raw) if op else ""
+        if left is not None and left.type == "subscript_expression" and right is not None:
+            obj = left.child_by_field_name("object")
+            idx = left.child_by_field_name("index")
+            if obj and node_text(obj, raw) == var_name and idx and node_text(idx, raw).strip() == "1":
+                sval = _js_unquote_string(right, raw)
+                if sval in ("/", "\\") and (
+                    (not negated and op_txt in ("!==", "!="))
+                    or (negated and op_txt in ("===", "=="))
+                ):
+                    rejected.add(sval)
+
+    return rejected
 
 
 def _js_block_exits(stmt_node: Any, raw: bytes) -> bool:
-    txt = node_text(stmt_node, raw)
-    return bool(re.search(r"\b(?:return|throw)\b", txt))
+    if stmt_node is None:
+        return False
+    if stmt_node.type in ("return_statement", "throw_statement"):
+        return True
+    if stmt_node.type == "statement_block" and stmt_node.named_children:
+        last = stmt_node.named_children[-1]
+        if last.type in ("return_statement", "throw_statement"):
+            return True
+    return False
 
 
 class JsTaintTracker:
-    """Flow-aware intra-procedural taint tracker over a Tree-sitter JS/TS scope."""
+    """Tree-sitter AST-walking intra-procedural taint tracker for JS/TS scopes."""
 
     def __init__(self, scope_node: Any, raw: bytes) -> None:
         self.scope_node = scope_node
         self.raw = raw
-        self.scope_text = node_text(scope_node, raw)
         self.tainted: dict[str, str] = {}
         self.sanitized: dict[str, set[str]] = {k: set() for k in _SINK_KINDS}
+        self._resolved_vars: set[str] = set()
         self._guard_ranges: list[tuple[int, int, str, set[str]]] = []
         self._analyze()
 
+    def _extract_js_atomic_guards(self, cond_node: Any) -> dict[str, set[str]]:
+        """Extract sink barriers implied when `cond_node` evaluates to True (Tree-sitter AST)."""
+        guards: dict[str, set[str]] = {k: set() for k in _SINK_KINDS}
+        cond_node = _js_unwrap_parens(cond_node)
+        if cond_node is None:
+            return guards
+
+        conjuncts = _js_flatten_logical(cond_node, self.raw, "&&")
+        if len(conjuncts) > 1:
+            slash_vars: set[str] = set()
+            for part in conjuncts:
+                sub_g = self._extract_js_atomic_guards(part)
+                for k, vs in sub_g.items():
+                    guards[k].update(vs)
+                recv, mname, args = _js_call_parts(part, self.raw)
+                if mname == "startsWith" and recv is not None and recv.type == "identifier" and args:
+                    if _js_unquote_string(args[0], self.raw) == "/":
+                        slash_vars.add(node_text(recv, self.raw))
+            for v in slash_vars:
+                rej: set[str] = set()
+                for part in conjuncts:
+                    rej.update(_js_rejected_second_chars(part, self.raw, v, negated=False))
+                if {"/", "\\"}.issubset(rej):
+                    guards["redirect"].add(v)
+            return guards
+
+        # Single atomic predicate:
+        # 1. Path guard: `<resolved_var>.startsWith(base + path.sep)` (ONLY if receiver is resolved!)
+        recv, mname, args = _js_call_parts(cond_node, self.raw)
+        if mname == "startsWith" and recv is not None and args:
+            if _js_arg_has_path_separator(args[0], self.raw):
+                if recv.type == "identifier":
+                    rname = node_text(recv, self.raw)
+                    if rname in self._resolved_vars:
+                        guards["path"].add(rname)
+                elif _js_is_path_resolve_node(recv, self.raw):
+                    guards["path"].update(_JS_IDENT_RE.findall(node_text(recv, self.raw)))
+
+        # 2. SSRF / Redirect allowlist calls: `allowedHosts.includes(host)`, `allowedOrigins.has(o)`, `isAllowedUrl(u)`
+        if mname in ("includes", "has") and recv is not None and args:
+            rtxt = node_text(recv, self.raw)
+            if any(tok in rtxt for tok in ("allowedHosts", "allowedOrigins", "ALLOWED_HOSTS", "ALLOWLIST")):
+                arg_idents = set(_JS_IDENT_RE.findall(node_text(args[0], self.raw)))
+                guards["ssrf"].update(arg_idents)
+                guards["redirect"].update(arg_idents)
+        elif mname in ("isAllowedUrl", "isSafeUrl", "isSafeRedirect") and args:
+            arg_idents = set(_JS_IDENT_RE.findall(node_text(args[0], self.raw)))
+            guards["ssrf"].update(arg_idents)
+            guards["redirect"].update(arg_idents)
+
+        # 3. Positive equality on parsed URL origin/hostname (`parsed.origin === ...` / `parsed.hostname === ...`)
+        if cond_node.type == "binary_expression":
+            op = cond_node.child_by_field_name("operator")
+            left = cond_node.child_by_field_name("left")
+            right = cond_node.child_by_field_name("right")
+            if op and node_text(op, self.raw) in ("===", "==") and left is not None and right is not None:
+                ltxt = node_text(left, self.raw)
+                rtxt = node_text(right, self.raw)
+                if any(tok in ltxt or tok in rtxt for tok in (".origin", ".hostname", ".host")):
+                    idents = set(_JS_IDENT_RE.findall(ltxt)) | set(_JS_IDENT_RE.findall(rtxt))
+                    guards["ssrf"].update(idents)
+                    guards["redirect"].update(idents)
+
+        return guards
+
+    def _extract_js_if_guards(
+        self, cond_node: Any
+    ) -> tuple[dict[str, set[str]], dict[str, set[str]]]:
+        """Return `(true_branch_guards, false_branch_guards)` by walking Tree-sitter AST."""
+        empty_true: dict[str, set[str]] = {k: set() for k in _SINK_KINDS}
+        empty_false: dict[str, set[str]] = {k: set() for k in _SINK_KINDS}
+        cond_node = _js_unwrap_parens(cond_node)
+        if cond_node is None:
+            return empty_true, empty_false
+
+        neg_inner = _js_is_negation(cond_node, self.raw)
+        if neg_inner is not None:
+            return empty_true, self._extract_js_atomic_guards(neg_inner)
+
+        disjuncts = _js_flatten_logical(cond_node, self.raw, "||")
+        if len(disjuncts) > 1:
+            # In `if (!A || !B || u.startsWith('//') || u.startsWith('/\\')) return;`,
+            # the FALSE branch (after early exit) guarantees A && B && !startsWith('//') && !startsWith('/\\')!
+            slash_vars_false: set[str] = set()
+            rejected_false: dict[str, set[str]] = {}
+            for part in disjuncts:
+                inner = _js_is_negation(part, self.raw)
+                if inner is not None:
+                    sub_g = self._extract_js_atomic_guards(inner)
+                    for k, vs in sub_g.items():
+                        empty_false[k].update(vs)
+                    recv, mname, args = _js_call_parts(inner, self.raw)
+                    if mname == "startsWith" and recv is not None and recv.type == "identifier" and args:
+                        if _js_unquote_string(args[0], self.raw) == "/":
+                            slash_vars_false.add(node_text(recv, self.raw))
+                else:
+                    for vname in _JS_IDENT_RE.findall(node_text(part, self.raw)):
+                        rej = _js_rejected_second_chars(part, self.raw, vname, negated=True)
+                        if rej:
+                            rejected_false.setdefault(vname, set()).update(rej)
+            for v in slash_vars_false:
+                if {"/", "\\"}.issubset(rejected_false.get(v, set())):
+                    empty_false["redirect"].add(v)
+            # Positive `||` branch cannot guarantee either disjunct -> true_g stays EMPTY!
+            return empty_true, empty_false
+
+        return self._extract_js_atomic_guards(cond_node), empty_false
+
     def _analyze(self) -> None:
-        has_path_resolve = "path.resolve(" in self.scope_text
         for node in walk_nodes(self.scope_node):
             if node.type == "variable_declarator":
                 name_n = node.child_by_field_name("name")
@@ -756,33 +1014,21 @@ class JsTaintTracker:
             elif node.type == "if_statement":
                 cond = node.child_by_field_name("condition")
                 cons = node.child_by_field_name("consequence")
+                alt = node.child_by_field_name("alternative")
                 if not cond or not cons:
                     continue
-                ctxt = node_text(cond, self.raw)
-                idents = set(_JS_IDENT_RE.findall(ctxt))
-                is_negated = ctxt.lstrip("( \t").startswith("!")
-                cons_exits = _js_block_exits(cons, self.raw)
-
-                if is_negated and cons_exits and node.parent is not None:
-                    start_b = cons.end_byte
-                    end_b = node.parent.end_byte
-                elif not is_negated:
-                    start_b = cons.start_byte
-                    end_b = cons.end_byte
-                else:
-                    continue
-
-                # Path confinement requires resolved base + explicit separator (NEVER bare `p.startsWith('/')`)
-                if has_path_resolve and (
-                    _JS_PATH_SEP_GUARD_RE.search(ctxt) or "path.relative(" in ctxt
-                ):
-                    self._guard_ranges.append((start_b, end_b, "path", idents))
-                # Open-redirect guard requires BOTH `/` prefix AND `//` protocol-relative rejection
-                if _JS_SAFE_REDIRECT_GUARD_RE.search(ctxt):
-                    self._guard_ranges.append((start_b, end_b, "redirect", idents))
-                if any(tok in ctxt for tok in ("allowedHosts", "allowedOrigins", "isAllowedUrl", "ALLOWED_HOSTS")):
-                    self._guard_ranges.append((start_b, end_b, "ssrf", idents))
-                    self._guard_ranges.append((start_b, end_b, "redirect", idents))
+                true_g, false_g = self._extract_js_if_guards(cond)
+                for kind, idents in true_g.items():
+                    if idents:
+                        self._guard_ranges.append((cons.start_byte, cons.end_byte, kind, idents))
+                if alt is not None:
+                    for kind, idents in false_g.items():
+                        if idents:
+                            self._guard_ranges.append((alt.start_byte, alt.end_byte, kind, idents))
+                if _js_block_exits(cons, self.raw) and node.parent is not None:
+                    for kind, idents in false_g.items():
+                        if idents:
+                            self._guard_ranges.append((cons.end_byte, node.parent.end_byte, kind, idents))
 
     def _record_assignment(self, name_n: Any, val_n: Any) -> None:
         vtxt = node_text(val_n, self.raw)
@@ -799,10 +1045,15 @@ class JsTaintTracker:
         is_xss_san = any(
             tok in vtxt for tok in ("DOMPurify.sanitize(", "escapeHtml(", "encodeURIComponent(")
         )
+        is_resolved = _js_is_path_resolve_node(val_n, self.raw)
+
         if name_n.type == "identifier":
             var = node_text(name_n, self.raw)
             for svars in self.sanitized.values():
                 svars.discard(var)
+            self._resolved_vars.discard(var)
+            if is_resolved:
+                self._resolved_vars.add(var)
             if is_path_san:
                 self.sanitized["path"].add(var)
             if is_xss_san:
@@ -817,6 +1068,7 @@ class JsTaintTracker:
                     v = node_text(sub, self.raw)
                     for svars in self.sanitized.values():
                         svars.discard(v)
+                    self._resolved_vars.discard(v)
                     self.tainted[v] = src
 
     def _active_sanitized(self, expr_node: Any, sink_kind: str) -> set[str]:

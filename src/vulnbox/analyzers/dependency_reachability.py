@@ -302,15 +302,14 @@ class DependencyReachabilityAnalyzer:
 
         py_index: list[tuple[str, ast.AST]] | None = None
         js_index: list[tuple[str, str, list[str]]] | None = None
-        py_rev_deps, py_graph_known = compute_reverse_dependents(workspace_dir, "python")
-        node_rev_deps, node_graph_known = compute_reverse_dependents(workspace_dir, "node")
+        py_rev_by_dir = compute_reverse_dependents(workspace_dir, "python")
+        node_rev_by_dir = compute_reverse_dependents(workspace_dir, "node")
 
         for adv in self.advisories:
             if adv.ecosystem not in ("python", "node"):
                 continue
             target_deps = py_deps if adv.ecosystem == "python" else node_deps
-            rev_deps = py_rev_deps if adv.ecosystem == "python" else node_rev_deps
-            graph_known = py_graph_known if adv.ecosystem == "python" else node_graph_known
+            rev_by_dir = py_rev_by_dir if adv.ecosystem == "python" else node_rev_by_dir
             for dep in target_deps:
                 pkg = dep.name
                 installed_ver = dep.version
@@ -389,14 +388,19 @@ class DependencyReachabilityAnalyzer:
                             if reachability != "reachable":
                                 reachability = "reachable"
 
-                # Soundness gate: even when app code only calls safe symbols directly,
-                # another dependency in the lockfile (e.g. `requests` calling `urllib3.PoolManager`)
-                # may still call the vulnerable code internally. Only keep `not_reachable` when
-                # we can prove zero other dependencies depend on this package.
-                pkg_dependents = sorted(rev_deps.get(adv.package.lower(), set()))
-                other_deps_present = len({d.name for d in target_deps} - {adv.package.lower()}) > 0
+                # Per-folder reverse-dependency soundness gate:
+                # Only treat a dependency's graph as known if its OWN lockfile folder has a parsed
+                # dependency graph (never inherit another monorepo service's lockfile).
+                dep_dir = Path(manifest).parent
+                dep_rev_map = rev_by_dir.get(dep_dir)
+                graph_known_for_dep = dep_rev_map is not None
+                pkg_dependents = sorted(dep_rev_map.get(adv.package.lower(), set())) if dep_rev_map is not None else []
+                same_dir_other_deps = (
+                    len({d.name for d in target_deps if Path(d.manifest).parent == dep_dir} - {adv.package.lower()})
+                    > 0
+                )
                 has_potential_dependents = (
-                    bool(pkg_dependents) if graph_known else other_deps_present
+                    bool(pkg_dependents) if graph_known_for_dep else same_dir_other_deps
                 )
                 if reachability == "not_reachable" and has_potential_dependents:
                     reachability = "under_investigation"

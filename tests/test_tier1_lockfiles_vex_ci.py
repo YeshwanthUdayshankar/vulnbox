@@ -464,6 +464,23 @@ def test_offline_osv_cache_kev_epss_and_sound_vex_generation(tmp_path: Path):
     assert "version" not in unc_comps["pkg:pypi/pyyaml"]
     assert "version" not in unc_comps["pkg:golang/stdlib"]
 
+    # Legacy/plugin reachability_basis="imported_safe_symbols_only" (without reverse-dep proof)
+    # MUST NOT bypass the reverse-dependency gate -> under_investigation / in_triage!
+    legacy_basis_finding = dep_by_cve["CVE-2024-99999"].model_copy(
+        update={
+            "metadata": {
+                **dep_by_cve["CVE-2024-99999"].metadata,
+                "reachability_basis": "imported_safe_symbols_only",
+            }
+        }
+    )
+    legacy_report = report.model_copy(update={"findings": [legacy_basis_finding], "verifications": []})
+    legacy_ov = build_openvex(legacy_report)["statements"][0]
+    assert legacy_ov["status"] == "under_investigation"
+    assert "justification" not in legacy_ov
+    legacy_cdx = build_cyclonedx_vex(legacy_report)["vulnerabilities"][0]
+    assert legacy_cdx["analysis"]["state"] == "in_triage"
+
     sarif = build_sarif(report)
     validate_sarif(sarif)
     for res in sarif["runs"][0]["results"]:

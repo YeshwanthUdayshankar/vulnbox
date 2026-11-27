@@ -8,28 +8,47 @@ from typing import Any
 from vulnbox.models import AuditReport, Finding, VerificationResult
 
 
+def _is_exact_version_known(finding: Finding) -> bool:
+    """Return True iff the finding's package version comes from a lockfile or Go toolchain pin."""
+    version_source = str(finding.metadata.get("version_source") or "").lower()
+    confidence = str(finding.metadata.get("confidence") or "").lower()
+    return (
+        version_source not in ("manifest_range", "go_directive_lower_bound")
+        and confidence != "low"
+    )
+
+
 def _package_purl(finding: Finding, *, use_fixed_version: bool = False) -> tuple[str, str, str]:
     """Return `(purl, package_name, version)` for a dependency finding.
 
-    When `use_fixed_version=True` (for verified `"fixed"` / `"resolved"` statements),
-    attaches the VEX statement to the patched version's PURL rather than the vulnerable one.
+    - When `use_fixed_version=True` (verified `"fixed"` / `"resolved"` statements),
+      attaches the VEX statement to the patched version's PURL rather than the vulnerable one.
+    - When the installed version is only a loose manifest range or Go minimum-language lower
+      bound (`not _is_exact_version_known(finding)`), omits `@version` (`pkg:pypi/requests`)
+      so downstream consumers are not told an unverified version is installed.
     """
     eco = str(finding.metadata.get("ecosystem") or "python").lower()
     pkg = str(finding.metadata.get("package") or "unknown")
     if eco != "go":
         pkg = pkg.lower()
-    raw_ver = (
-        finding.metadata.get("fixed_version")
-        if use_fixed_version and finding.metadata.get("fixed_version")
-        else finding.metadata.get("installed_version")
-    )
-    ver = str(raw_ver or "0.0.0").lstrip("^~>=<v")
     if eco == "python":
         purl_type = "pypi"
     elif eco == "go":
         purl_type = "golang"
     else:
         purl_type = "npm"
+
+    if not use_fixed_version and not _is_exact_version_known(finding):
+        return f"pkg:{purl_type}/{pkg}", pkg, ""
+
+    raw_ver = (
+        finding.metadata.get("fixed_version")
+        if use_fixed_version and finding.metadata.get("fixed_version")
+        else finding.metadata.get("installed_version")
+    )
+    ver = str(raw_ver or "").lstrip("^~>=<v")
+    if not ver:
+        return f"pkg:{purl_type}/{pkg}", pkg, ""
     return f"pkg:{purl_type}/{pkg}@{ver}", pkg, ver
 
 
@@ -39,19 +58,20 @@ def _statement_state(
     """Map VulnBox reachability + patch verification into OpenVEX & CycloneDX VEX states.
 
     Returns `(openvex_status, openvex_justification, cdx_state, detail, use_fixed_purl)`.
-    Soundness rule: NEVER emit `not_affected` unless vulnerable-symbol absence is positively
-    proven on a directly imported package (`reachability_basis == "imported_safe_symbols_only"`
-    or `reachability == "not_reachable"` with direct citations). Unimported/transitive packages
-    remain `under_investigation` / `in_triage`.
-    """
-    version_source = str(finding.metadata.get("version_source") or "").lower()
-    confidence = str(finding.metadata.get("confidence") or "").lower()
-    exact_version_known = (
-        version_source not in ("manifest_range", "go_directive_lower_bound")
-        and confidence != "low"
-    )
 
-    if not exact_version_known:
+    Soundness rules:
+    1. Exact-version gate: if `version_source` is `manifest_range` or `go_directive_lower_bound`
+       (or `confidence == "low"`), always emit `under_investigation` / `in_triage`; never claim
+       `affected`, `not_affected`, or `fixed` without a lockfile or `toolchain goX.Y.Z` pin.
+    2. Reverse-dependent gate: emit `not_affected` (`vulnerable_code_not_in_execute_path`) ONLY
+       when the package is directly imported using non-vulnerable symbols AND the folder's
+       lockfile dependency graph proves zero other dependencies depend on it
+       (`reachability == "not_reachable"`, `reachability_basis == "imported_safe_symbols_no_dependents"`,
+       and empty `reverse_dependents`). Unimported packages and packages with dependents remain
+       `under_investigation` / `in_triage`.
+    """
+    if not _is_exact_version_known(finding):
+        version_source = str(finding.metadata.get("version_source") or "").lower()
         src_desc = (
             "minimum `go` language directive (not a pinned `toolchain goX.Y.Z`)"
             if version_source == "go_directive_lower_bound"
@@ -203,13 +223,15 @@ def build_cyclonedx_vex(report: AuditReport) -> dict[str, Any]:
         purl, pkg, pkg_ver = _package_purl(f, use_fixed_version=use_fixed)
 
         if purl not in components_by_ref:
-            components_by_ref[purl] = {
+            comp: dict[str, Any] = {
                 "type": "library",
                 "bom-ref": purl,
                 "name": pkg,
-                "version": pkg_ver,
                 "purl": purl,
             }
+            if pkg_ver:
+                comp["version"] = pkg_ver
+            components_by_ref[purl] = comp
 
         analysis: dict[str, Any] = {
             "state": cdx_state,

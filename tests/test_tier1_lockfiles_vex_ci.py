@@ -450,11 +450,19 @@ def test_offline_osv_cache_kev_epss_and_sound_vex_generation(tmp_path: Path):
     uncertain_report = report.model_copy(update={"findings": [uncertain_yaml, uncertain_go], "verifications": []})
     unc_ov = {s["vulnerability"]["name"]: s for s in build_openvex(uncertain_report)["statements"]}
     assert unc_ov["CVE-2020-14343"]["status"] == "under_investigation"
+    assert unc_ov["CVE-2020-14343"]["products"][0]["@id"] == "pkg:pypi/pyyaml"
     assert "unknown" in unc_ov["CVE-2020-14343"]["status_notes"].lower()
     assert unc_ov["GO-2023-2102"]["status"] == "under_investigation"
-    unc_cdx = {v["id"]: v for v in build_cyclonedx_vex(uncertain_report)["vulnerabilities"]}
+    assert unc_ov["GO-2023-2102"]["products"][0]["@id"] == "pkg:golang/stdlib"
+    unc_cdx_doc = build_cyclonedx_vex(uncertain_report)
+    unc_cdx = {v["id"]: v for v in unc_cdx_doc["vulnerabilities"]}
     assert unc_cdx["CVE-2020-14343"]["analysis"]["state"] == "in_triage"
+    assert unc_cdx["CVE-2020-14343"]["affects"][0]["ref"] == "pkg:pypi/pyyaml"
     assert unc_cdx["GO-2023-2102"]["analysis"]["state"] == "in_triage"
+    assert unc_cdx["GO-2023-2102"]["affects"][0]["ref"] == "pkg:golang/stdlib"
+    unc_comps = {c["bom-ref"]: c for c in unc_cdx_doc["components"]}
+    assert "version" not in unc_comps["pkg:pypi/pyyaml"]
+    assert "version" not in unc_comps["pkg:golang/stdlib"]
 
     sarif = build_sarif(report)
     validate_sarif(sarif)

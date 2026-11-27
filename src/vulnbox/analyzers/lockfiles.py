@@ -631,13 +631,15 @@ def compute_reverse_dependents(
             if isinstance(packages, dict) and packages:
                 rev = by_dir.setdefault(lock_dir, {})
                 for pkg_path, entry in packages.items():
-                    if not pkg_path or not isinstance(entry, dict):
+                    # Skip root (`""`), workspace symlinks (`link: true`), and first-party workspace dirs (not under `node_modules/`)
+                    if (
+                        not pkg_path
+                        or not isinstance(entry, dict)
+                        or entry.get("link") is True
+                        or "node_modules/" not in pkg_path
+                    ):
                         continue
-                    parent = (
-                        pkg_path.rsplit("node_modules/", 1)[-1].lower()
-                        if "node_modules/" in pkg_path
-                        else str(entry.get("name") or pkg_path).lower()
-                    )
+                    parent = pkg_path.rsplit("node_modules/", 1)[-1].lower()
                     for sec in ("dependencies", "optionalDependencies", "peerDependencies"):
                         dmap = entry.get(sec)
                         if isinstance(dmap, dict):
@@ -690,7 +692,13 @@ def compute_reverse_dependents(
                     in_deps_block = False
                     continue
                 if not line[0].isspace():
-                    m_hdr = YARN_HEADER_RE.match(line.strip())
+                    header_s = line.strip()
+                    # Skip Yarn Berry first-party workspace entries (e.g. `"myapp@workspace:."`)
+                    if "@workspace:" in header_s:
+                        cur_parent = None
+                        in_deps_block = False
+                        continue
+                    m_hdr = YARN_HEADER_RE.match(header_s)
                     cur_parent = m_hdr.group(1).lower() if m_hdr else None
                     in_deps_block = False
                     continue

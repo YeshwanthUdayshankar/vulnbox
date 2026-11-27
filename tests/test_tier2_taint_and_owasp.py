@@ -136,6 +136,10 @@ def test_taint_engine_guard_soundness_reassignment_and_fastapi_depends(tmp_path:
         "  if (f.startsWith('/srv/data' + path.sep)) {\n"
         "    const unresolvedTarget = f;\n"
         "  }\n"
+        "  const prom = resolve('/srv/data/' + req.query.file);\n"
+        "  if (prom.startsWith('/srv/data' + path.sep)) {\n"
+        "    const promiseResolveTarget = prom;\n"
+        "  }\n"
         "  if (p.startsWith('/srv/data' + path.sep)) {\n"
         "    const safeTarget = p;\n"
         "  }\n"
@@ -167,6 +171,7 @@ def test_taint_engine_guard_soundness_reassignment_and_fastapi_depends(tmp_path:
 
     assert tracker.is_tainted(_rhs(b"badTarget"), "path") is not None
     assert tracker.is_tainted(_rhs(b"unresolvedTarget"), "path") is not None
+    assert tracker.is_tainted(_rhs(b"promiseResolveTarget"), "path") is not None
     assert tracker.is_tainted(_rhs(b"safeTarget"), "path") is None
 
     (tmp_path / "js_redir.js").write_text(js_src, encoding="utf-8")

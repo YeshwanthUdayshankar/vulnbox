@@ -44,6 +44,29 @@ def _statement_state(
     or `reachability == "not_reachable"` with direct citations). Unimported/transitive packages
     remain `under_investigation` / `in_triage`.
     """
+    version_source = str(finding.metadata.get("version_source") or "").lower()
+    confidence = str(finding.metadata.get("confidence") or "").lower()
+    exact_version_known = (
+        version_source not in ("manifest_range", "go_directive_lower_bound")
+        and confidence != "low"
+    )
+
+    if not exact_version_known:
+        src_desc = (
+            "minimum `go` language directive (not a pinned `toolchain goX.Y.Z`)"
+            if version_source == "go_directive_lower_bound"
+            else "loose manifest range rather than a lockfile pin"
+        )
+        return (
+            "under_investigation",
+            None,
+            "in_triage",
+            f"Exact installed version of '{finding.metadata.get('package', 'package')}' is unknown "
+            f"(derived from {src_desc}); provide a lockfile or `toolchain` directive before making "
+            "a definitive affected/not_affected/fixed VEX claim.",
+            False,
+        )
+
     if ver is not None and ver.verified:
         fixed_ver = finding.metadata.get("fixed_version") or "patched version"
         return (

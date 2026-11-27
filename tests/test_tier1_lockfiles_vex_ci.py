@@ -205,6 +205,7 @@ def test_lockfiles_override_loose_manifest_ranges(tmp_path: Path):
     yarn_dir = tmp_path / "yarn_app"
     yarn_dir.mkdir()
     (yarn_dir / "yarn.lock").write_text(
+        '"myapp@workspace:.":\n  version: 0.0.0-use.local\n  dependencies:\n    lodash: ^4.17.20\n\n'
         '"express@^4.18.0":\n  version "4.18.2"\n  dependencies:\n    minimist "^1.2.0"\n\n'
         '"minimist@^1.2.0":\n  version "1.2.5"\n',
         encoding="utf-8",
@@ -215,6 +216,28 @@ def test_lockfiles_override_loose_manifest_ranges(tmp_path: Path):
 
     yarn_rev = compute_reverse_dependents(yarn_dir, "node")
     assert "express" in yarn_rev[Path(".")]["minimist"]
+    # First-party Yarn Berry `@workspace:.` entry MUST NOT count as a third-party dependent!
+    assert "lodash" not in yarn_rev[Path(".")]
+
+    # First-party npm workspace packages/* and link:true entries MUST NOT count as third-party dependents!
+    npm_ws = tmp_path / "npm_ws"
+    npm_ws.mkdir()
+    (npm_ws / "package-lock.json").write_text(
+        json.dumps(
+            {
+                "lockfileVersion": 3,
+                "packages": {
+                    "": {"dependencies": {"lodash": "^4.17.20"}},
+                    "packages/web": {"name": "web", "dependencies": {"lodash": "^4.17.20"}},
+                    "node_modules/web": {"resolved": "packages/web", "link": True, "dependencies": {"lodash": "^4.17.20"}},
+                    "node_modules/lodash": {"version": "4.17.20"},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    npm_ws_rev = compute_reverse_dependents(npm_ws, "node")
+    assert "lodash" not in npm_ws_rev[Path(".")]
 
     # Monorepo per-folder reverse-dependency graph isolation:
     # svc_a has a uv.lock, while svc_b only has flat requirements.txt -> svc_b MUST NOT inherit svc_a's graph_known!
@@ -398,6 +421,40 @@ def test_offline_osv_cache_kev_epss_and_sound_vex_generation(tmp_path: Path):
     fixed_cdx_yaml = {v["id"]: v for v in fixed_cdx["vulnerabilities"]}["CVE-2020-14343"]
     assert fixed_cdx_yaml["affects"][0]["ref"] == "pkg:pypi/pyyaml@6.0.2"
     assert "pkg:pypi/pyyaml@6.0.2" in {c["bom-ref"] for c in fixed_cdx["components"]}
+
+    # VEX uncertainty gate: loose manifest_range or go_directive_lower_bound MUST emit under_investigation / in_triage
+    # (NEVER firm affected / not_affected / fixed) even when symbols are called!
+    uncertain_yaml = yaml_finding.model_copy(
+        update={
+            "metadata": {
+                **yaml_finding.metadata,
+                "version_source": "manifest_range",
+            }
+        }
+    )
+    uncertain_go = yaml_finding.model_copy(
+        update={
+            "finding_id": "F-GO-LOW",
+            "rule_id": "DEP-GO-2023-2102",
+            "metadata": {
+                "ecosystem": "go",
+                "package": "stdlib",
+                "installed_version": "1.21.1",
+                "fixed_version": "1.21.3",
+                "advisory_id": "GO-2023-2102",
+                "version_source": "go_directive_lower_bound",
+                "confidence": "low",
+            },
+        }
+    )
+    uncertain_report = report.model_copy(update={"findings": [uncertain_yaml, uncertain_go], "verifications": []})
+    unc_ov = {s["vulnerability"]["name"]: s for s in build_openvex(uncertain_report)["statements"]}
+    assert unc_ov["CVE-2020-14343"]["status"] == "under_investigation"
+    assert "unknown" in unc_ov["CVE-2020-14343"]["status_notes"].lower()
+    assert unc_ov["GO-2023-2102"]["status"] == "under_investigation"
+    unc_cdx = {v["id"]: v for v in build_cyclonedx_vex(uncertain_report)["vulnerabilities"]}
+    assert unc_cdx["CVE-2020-14343"]["analysis"]["state"] == "in_triage"
+    assert unc_cdx["GO-2023-2102"]["analysis"]["state"] == "in_triage"
 
     sarif = build_sarif(report)
     validate_sarif(sarif)

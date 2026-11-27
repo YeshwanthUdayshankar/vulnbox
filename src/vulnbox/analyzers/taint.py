@@ -764,7 +764,7 @@ def _js_is_path_resolve_node(node: Any, raw: bytes) -> bool:
     for sub in walk_nodes(node):
         if sub.type == "call_expression":
             fn = sub.child_by_field_name("function")
-            if fn and node_text(fn, raw) in ("path.resolve", "fs.realpathSync", "realpathSync", "resolve"):
+            if fn and node_text(fn, raw) in ("path.resolve", "fs.realpathSync", "realpathSync"):
                 return True
     return False
 

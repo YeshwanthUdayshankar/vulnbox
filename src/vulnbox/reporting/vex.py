@@ -101,7 +101,7 @@ def _statement_state(
     rev_deps = finding.metadata.get("reverse_dependents") or []
     has_direct_proof = (
         finding.reachability == "not_reachable"
-        and basis in ("imported_safe_symbols_no_dependents", "imported_safe_symbols_only")
+        and basis == "imported_safe_symbols_no_dependents"
         and not rev_deps
     )
     if has_direct_proof:

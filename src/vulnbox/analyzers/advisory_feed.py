@@ -220,22 +220,31 @@ def normalize_osv_record(
         if str(pkg_info.get("name") or "").lower() != package_name.lower():
             continue
         for rng in aff.get("ranges") or []:
-            cur_intro = "0"
+            # Only evaluate version-comparable ranges; ignore GIT commit-SHA ranges
+            rng_type = str(rng.get("type") or "").upper()
+            if rng_type not in ("ECOSYSTEM", "SEMVER"):
+                continue
+            cur_intro: str | None = None
             for ev in rng.get("events") or []:
                 if not isinstance(ev, dict):
                     continue
                 if ev.get("introduced") is not None:
                     cur_intro = str(ev["introduced"])
                 elif ev.get("fixed"):
-                    affected_ranges.append({"introduced": cur_intro, "fixed": str(ev["fixed"])})
-                    cur_intro = "0"
+                    affected_ranges.append(
+                        {"introduced": cur_intro if cur_intro is not None else "0", "fixed": str(ev["fixed"])}
+                    )
+                    cur_intro = None
                 elif ev.get("last_affected"):
                     affected_ranges.append(
-                        {"introduced": cur_intro, "last_affected": str(ev["last_affected"])}
+                        {
+                            "introduced": cur_intro if cur_intro is not None else "0",
+                            "last_affected": str(ev["last_affected"]),
+                        }
                     )
-                    cur_intro = "0"
-            # Open-ended introduced range with no fix yet
-            if cur_intro != "0" and not any(r.get("introduced") == cur_intro for r in affected_ranges):
+                    cur_intro = None
+            # Preserve open-ended / unfixed vulnerabilities (including `introduced: "0"` with no fix yet)
+            if cur_intro is not None:
                 affected_ranges.append({"introduced": cur_intro})
 
         eco_spec = aff.get("ecosystem_specific") or {}

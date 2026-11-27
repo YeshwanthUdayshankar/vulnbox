@@ -106,6 +106,77 @@ def test_osv_multibranch_ranges_cvss3_vector_scoring_and_pypi_aliases():
         )
         assert rec is not None and expected_imp in rec["imports"]
 
+    # Unfixed OSV vulnerability (`introduced: "0"` with NO fix yet) MUST NOT be dropped!
+    unfixed = normalize_osv_record(
+        {
+            "id": "GHSA-unfixed-0day",
+            "aliases": ["CVE-2026-00001"],
+            "summary": "Unpatched zero-day",
+            "affected": [
+                {
+                    "package": {"ecosystem": "PyPI", "name": "zero-pkg"},
+                    "ranges": [{"type": "ECOSYSTEM", "events": [{"introduced": "0"}]}],
+                }
+            ],
+        },
+        ecosystem="python",
+        package_name="zero-pkg",
+    )
+    assert unfixed is not None
+    assert unfixed["affected_ranges"] == [{"introduced": "0"}]
+    assert unfixed["fixed_version"] == ""
+    assert is_version_in_ranges("9.9.9", unfixed["affected_ranges"], ecosystem="python") == (True, None)
+
+    # GIT commit-SHA ranges MUST be ignored (only ECOSYSTEM / SEMVER ranges evaluated!)
+    with_git = normalize_osv_record(
+        {
+            "id": "PYSEC-2024-GIT",
+            "affected": [
+                {
+                    "package": {"ecosystem": "PyPI", "name": "git-pkg"},
+                    "ranges": [
+                        {
+                            "type": "GIT",
+                            "events": [
+                                {"introduced": "0"},
+                                {"fixed": "9999abcdef1234567890abcdef1234567890abcd"},
+                            ],
+                        },
+                        {
+                            "type": "ECOSYSTEM",
+                            "events": [{"introduced": "0"}, {"fixed": "1.2.0"}],
+                        },
+                    ],
+                }
+            ],
+        },
+        ecosystem="python",
+        package_name="git-pkg",
+    )
+    assert with_git is not None
+    assert with_git["affected_ranges"] == [{"introduced": "0", "fixed": "1.2.0"}]
+    assert is_version_in_ranges("1.2.0", with_git["affected_ranges"], ecosystem="python") == (False, None)
+    # GIT-only range with no ECOSYSTEM/SEMVER returns None instead of SHA-digit comparison
+    git_only = normalize_osv_record(
+        {
+            "id": "PYSEC-2024-GITONLY",
+            "affected": [
+                {
+                    "package": {"ecosystem": "PyPI", "name": "git-only"},
+                    "ranges": [
+                        {
+                            "type": "GIT",
+                            "events": [{"introduced": "0"}, {"fixed": "abcdef123456"}],
+                        }
+                    ],
+                }
+            ],
+        },
+        ecosystem="python",
+        package_name="git-only",
+    )
+    assert git_only is None
+
 
 def test_lockfiles_override_loose_manifest_ranges(tmp_path: Path):
     node_v3 = tmp_path / "node_v3"
@@ -216,15 +287,23 @@ def test_offline_osv_cache_kev_epss_and_sound_vex_generation(tmp_path: Path):
 
     repo = tmp_path / "repo"
     repo.mkdir()
-    (repo / "requirements.txt").write_text(
-        "demo-pkg==1.5.0\ntransitive-pkg==1.0.0\npyyaml==5.3.1\n",
+    # Use uv.lock so the full dependency graph is known:
+    # - demo-pkg has ZERO reverse dependents (safe symbols only -> provably not_affected!)
+    # - urllib3 is depended on by requests (even though app.py only calls urllib3.disable_warnings -> MUST stay under_investigation!)
+    # - transitive-pkg is unimported -> MUST stay under_investigation!
+    # - pyyaml is directly imported calling yaml.load -> affected!
+    (repo / "uv.lock").write_text(
+        '[[package]]\nname = "demo-pkg"\nversion = "1.5.0"\n\n'
+        '[[package]]\nname = "transitive-pkg"\nversion = "1.0.0"\n\n'
+        '[[package]]\nname = "pyyaml"\nversion = "5.3.1"\n\n'
+        '[[package]]\nname = "urllib3"\nversion = "2.0.5"\n\n'
+        '[[package]]\nname = "requests"\nversion = "2.31.0"\n'
+        'dependencies = [\n  { name = "urllib3" },\n]\n',
         encoding="utf-8",
     )
-    # app.py imports yaml (calls yaml.load -> affected), imports demo_pkg (calls safe_fn only -> not_affected!),
-    # and never imports transitive_pkg directly -> MUST stay under_investigation (not_affected would be unsound!)
     (repo / "app.py").write_text(
-        "import yaml\nimport demo_pkg\n\n"
-        "def load(s):\n    demo_pkg.safe_fn()\n    return yaml.load(s)\n",
+        "import yaml\nimport demo_pkg\nimport urllib3\n\n"
+        "def load(s):\n    demo_pkg.safe_fn()\n    urllib3.disable_warnings()\n    return yaml.load(s)\n",
         encoding="utf-8",
     )
 
@@ -239,9 +318,13 @@ def test_offline_osv_cache_kev_epss_and_sound_vex_generation(tmp_path: Path):
         f.metadata["advisory_id"]: f for f in report.findings if f.category == "dependency"
     }
     assert dep_by_cve["CVE-2024-99999"].reachability == "not_reachable"
-    assert dep_by_cve["CVE-2024-99999"].metadata["reachability_basis"] == "imported_safe_symbols_only"
+    assert dep_by_cve["CVE-2024-99999"].metadata["reachability_basis"] == "imported_safe_symbols_no_dependents"
     assert dep_by_cve["CVE-2024-99999"].metadata["cisa_kev"] is True
     assert dep_by_cve["CVE-2024-99999"].metadata["epss_score"] == 0.875
+    # urllib3 has reverse dependent `requests` in uv.lock -> MUST NOT claim not_affected!
+    assert dep_by_cve["CVE-2023-45803"].reachability == "under_investigation"
+    assert dep_by_cve["CVE-2023-45803"].metadata["reachability_basis"] == "imported_safe_symbols_but_has_dependents"
+    assert "requests" in dep_by_cve["CVE-2023-45803"].metadata["reverse_dependents"]
     assert dep_by_cve["CVE-2024-88888"].reachability == "under_investigation"
     assert dep_by_cve["CVE-2024-88888"].metadata["reachability_basis"] == "not_directly_imported"
     assert dep_by_cve["CVE-2020-14343"].reachability == "reachable"
@@ -251,6 +334,7 @@ def test_offline_osv_cache_kev_epss_and_sound_vex_generation(tmp_path: Path):
     stmts = {s["vulnerability"]["name"]: s for s in openvex["statements"]}
     assert stmts["CVE-2024-99999"]["status"] == "not_affected"
     assert stmts["CVE-2024-99999"]["justification"] == "vulnerable_code_not_in_execute_path"
+    assert stmts["CVE-2023-45803"]["status"] == "under_investigation"
     assert stmts["CVE-2024-88888"]["status"] == "under_investigation"
     assert stmts["CVE-2020-14343"]["status"] == "affected"
 

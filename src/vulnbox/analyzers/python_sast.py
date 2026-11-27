@@ -11,6 +11,7 @@ from vulnbox.analyzers.base import (
     make_finding_id,
     safe_ast_parse,
 )
+from vulnbox.analyzers.lockfiles import compare_versions, parse_python_dependencies
 from vulnbox.analyzers.taint import PythonTaintTracker
 from vulnbox.models import Finding, Severity
 
@@ -86,10 +87,17 @@ def _contains_sql_keyword(node: ast.AST) -> bool:
 
 
 class _PythonSecurityVisitor(ast.NodeVisitor):
-    def __init__(self, rel_path: str, lines: list[str], source: str = "") -> None:
+    def __init__(
+        self,
+        rel_path: str,
+        lines: list[str],
+        source: str = "",
+        lxml_is_v5_plus: bool = False,
+    ) -> None:
         self.rel_path = rel_path
         self.lines = lines
         self.source = source
+        self.lxml_is_v5_plus = lxml_is_v5_plus
         self.findings: list[Finding] = []
         self._func_stack: list[ast.FunctionDef | ast.AsyncFunctionDef] = []
         self._taint_stack: list[PythonTaintTracker] = []
@@ -569,20 +577,31 @@ class _PythonSecurityVisitor(ast.NodeVisitor):
                 )
                 is_lxml_parser = resolved_call.startswith("lxml.")
                 if has_explicit_true or (is_lxml_parser and not has_explicit_false):
+                    parser_sev: Severity = (
+                        "high" if (has_explicit_true or not self.lxml_is_v5_plus) else "low"
+                    )
+                    parser_msg = (
+                        "XMLParser explicitly sets resolve_entities=True, exposing the app to XXE."
+                        if has_explicit_true
+                        else (
+                            "lxml >= 5.0 disables external entity resolution by default, but passing "
+                            "resolve_entities=False, no_network=True explicitly is recommended defense-in-depth."
+                            if self.lxml_is_v5_plus
+                            else "lxml XMLParser enables or fails to disable external entity resolution "
+                            "(resolve_entities=False), exposing the application to XXE file disclosure/SSRF."
+                        )
+                    )
                     self._add(
                         rule_id="PY-XXE-001",
                         cwe_id="CWE-611",
                         title="XXE Risk via lxml XMLParser Without resolve_entities=False",
-                        severity="high",
+                        severity=parser_sev,
                         node=node,
-                        message=(
-                            "lxml XMLParser enables or fails to disable external entity resolution "
-                            "(resolve_entities=False), exposing the application to XXE file disclosure/SSRF."
-                        ),
+                        message=parser_msg,
                         recommended_fix="Instantiate lxml.etree.XMLParser(resolve_entities=False, no_network=True, load_dtd=False) or use defusedxml.",
-                        metadata={"call": resolved_call},
+                        metadata={"call": resolved_call, "lxml_v5_plus": self.lxml_is_v5_plus},
                     )
-            # 2. High-severity XXE: lxml.etree.parse / fromstring / XML / iterparse without safe parser=
+            # 2. XXE: lxml.etree.parse / fromstring / XML / iterparse without safe parser=
             elif resolved_call in (
                 "lxml.etree.parse",
                 "lxml.etree.fromstring",
@@ -602,18 +621,23 @@ class _PythonSecurityVisitor(ast.NodeVisitor):
                         ):
                             safe_parser_arg = True
                 if not safe_parser_arg:
+                    lxml_sev: Severity = "low" if self.lxml_is_v5_plus else "high"
+                    lxml_msg = (
+                        f"{resolved_call}() uses lxml's default parser (lxml >= 5.0 disables external "
+                        "entities by default; pass resolve_entities=False, no_network=True for defense-in-depth)."
+                        if self.lxml_is_v5_plus
+                        else f"{resolved_call}() parses XML without a hardened parser "
+                        "(resolve_entities=False, no_network=True)."
+                    )
                     self._add(
                         rule_id="PY-XXE-001",
                         cwe_id="CWE-611",
                         title="XML External Entity (XXE) via lxml.etree Default Parser",
-                        severity="high",
+                        severity=lxml_sev,
                         node=node,
-                        message=(
-                            f"{resolved_call}() parses XML without a hardened parser "
-                            "(resolve_entities=False, no_network=True)."
-                        ),
+                        message=lxml_msg,
                         recommended_fix="Pass parser=lxml.etree.XMLParser(resolve_entities=False, no_network=True, load_dtd=False) or use defusedxml.",
-                        metadata={"call": resolved_call},
+                        metadata={"call": resolved_call, "lxml_v5_plus": self.lxml_is_v5_plus},
                     )
             # 3. Low-severity entity-expansion DoS: stdlib xml.* (expat disables external entities since Python 3.7.1)
             elif resolved_call in (
@@ -786,6 +810,16 @@ class PythonSASTAnalyzer:
 
     def analyze(self, workspace_dir: Path) -> list[Finding]:
         findings: list[Finding] = []
+        # Detect whether lockfile/manifest pins lxml >= 5.0 (which disables external entities by default)
+        lxml_versions = [
+            d.version
+            for d in parse_python_dependencies(workspace_dir)
+            if d.name == "lxml" and d.is_lockfile
+        ]
+        lxml_is_v5_plus = bool(lxml_versions) and all(
+            compare_versions(v, "5.0", ecosystem="python") >= 0 for v in lxml_versions
+        )
+
         for py_file in iter_source_files(workspace_dir, (".py",)):
             try:
                 source = py_file.read_text(encoding="utf-8", errors="ignore")
@@ -793,7 +827,12 @@ class PythonSASTAnalyzer:
             except (OSError, SyntaxError):
                 continue
             rel = str(py_file.relative_to(workspace_dir))
-            visitor = _PythonSecurityVisitor(rel, source.splitlines(), source=source)
+            visitor = _PythonSecurityVisitor(
+                rel,
+                source.splitlines(),
+                source=source,
+                lxml_is_v5_plus=lxml_is_v5_plus,
+            )
             visitor.visit(tree)
             findings.extend(visitor.findings)
         return findings

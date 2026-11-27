@@ -55,18 +55,19 @@ def _statement_state(
         )
 
     basis = str(finding.metadata.get("reachability_basis") or "")
+    rev_deps = finding.metadata.get("reverse_dependents") or []
     has_direct_proof = (
         finding.reachability == "not_reachable"
-        and basis != "not_directly_imported"
-        and (basis == "imported_safe_symbols_only" or bool(finding.metadata.get("citations")))
+        and basis in ("imported_safe_symbols_no_dependents", "imported_safe_symbols_only")
+        and not rev_deps
     )
     if has_direct_proof:
         return (
             "not_affected",
             "vulnerable_code_not_in_execute_path",
             "not_affected",
-            f"VulnBox AST/call-graph analysis confirmed '{finding.metadata.get('package', 'package')}' "
-            f"is directly imported using only non-vulnerable APIs (vulnerable symbols not invoked).",
+            f"VulnBox AST/lockfile analysis confirmed '{finding.metadata.get('package', 'package')}' "
+            f"has no reverse dependents in the lockfile and is directly imported using only non-vulnerable APIs.",
             False,
         )
 
@@ -89,7 +90,13 @@ def _statement_state(
             False,
         )
 
-    if basis == "not_directly_imported":
+    if basis == "imported_safe_symbols_but_has_dependents":
+        dep_list_str = f" ({', '.join(rev_deps[:5])})" if rev_deps else ""
+        triage_msg = (
+            f"Application code does not invoke vulnerable symbols directly, but other dependencies{dep_list_str} "
+            "may call the vulnerable code transitively; cannot prove not_affected without full transitive call graph."
+        )
+    elif basis == "not_directly_imported":
         triage_msg = (
             "Package is not directly imported in application source, but may be invoked transitively "
             "or via an indirect import alias; requires transitive/runtime verification before marking not_affected."

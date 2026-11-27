@@ -26,6 +26,7 @@ from vulnbox.llm.guardrails import (
 )
 from vulnbox.models import DynamicProbeSpec, Finding, MockRule
 from vulnbox.reporting.vex import build_cyclonedx_vex, build_openvex
+from vulnbox.sandbox.docker_backend import DockerSandboxBackend
 from vulnbox.suppressions import should_fail_ci
 
 MCP_PROTOCOL_VERSION = "2024-11-05"
@@ -109,19 +110,19 @@ def _resolve_mcp_backend(
     allow_local: bool,
     executes_repo_code: bool,
 ) -> str:
-    """Enforce Docker containment by default for MCP tool calls.
+    """Enforce Docker containment for any MCP tool that executes repository code.
 
-    Refuses `local` (and never silently falls back from `auto` to `local`) unless the MCP
-    server was explicitly started with `--allow-local`. Purely static `vulnbox_scan`
-    (deep=False, check_leaks=False) does not execute repository code; if `backend` is omitted
-    and Docker is unavailable, it still refuses `local` when `executes_repo_code=True`.
+    - Purely static scans (`executes_repo_code=False`, i.e. `vulnbox_scan` with `deep=False`
+      and `check_leaks=False`) never execute repository code, so they may run without Docker.
+    - Any tool that executes repository code (`deep=True`, `check_leaks=True`, `vulnbox_probe`,
+      `vulnbox_verify_patch`) defaults to `docker` and refuses `local` (and silent `auto`
+      fallback) unless the server was explicitly started with `vulnbox mcp --allow-local`.
     """
     pref = str(requested or "docker").strip().lower()
     if pref == "auto":
-        # Never allow silent fallback to host-local execution under MCP
         pref = "docker"
     if pref == "local":
-        if not allow_local:
+        if executes_repo_code and not allow_local:
             raise PermissionError(
                 "MCP server refuses '--backend local' host execution by default because local "
                 "mode is not a kernel/filesystem containment boundary. Use backend='docker' "
@@ -129,8 +130,13 @@ def _resolve_mcp_backend(
             )
         return "local"
     if pref == "docker":
+        if not executes_repo_code and not DockerSandboxBackend().is_available():
+            # Static-only scan never spawns repo code; safe to run without Docker daemon
+            return "local"
         return "docker"
-    raise ValueError(f"Unsupported MCP backend {requested!r}. Allowed: 'docker' (or 'local' with --allow-local).")
+    raise ValueError(
+        f"Unsupported MCP backend {requested!r}. Allowed: 'docker' (or 'local' with --allow-local)."
+    )
 
 
 def _enforce_guardrail(ev_decision: str, gate: str, reason: str) -> None:

@@ -79,6 +79,14 @@ _PY_NON_TAINTED_ANNOTATIONS = frozenset(
     }
 )
 _PY_DI_CALLS = frozenset({"Depends", "Security", "fastapi.Depends", "fastapi.Security"})
+_PY_EARLY_EXIT_CALLS = frozenset(
+    {
+        "abort",
+        "flask.abort",
+        "werkzeug.exceptions.abort",
+        "sys.exit",
+    }
+)
 _PY_PATH_SANITIZER_CALLS = frozenset(
     {
         "os.path.basename",
@@ -95,6 +103,11 @@ _PY_XSS_SANITIZER_CALLS = frozenset(
     }
 )
 _SINK_KINDS = ("path", "ssrf", "redirect", "xss", "nosql")
+
+# Safe allowlist-only regex tokens for path segment validation (no `.`, `/`, `\`, or negated classes `[^...]`)
+_SAFE_PATH_REGEX_BODY_RE = re.compile(
+    r"^(?:\\w|\\d|[A-Za-z0-9_-]|\[[A-Za-z0-9_-]+\]|[+*?{}0-9,()|])+$"
+)
 
 
 def _dotted(node: ast.AST) -> str:
@@ -122,7 +135,6 @@ def _is_di_default(default_expr: ast.AST | None) -> bool:
 def _is_non_tainted_annotation(ann: ast.AST | None) -> bool:
     if ann is None:
         return False
-    # Handle Annotated[User, Depends(get_current_user)]
     for sub in ast.walk(ann):
         if isinstance(sub, ast.Call):
             cname = _dotted(sub.func)
@@ -134,13 +146,10 @@ def _is_non_tainted_annotation(ann: ast.AST | None) -> bool:
 
 
 def _has_trailing_path_separator(arg: ast.AST) -> bool:
-    """Return True iff `arg` enforces a directory boundary separator (e.g. `base + os.sep` or `f'{base}/'`).
-
-    Plain `resolved.startswith(base)` without a separator allows sibling-directory bypass
-    (`/srv/data2` passes `.startswith('/srv/data')`).
-    """
+    """Return True iff `arg` enforces a directory boundary separator (e.g. `base + os.sep` or `f'{base}/'`)."""
     if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
-        return arg.value.endswith(("/", "\\"))
+        # Must be a non-trivial path prefix ending in separator (not bare "/" which matches every absolute path)
+        return len(arg.value) > 1 and arg.value.endswith(("/", "\\"))
     if isinstance(arg, ast.BinOp) and isinstance(arg.op, ast.Add):
         right = arg.right
         if isinstance(right, ast.Constant) and isinstance(right.value, str) and right.value in ("/", "\\"):
@@ -160,10 +169,79 @@ def _has_trailing_path_separator(arg: ast.AST) -> bool:
     return False
 
 
-def _is_full_anchored_regex(pattern_arg: ast.AST) -> bool:
-    if isinstance(pattern_arg, ast.Constant) and isinstance(pattern_arg.value, str):
-        p = pattern_arg.value
-        return p.endswith("$") or p.endswith(r"\Z")
+def _is_safe_path_regex(pattern_arg: ast.AST, *, require_end_anchor: bool = False) -> bool:
+    """Return True only when `pattern_arg` is a restrictive allowlist regex that cannot match `/` or `..`."""
+    if not (isinstance(pattern_arg, ast.Constant) and isinstance(pattern_arg.value, str)):
+        return False
+    p = pattern_arg.value
+    if require_end_anchor and not (p.endswith("$") or p.endswith(r"\Z")):
+        return False
+    body = p
+    if body.startswith("^"):
+        body = body[1:]
+    elif body.startswith(r"\A"):
+        body = body[2:]
+    if body.endswith("$"):
+        body = body[:-1]
+    elif body.endswith(r"\Z"):
+        body = body[:-2]
+    if not body:
+        return False
+    # Reject wildcards, dots (could allow `..`), slashes, backslashes, or negated classes `[^...]`
+    if "." in body or "/" in body or "[^" in body:
+        return False
+    return bool(_SAFE_PATH_REGEX_BODY_RE.fullmatch(body))
+
+
+def _startswith_arg_checks_prefix(arg: ast.AST, prefix: str) -> bool:
+    if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+        return arg.value == prefix
+    if isinstance(arg, (ast.Tuple, ast.List)):
+        return any(
+            isinstance(elt, ast.Constant) and isinstance(elt.value, str) and elt.value == prefix
+            for elt in arg.elts
+        )
+    return False
+
+
+def _extract_startswith_info(expr: ast.AST) -> tuple[str | None, ast.AST | None]:
+    if isinstance(expr, ast.Call):
+        cname = _dotted(expr.func)
+        if (cname.endswith(".startswith") or cname == "startswith") and expr.args:
+            recv = expr.func.value if isinstance(expr.func, ast.Attribute) else None
+            if isinstance(recv, ast.Name):
+                return recv.id, expr.args[0]
+    return None, None
+
+
+def _has_host_or_netloc_attr(expr: ast.AST) -> bool:
+    return any(
+        isinstance(s, ast.Attribute) and s.attr in ("hostname", "netloc")
+        for s in ast.walk(expr)
+    )
+
+
+def _rejects_protocol_relative(expr: ast.AST, var_name: str) -> bool:
+    """Check whether `expr` (holding True) rejects protocol-relative `//` or `/\\` URLs for `var_name`."""
+    # Pattern 1: `not x.startswith("//")` or `not x.startswith(("//", "/\\"))`
+    if isinstance(expr, ast.UnaryOp) and isinstance(expr.op, ast.Not):
+        recv_name, arg = _extract_startswith_info(expr.operand)
+        if recv_name == var_name and arg is not None and _startswith_arg_checks_prefix(arg, "//"):
+            return True
+    # Pattern 2: `x[1] != "/"` or `x[1] not in ("/", "\\")`
+    if isinstance(expr, ast.Compare) and len(expr.ops) == 1:
+        if isinstance(expr.ops[0], (ast.NotEq, ast.NotIn)) and isinstance(expr.left, ast.Subscript):
+            if isinstance(expr.left.value, ast.Name) and expr.left.value.id == var_name:
+                return True
+    # Pattern 3: `not urlparse(x).netloc` / `urlparse(x).netloc == ""`
+    if isinstance(expr, ast.UnaryOp) and isinstance(expr.op, ast.Not):
+        if isinstance(expr.operand, ast.Attribute) and expr.operand.attr == "netloc":
+            if var_name in _expr_names(expr.operand):
+                return True
+    if isinstance(expr, ast.Compare) and len(expr.ops) == 1 and isinstance(expr.ops[0], ast.Eq):
+        if any(isinstance(s, ast.Attribute) and s.attr == "netloc" for s in ast.walk(expr)) and var_name in _expr_names(expr):
+            if any(isinstance(c, ast.Constant) and c.value == "" for c in expr.comparators):
+                return True
     return False
 
 
@@ -173,6 +251,10 @@ def _block_always_exits(stmts: list[ast.stmt]) -> bool:
     last = stmts[-1]
     if isinstance(last, (ast.Return, ast.Raise, ast.Continue, ast.Break)):
         return True
+    if isinstance(last, ast.Expr) and isinstance(last.value, ast.Call):
+        cname = _dotted(last.value.func)
+        if cname in _PY_EARLY_EXIT_CALLS or cname.endswith(".abort"):
+            return True
     if isinstance(last, ast.If) and last.orelse:
         return _block_always_exits(last.body) and _block_always_exits(last.orelse)
     return False
@@ -257,10 +339,24 @@ class PythonTaintTracker:
         """Extract sink barriers implied when `expr` evaluates to True (positive polarity)."""
         guards: dict[str, set[str]] = {k: set() for k in _SINK_KINDS}
         if isinstance(expr, ast.BoolOp) and isinstance(expr.op, ast.And):
+            slash_vars: set[str] = set()
             for val in expr.values:
                 sub_g = self._extract_atomic_guards(val, resolved_vars)
                 for k, vs in sub_g.items():
                     guards[k].update(vs)
+                recv_name, sw_arg = _extract_startswith_info(val)
+                if recv_name and sw_arg is not None and _startswith_arg_checks_prefix(sw_arg, "/"):
+                    slash_vars.add(recv_name)
+            # Open-redirect requires BOTH `x.startswith("/")` AND protocol-relative `//` (or netloc) rejection
+            for v in slash_vars:
+                if any(_rejects_protocol_relative(val, v) for val in expr.values):
+                    guards["redirect"].add(v)
+            return guards
+
+        if isinstance(expr, ast.UnaryOp) and isinstance(expr.op, ast.Not):
+            # `not parsed.netloc` -> relative URL only (safe for redirect)
+            if isinstance(expr.operand, ast.Attribute) and expr.operand.attr == "netloc":
+                guards["redirect"].update(_expr_names(expr.operand))
             return guards
 
         if isinstance(expr, ast.Call):
@@ -271,22 +367,18 @@ class PythonTaintTracker:
             elif cname.endswith(".startswith") or cname == "startswith":
                 recv = expr.func.value if isinstance(expr.func, ast.Attribute) else None
                 recv_name = recv.id if isinstance(recv, ast.Name) else None
-                # Path confinement requires a resolved path AND a trailing separator (`+ os.sep` / `'/'`)
+                # Path confinement requires a resolved path AND a non-trivial trailing separator (`base + os.sep`)
                 if expr.args and _has_trailing_path_separator(expr.args[0]):
                     if recv_name and recv_name in resolved_vars:
                         guards["path"].add(recv_name)
                     elif recv is not None and self._is_path_resolve_expr(recv):
                         guards["path"].update(_expr_names(recv))
-                # Open-redirect guard: target.startswith("/")
-                if expr.args and isinstance(expr.args[0], ast.Constant) and expr.args[0].value == "/":
-                    if recv_name:
-                        guards["redirect"].add(recv_name)
+                # Bare `x.startswith("/")` is NOT sufficient for open redirect (`//evil.com` bypasses it)
             elif cname == "re.fullmatch":
-                if len(expr.args) >= 2:
+                if len(expr.args) >= 2 and _is_safe_path_regex(expr.args[0], require_end_anchor=False):
                     guards["path"].update(_expr_names(expr.args[1]))
             elif cname == "re.match":
-                # re.match only checks a prefix unless explicitly end-anchored with `$` or `\Z`
-                if len(expr.args) >= 2 and _is_full_anchored_regex(expr.args[0]):
+                if len(expr.args) >= 2 and _is_safe_path_regex(expr.args[0], require_end_anchor=True):
                     guards["path"].update(_expr_names(expr.args[1]))
             elif cname.endswith("_RE.fullmatch"):
                 if expr.args:
@@ -294,21 +386,27 @@ class PythonTaintTracker:
             elif cname in ("is_fetch_url_allowed", "validate_loopback_url", "is_safe_url"):
                 guards["ssrf"].update(names)
                 guards["redirect"].update(names)
-        elif isinstance(expr, ast.Compare):
+        elif isinstance(expr, ast.Compare) and len(expr.ops) == 1:
+            op = expr.ops[0]
             # os.path.commonpath([base, target]) == base
             if (
-                len(expr.ops) == 1
-                and isinstance(expr.ops[0], ast.Eq)
+                isinstance(op, ast.Eq)
                 and isinstance(expr.left, ast.Call)
                 and _dotted(expr.left.func) in ("os.path.commonpath", "commonpath")
             ):
                 guards["path"].update(_expr_names(expr.left))
-            else:
-                names = _expr_names(expr)
-                src_names = {_dotted(s) for s in ast.walk(expr) if isinstance(s, ast.Attribute)}
-                if any(s.endswith(".hostname") or s.endswith(".netloc") for s in src_names):
-                    guards["ssrf"].update(names)
-                    guards["redirect"].update(names)
+            # Positive allowlist ONLY (`==` or `in`) on `.hostname` / `.netloc`; never `!=` / `not in` blocklists
+            elif isinstance(op, (ast.Eq, ast.In)):
+                if _has_host_or_netloc_attr(expr):
+                    names = _expr_names(expr)
+                    is_empty_netloc = isinstance(op, ast.Eq) and any(
+                        isinstance(c, ast.Constant) and c.value == "" for c in expr.comparators
+                    )
+                    if is_empty_netloc:
+                        guards["redirect"].update(names)
+                    else:
+                        guards["ssrf"].update(names)
+                        guards["redirect"].update(names)
         return guards
 
     def _extract_test_guards(
@@ -317,21 +415,58 @@ class PythonTaintTracker:
         resolved_vars: set[str],
     ) -> tuple[dict[str, set[str]], dict[str, set[str]]]:
         """Return `(true_branch_guards, false_branch_guards)` for an `if <test>:` condition."""
+        empty_true: dict[str, set[str]] = {k: set() for k in _SINK_KINDS}
+        empty_false: dict[str, set[str]] = {k: set() for k in _SINK_KINDS}
+
         if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not):
-            # `if not <safe_cond>:` -> `<safe_cond>` holds in the FALSE branch (and after early-exit)
-            return {k: set() for k in _SINK_KINDS}, self._extract_atomic_guards(
-                test.operand, resolved_vars
-            )
+            # `if not <safe_cond>:` -> `<safe_cond>` holds in the FALSE branch (and after early exit)
+            return empty_true, self._extract_atomic_guards(test.operand, resolved_vars)
+
+        # `if parsed.hostname not in ALLOWED_HOSTS: raise/abort` -> FALSE branch guarantees `in ALLOWED_HOSTS`
+        if (
+            isinstance(test, ast.Compare)
+            and len(test.ops) == 1
+            and isinstance(test.ops[0], ast.NotIn)
+        ):
+            if _has_host_or_netloc_attr(test):
+                names = _expr_names(test)
+                empty_false["ssrf"].update(names)
+                empty_false["redirect"].update(names)
+                return empty_true, empty_false
+
         if isinstance(test, ast.BoolOp) and isinstance(test.op, ast.Or):
-            # `if not A or not B: raise` -> both A and B hold in the FALSE branch
-            false_g: dict[str, set[str]] = {k: set() for k in _SINK_KINDS}
+            # `if not A or not B: raise` -> both A and B hold in FALSE branch;
+            # also `if not x.startswith("/") or x.startswith("//"): abort(400)` -> redirect-safe in FALSE branch
+            slash_vars_false: set[str] = set()
+            dbl_slash_rejected_false: set[str] = set()
             for val in test.values:
                 if isinstance(val, ast.UnaryOp) and isinstance(val.op, ast.Not):
                     sub_g = self._extract_atomic_guards(val.operand, resolved_vars)
                     for k, vs in sub_g.items():
-                        false_g[k].update(vs)
-            return {k: set() for k in _SINK_KINDS}, false_g
-        return self._extract_atomic_guards(test, resolved_vars), {k: set() for k in _SINK_KINDS}
+                        empty_false[k].update(vs)
+                    rname, sw_arg = _extract_startswith_info(val.operand)
+                    if rname and sw_arg is not None and _startswith_arg_checks_prefix(sw_arg, "/"):
+                        slash_vars_false.add(rname)
+                else:
+                    # In `if x.startswith("//") or ...: abort`, FALSE branch guarantees `not x.startswith("//")`
+                    rname, sw_arg = _extract_startswith_info(val)
+                    if rname and sw_arg is not None and _startswith_arg_checks_prefix(sw_arg, "//"):
+                        dbl_slash_rejected_false.add(rname)
+                    elif (
+                        isinstance(val, ast.Compare)
+                        and len(val.ops) == 1
+                        and isinstance(val.ops[0], ast.NotIn)
+                    ):
+                        _, fg = self._extract_test_guards(val, resolved_vars)
+                        for k, vs in fg.items():
+                            empty_false[k].update(vs)
+                    elif isinstance(val, ast.Attribute) and val.attr == "netloc":
+                        empty_false["redirect"].update(_expr_names(val))
+            for v in slash_vars_false & dbl_slash_rejected_false:
+                empty_false["redirect"].add(v)
+            return empty_true, empty_false
+
+        return self._extract_atomic_guards(test, resolved_vars), empty_false
 
     def _snapshot_subtree(
         self,
@@ -395,7 +530,6 @@ class PythonTaintTracker:
         for tgt in targets:
             if isinstance(tgt, ast.Name):
                 var = tgt.id
-                # Reassignment invalidates any prior sanitization or resolution state on `var`
                 for svars in sanitized.values():
                     svars.discard(var)
                 resolved_vars.discard(var)
@@ -408,7 +542,6 @@ class PythonTaintTracker:
 
                 if propagated:
                     tainted[var] = propagated
-                    # Inherit sanitizer state only if NOT a fresh direct source and ALL tainted inputs were sanitized
                     if src is None:
                         tainted_inputs = [n for n in val_names if n in tainted and n != var]
                         if tainted_inputs:
@@ -435,7 +568,6 @@ class PythonTaintTracker:
         resolved_vars: set[str],
     ) -> None:
         for stmt in stmts:
-            # Skip nested function/class definitions (analyzed with their own tracker)
             if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                 continue
 
@@ -454,7 +586,6 @@ class PythonTaintTracker:
                 body_exits = _block_always_exits(stmt.body)
                 else_exits = _block_always_exits(stmt.orelse)
                 if body_exits and not else_exits:
-                    # Guarded early exit (`if not safe: raise/return`): false_g holds for remaining block
                     tainted.clear()
                     tainted.update(else_t)
                     for k in _SINK_KINDS:
@@ -469,7 +600,6 @@ class PythonTaintTracker:
                     resolved_vars.clear()
                     resolved_vars.update(body_r)
                 else:
-                    # Merge: taint is union (conservative); sanitization is intersection (must hold on ALL paths)
                     for var, origin in body_t.items():
                         tainted.setdefault(var, origin)
                     for var, origin in else_t.items():
@@ -522,7 +652,6 @@ class PythonTaintTracker:
                 self._walk_stmts(stmt.finalbody, tainted, sanitized, resolved_vars)
                 continue
 
-            # All other statements (Return, Raise, Assert, etc.)
             if isinstance(stmt, ast.Assert):
                 self._snapshot_subtree(stmt, tainted, sanitized)
                 pos_g, _ = self._extract_test_guards(stmt.test, resolved_vars)
@@ -583,6 +712,14 @@ _JS_TAINT_SOURCE_RE = re.compile(
     r"|\bnew\s+URLSearchParams\s*\(\s*(?:(?:window\.|document\.)?location\.(?:search|hash|href)|(?:req|request)\.(?:url|originalUrl|query))"
 )
 _JS_IDENT_RE = re.compile(r"\b[A-Za-z_$][A-Za-z0-9_$]*\b")
+_JS_PATH_SEP_GUARD_RE = re.compile(
+    r"\.startsWith\s*\([^)]*(?:path\.sep|\+\s*['\"]/['\"]|\$\{[^}]+\}/|['\"][^'\"]+['\"]\s*\+\s*['\"]/['\"])"
+)
+_JS_SAFE_REDIRECT_GUARD_RE = re.compile(
+    r"(?:startsWith\s*\(\s*['\"]/['\"]\s*\)[\s\S]*startsWith\s*\(\s*['\"]//['\"]\s*\))"
+    r"|(?:startsWith\s*\(\s*['\"]/['\"]\s*\)[\s\S]*(?:\[\s*1\s*\]\s*!==?\s*['\"]/['\"]|replace|URL\())"
+    r"|(?:/\^\\/\[\^/\\\\\]/)"
+)
 
 
 def _js_block_exits(stmt_node: Any, raw: bytes) -> bool:
@@ -604,7 +741,6 @@ class JsTaintTracker:
 
     def _analyze(self) -> None:
         has_path_resolve = "path.resolve(" in self.scope_text
-        # Single AST walk in source order to handle declarations, reassignments, and scoped if-guards
         for node in walk_nodes(self.scope_node):
             if node.type == "variable_declarator":
                 name_n = node.child_by_field_name("name")
@@ -627,7 +763,6 @@ class JsTaintTracker:
                 is_negated = ctxt.lstrip("( \t").startswith("!")
                 cons_exits = _js_block_exits(cons, self.raw)
 
-                # Scope guard to either the `consequence` block or, if negated early-exit, rest of parent block
                 if is_negated and cons_exits and node.parent is not None:
                     start_b = cons.end_byte
                     end_b = node.parent.end_byte
@@ -637,14 +772,13 @@ class JsTaintTracker:
                 else:
                     continue
 
-                # Path startsWith requires a trailing separator (`+ path.sep` / `+ '/'` / `'/...'`)
-                if (
-                    ".startsWith(" in ctxt
-                    and (has_path_resolve or "path.relative(" in ctxt)
-                    and ("path.sep" in ctxt or "+ '/'" in ctxt or '+ "/"' in ctxt or "/')" in ctxt or '/")' in ctxt)
+                # Path confinement requires resolved base + explicit separator (NEVER bare `p.startsWith('/')`)
+                if has_path_resolve and (
+                    _JS_PATH_SEP_GUARD_RE.search(ctxt) or "path.relative(" in ctxt
                 ):
                     self._guard_ranges.append((start_b, end_b, "path", idents))
-                if "startsWith('/')" in ctxt or 'startsWith("/")' in ctxt:
+                # Open-redirect guard requires BOTH `/` prefix AND `//` protocol-relative rejection
+                if _JS_SAFE_REDIRECT_GUARD_RE.search(ctxt):
                     self._guard_ranges.append((start_b, end_b, "redirect", idents))
                 if any(tok in ctxt for tok in ("allowedHosts", "allowedOrigins", "isAllowedUrl", "ALLOWED_HOSTS")):
                     self._guard_ranges.append((start_b, end_b, "ssrf", idents))
@@ -667,7 +801,6 @@ class JsTaintTracker:
         )
         if name_n.type == "identifier":
             var = node_text(name_n, self.raw)
-            # Invalidate prior sanitization on reassignment
             for svars in self.sanitized.values():
                 svars.discard(var)
             if is_path_san:

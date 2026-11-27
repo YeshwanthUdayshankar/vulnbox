@@ -36,19 +36,7 @@
                           "required": ["text"],
                           "properties": { "text": { "type": "string" } }
                         },
-                        "suppressions": {
-                  "type": "array",
-                  "items": {
-                    "type": "object",
-                    "required": ["kind"],
-                    "properties": {
-                      "kind": { "type": "string" },
-                      "status": { "type": "string" },
-                      "justification": { "type": "string" }
-                    }
-                  }
-                },
-                "properties": { "type": "object" }
+                        "properties": { "type": "object" }
                       }
                     }
                   }

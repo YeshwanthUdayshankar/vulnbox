@@ -66,6 +66,22 @@ BUILTIN_GO_ADVISORIES: list[Advisory] = [
         vulnerable_symbols=["ConfigureServer", "Server.ServeConn"],
     ),
     Advisory(
+        advisory_id="GO-2023-2102-STDLIB",
+        ecosystem="go",
+        package="stdlib",
+        affected_below="1.21.3",
+        fixed_version="1.21.3",
+        affected_ranges=[
+            {"introduced": "0", "fixed": "1.20.10"},
+            {"introduced": "1.21.0", "fixed": "1.21.3"},
+        ],
+        severity="high",
+        cwe_id="CWE-400",
+        title="HTTP/2 Rapid Reset DoS in Go net/http stdlib",
+        imports=["net/http"],
+        vulnerable_symbols=["ListenAndServe", "ListenAndServeTLS", "Server.Serve"],
+    ),
+    Advisory(
         advisory_id="GO-2024-2687",
         ecosystem="go",
         package="golang.org/x/net",
@@ -163,23 +179,32 @@ def _check_go_symbol_reachability(
     import_paths: list[str],
     module_path: str,
     vulnerable_symbols: list[str],
+    *,
+    has_other_dependents: bool = False,
 ) -> tuple[ReachabilityStatus, list[str], str]:
-    """Check Go package import + OSV symbol-level reachability across `.go` source files."""
+    """Check Go package import + alias-qualified OSV symbol reachability across `.go` source files."""
     imported_files: list[str] = []
     symbol_citations: list[str] = []
     target_paths = set(import_paths)
 
-    # Normalize OSV Go symbols (e.g. `Server.ServeConn` -> `ServeConn`, `ConfigureServer` -> `ConfigureServer`)
-    sym_tails = [s.rsplit(".", 1)[-1] for s in vulnerable_symbols if s]
-    sym_patterns = [(s, re.compile(rf"\b{re.escape(s)}\s*\(")) for s in sym_tails]
+    # Split OSV symbols into top-level functions (`ConfigureServer`) vs type methods (`Server.ServeConn`)
+    func_syms: list[str] = []
+    method_syms: list[tuple[str, str]] = []
+    for raw_sym in vulnerable_symbols:
+        if not raw_sym:
+            continue
+        if "." in raw_sym:
+            tname, mname = raw_sym.rsplit(".", 1)
+            method_syms.append((tname, mname))
+        else:
+            func_syms.append(raw_sym)
 
     for rel, source, imp_map in go_sources:
         matched_aliases: list[str] = []
         for alias, imp_path in imp_map.items():
             if (
                 imp_path in target_paths
-                or imp_path == module_path
-                or imp_path.startswith(f"{module_path}/")
+                or (module_path != "stdlib" and (imp_path == module_path or imp_path.startswith(f"{module_path}/")))
                 or any(imp_path.startswith(f"{tp}/") for tp in target_paths)
             ):
                 matched_aliases.append(alias)
@@ -188,20 +213,32 @@ def _check_go_symbol_reachability(
             continue
         imported_files.append(rel)
 
-        if not sym_patterns:
+        if not vulnerable_symbols:
             continue
 
+        dot_imported = "." in matched_aliases
+        named_aliases = [a for a in matched_aliases if a != "."]
         lines = source.splitlines()
+
         for idx, raw_line in enumerate(lines, start=1):
             code = raw_line.split("//", 1)[0]
-            for sym, pat in sym_patterns:
-                # Match either `alias.Symbol(` or method call `.Symbol(` when package is imported
+            if not code.strip():
+                continue
+            # Top-level package functions MUST be qualified by an imported package alias (or dot-imported)
+            for sym in func_syms:
                 if any(
                     re.search(rf"\b{re.escape(alias)}\.{re.escape(sym)}\s*\(", code)
-                    for alias in matched_aliases
-                    if alias != "."
-                ) or pat.search(code):
+                    for alias in named_aliases
+                ) or (dot_imported and re.search(rf"\b{re.escape(sym)}\s*\(", code)):
                     symbol_citations.append(f"{rel}:{idx} ({sym})")
+            # Type methods (`Type.Method`) require the vulnerable type to be referenced via the package alias in this file
+            for tname, mname in method_syms:
+                type_used_in_file = any(
+                    re.search(rf"\b{re.escape(alias)}\.{re.escape(tname)}\b", source)
+                    for alias in named_aliases
+                ) or (dot_imported and re.search(rf"\b{re.escape(tname)}\b", source))
+                if type_used_in_file and re.search(rf"\.\s*{re.escape(mname)}\s*\(", code):
+                    symbol_citations.append(f"{rel}:{idx} ({tname}.{mname})")
 
     if not imported_files:
         return "under_investigation", [], "not_directly_imported"
@@ -209,7 +246,9 @@ def _check_go_symbol_reachability(
         return "under_investigation", imported_files, "imported_no_symbol_metadata"
     if symbol_citations:
         return "reachable", sorted(set(symbol_citations)), "symbol_call_confirmed"
-    return "not_reachable", imported_files, "imported_safe_symbols_only"
+    if has_other_dependents:
+        return "under_investigation", imported_files, "imported_safe_symbols_but_has_dependents"
+    return "not_reachable", imported_files, "imported_safe_symbols_no_dependents"
 
 
 class GoSASTAnalyzer:
@@ -414,11 +453,17 @@ class GoSASTAnalyzer:
                         continue
                     effective_fixed = adv.fixed_version or adv.affected_below
 
+                other_mods = [d.name for d in go_deps if d.name not in (adv.package, "stdlib")]
+                is_indirect = "// indirect" in dep.raw_spec.lower()
+                # Other third-party modules in go.mod may call stdlib or shared modules transitively
+                has_other_dependents = is_indirect or bool(other_mods)
+
                 reachability, citations, basis = _check_go_symbol_reachability(
                     go_sources,
                     adv.imports or [adv.package],
                     adv.package,
                     adv.vulnerable_symbols,
+                    has_other_dependents=has_other_dependents,
                 )
                 rule_id = f"DEP-{adv.advisory_id}"
                 is_kev = adv.advisory_id in kev_cves
@@ -439,24 +484,36 @@ class GoSASTAnalyzer:
                     meta["epss_score"] = epss_info["epss"]
                     meta["epss_percentile"] = epss_info["percentile"]
 
+                fix_cmd = (
+                    f"Upgrade Go toolchain in {dep.manifest} to >= go {effective_fixed}."
+                    if adv.package == "stdlib"
+                    else (
+                        f"Run `go get {adv.package}@v{effective_fixed} && go mod tidy`."
+                        if effective_fixed
+                        else f"No fixed version of '{adv.package}' published yet for {adv.advisory_id}."
+                    )
+                )
+
                 findings.append(
                     Finding(
                         finding_id=make_finding_id(rule_id, dep.manifest, dep.line_no),
                         rule_id=rule_id,
                         cwe_id=adv.cwe_id,
-                        title=f"{adv.title} ({adv.package} v{dep.version})",
+                        title=f"{adv.title} ({adv.package} {'go' if adv.package == 'stdlib' else 'v'}{dep.version})",
                         category="dependency",
                         severity=adv.severity,
                         file_path=dep.manifest,
                         start_line=dep.line_no,
                         end_line=dep.line_no,
-                        snippet=f"{dep.manifest}:{dep.line_no}: {dep.name} v{dep.version}",
+                        snippet=f"{dep.manifest}:{dep.line_no}: {dep.name} {dep.version}",
                         message=(
-                            f"Go module '{adv.package}' v{dep.version} (go.mod) is affected by "
-                            f"{adv.advisory_id} (fix: >= v{effective_fixed}). Reachability: {reachability}.{cite_text}"
+                            f"Go {'stdlib' if adv.package == 'stdlib' else 'module'} '{adv.package}' "
+                            f"{dep.version} (go.mod) is affected by {adv.advisory_id} "
+                            f"({'fix: >= ' + effective_fixed if effective_fixed else 'no fix published yet'}). "
+                            f"Reachability: {reachability}.{cite_text}"
                         ),
                         reachability=reachability,
-                        recommended_fix=f"Run `go get {adv.package}@v{effective_fixed} && go mod tidy`.",
+                        recommended_fix=fix_cmd,
                         metadata=meta,
                     )
                 )

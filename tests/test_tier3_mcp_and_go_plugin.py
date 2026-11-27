@@ -33,11 +33,12 @@ def test_mcp_server_defaults_to_docker_refuses_local_by_default_and_enforces_gua
     for tname in ("vulnbox_scan", "vulnbox_probe", "vulnbox_verify_patch"):
         assert tools_by_name[tname]["inputSchema"]["properties"]["backend"]["default"] == "docker"
 
-    # 1. Default MCP (allow_local=False) MUST refuse backend="local"
-    refused = handle_mcp_request(
+    # 1. Default MCP (allow_local=False) ALLOWS pure static vulnbox_scan (no repo code executed)
+    #    even without Docker, but REFUSES executing calls (deep=True, vulnbox_probe, vulnbox_verify_patch) with backend="local"!
+    static_ok = handle_mcp_request(
         {
             "jsonrpc": "2.0",
-            "id": 10,
+            "id": 99,
             "method": "tools/call",
             "params": {
                 "name": "vulnbox_scan",
@@ -45,8 +46,51 @@ def test_mcp_server_defaults_to_docker_refuses_local_by_default_and_enforces_gua
             },
         }
     )
-    assert refused is not None and refused["result"]["isError"] is True
-    assert "--allow-local" in refused["result"]["content"][0]["text"]
+    assert static_ok is not None and static_ok["result"]["isError"] is False
+
+    refused_deep = handle_mcp_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 10,
+            "method": "tools/call",
+            "params": {
+                "name": "vulnbox_scan",
+                "arguments": {
+                    "repo_path": str(FIXTURES / "py_sample_app"),
+                    "backend": "local",
+                    "deep": True,
+                },
+            },
+        }
+    )
+    assert refused_deep is not None and refused_deep["result"]["isError"] is True
+    assert "--allow-local" in refused_deep["result"]["content"][0]["text"]
+
+    refused_probe = handle_mcp_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 101,
+            "method": "tools/call",
+            "params": {
+                "name": "vulnbox_probe",
+                "arguments": {
+                    "repo_path": str(FIXTURES / "py_integrated_app"),
+                    "backend": "local",
+                    "probes": [
+                        {
+                            "probe_id": "p0",
+                            "method": "GET",
+                            "path": "/health",
+                            "vulnerable_expectation": {"status_codes": [200]},
+                            "fixed_expectation": {"status_codes": [200]},
+                        }
+                    ],
+                },
+            },
+        }
+    )
+    assert refused_probe is not None and refused_probe["result"]["isError"] is True
+    assert "--allow-local" in refused_probe["result"]["content"][0]["text"]
 
     # 2. Guardrails MUST block shell injection / inline eval in start_cmd even when allow_local=True
     for bad_cmd in ("python3 -c 'import os; os.system(\"id\")'", "uvicorn app:app; id", "bash -c whoami"):
@@ -212,7 +256,8 @@ def test_reference_go_plugin_pack_sast_reachability_and_gomod_osv_symbols(tmp_pa
         ]
         assert len(dep_reach) == 1 and dep_reach[0].reachability == "reachable"
 
-        # Imported golang.org/x/net/http2 WITHOUT calling ConfigureServer / ServeConn -> not_reachable
+        # Imported golang.org/x/net/http2 calling an UNRELATED other.ConfigureServer() MUST NOT match!
+        # Sole module in go.mod using only safe http2.Transport -> not_reachable
         go_safe = tmp_path / "go_safe"
         go_safe.mkdir()
         (go_safe / "go.mod").write_text(
@@ -220,14 +265,46 @@ def test_reference_go_plugin_pack_sast_reachability_and_gomod_osv_symbols(tmp_pa
             encoding="utf-8",
         )
         (go_safe / "client.go").write_text(
-            'package main\nimport "golang.org/x/net/http2"\nfunc main() { _ = http2.Transport{} }\n',
+            'package main\nimport "golang.org/x/net/http2"\n'
+            "func main() {\n\t_ = http2.Transport{}\n\tother.ConfigureServer()\n}\n",
             encoding="utf-8",
         )
         dep_safe = [
             f for f in run_all_analyzers(go_safe, registry=reg) if f.rule_id == "DEP-GO-2023-2102"
         ]
         assert len(dep_safe) == 1 and dep_safe[0].reachability == "not_reachable"
-        assert dep_safe[0].metadata["reachability_basis"] == "imported_safe_symbols_only"
+        assert dep_safe[0].metadata["reachability_basis"] == "imported_safe_symbols_no_dependents"
+
+        # Multiple modules in go.mod -> other deps might call http2 transitively -> MUST stay under_investigation
+        go_multi = tmp_path / "go_multi"
+        go_multi.mkdir()
+        (go_multi / "go.mod").write_text(
+            "module example.com/multi\n\ngo 1.22\n\nrequire (\n"
+            "\tgolang.org/x/net v0.15.0\n"
+            "\tgithub.com/example/other v1.0.0\n)\n",
+            encoding="utf-8",
+        )
+        (go_multi / "client.go").write_text(
+            'package main\nimport "golang.org/x/net/http2"\nfunc main() { _ = http2.Transport{} }\n',
+            encoding="utf-8",
+        )
+        dep_multi = [
+            f for f in run_all_analyzers(go_multi, registry=reg) if f.rule_id == "DEP-GO-2023-2102"
+        ]
+        assert len(dep_multi) == 1 and dep_multi[0].reachability == "under_investigation"
+
+        # Go stdlib CVE via `go 1.21.1` directive in go.mod (reachable via net/http.ListenAndServe)
+        go_stdlib = tmp_path / "go_stdlib"
+        go_stdlib.mkdir()
+        (go_stdlib / "go.mod").write_text("module example.com/std\n\ngo 1.21.1\n", encoding="utf-8")
+        (go_stdlib / "srv.go").write_text(
+            'package main\nimport "net/http"\nfunc main() { _ = http.ListenAndServe(":8080", nil) }\n',
+            encoding="utf-8",
+        )
+        stdlib_hits = [
+            f for f in run_all_analyzers(go_stdlib, registry=reg) if f.rule_id == "DEP-GO-2023-2102-STDLIB"
+        ]
+        assert len(stdlib_hits) == 1 and stdlib_hits[0].reachability == "reachable"
 
         # Unimported in go.mod -> under_investigation (NEVER false not_affected)
         go_unimp = tmp_path / "go_unimp"
@@ -278,3 +355,13 @@ def test_distribution_and_ci_artifacts_are_hardened():
     threat_model = (REPO_ROOT / "docs" / "threat-model.md").read_text(encoding="utf-8")
     assert "Trust Boundaries" in threat_model and "--network=none" in threat_model
     assert "pull_request_target" in threat_model and "--allow-local" in threat_model
+
+    # SARIF subset schema: suppressions belongs on results[], NOT on tool.driver.rules[]
+    sarif_schema = json.loads(
+        (REPO_ROOT / "src" / "vulnbox" / "schemas" / "sarif_2_1_0.schema.json").read_text(encoding="utf-8")
+    )
+    run_props = sarif_schema["properties"]["runs"]["items"]["properties"]
+    rule_props = run_props["tool"]["properties"]["driver"]["properties"]["rules"]["items"]["properties"]
+    result_props = run_props["results"]["items"]["properties"]
+    assert "suppressions" not in rule_props
+    assert "suppressions" in result_props

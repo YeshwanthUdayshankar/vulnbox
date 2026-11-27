@@ -18,6 +18,7 @@ from vulnbox.analyzers.advisory_feed import (
 from vulnbox.analyzers.base import iter_source_files, make_finding_id, safe_ast_parse
 from vulnbox.analyzers.lockfiles import (
     InstalledPackage,
+    compute_reverse_dependents,
     is_version_below,
     is_version_in_ranges,
     parse_node_dependencies,
@@ -301,11 +302,15 @@ class DependencyReachabilityAnalyzer:
 
         py_index: list[tuple[str, ast.AST]] | None = None
         js_index: list[tuple[str, str, list[str]]] | None = None
+        py_rev_deps, py_graph_known = compute_reverse_dependents(workspace_dir, "python")
+        node_rev_deps, node_graph_known = compute_reverse_dependents(workspace_dir, "node")
 
         for adv in self.advisories:
             if adv.ecosystem not in ("python", "node"):
                 continue
             target_deps = py_deps if adv.ecosystem == "python" else node_deps
+            rev_deps = py_rev_deps if adv.ecosystem == "python" else node_rev_deps
+            graph_known = py_graph_known if adv.ecosystem == "python" else node_graph_known
             for dep in target_deps:
                 pkg = dep.name
                 installed_ver = dep.version
@@ -319,7 +324,7 @@ class DependencyReachabilityAnalyzer:
                     )
                     if not affected:
                         continue
-                    effective_fixed = branch_fixed or adv.fixed_version or "latest patched"
+                    effective_fixed = branch_fixed or adv.fixed_version or ""
                 else:
                     if not adv.affected_below or not _is_version_below(
                         installed_ver, adv.affected_below, ecosystem=adv.ecosystem
@@ -384,10 +389,22 @@ class DependencyReachabilityAnalyzer:
                             if reachability != "reachable":
                                 reachability = "reachable"
 
-                if reachability == "reachable":
+                # Soundness gate: even when app code only calls safe symbols directly,
+                # another dependency in the lockfile (e.g. `requests` calling `urllib3.PoolManager`)
+                # may still call the vulnerable code internally. Only keep `not_reachable` when
+                # we can prove zero other dependencies depend on this package.
+                pkg_dependents = sorted(rev_deps.get(adv.package.lower(), set()))
+                other_deps_present = len({d.name for d in target_deps} - {adv.package.lower()}) > 0
+                has_potential_dependents = (
+                    bool(pkg_dependents) if graph_known else other_deps_present
+                )
+                if reachability == "not_reachable" and has_potential_dependents:
+                    reachability = "under_investigation"
+                    reach_basis = "imported_safe_symbols_but_has_dependents"
+                elif reachability == "reachable":
                     reach_basis = "symbol_call_confirmed"
                 elif reachability == "not_reachable":
-                    reach_basis = "imported_safe_symbols_only"
+                    reach_basis = "imported_safe_symbols_no_dependents"
                 elif citations:
                     reach_basis = "imported_no_symbol_metadata"
                 else:
@@ -416,12 +433,21 @@ class DependencyReachabilityAnalyzer:
                     "reachability_basis": reach_basis,
                     "cisa_kev": is_kev,
                 }
+                if pkg_dependents:
+                    meta["reverse_dependents"] = pkg_dependents
                 if epss_info:
                     meta["epss_score"] = epss_info["epss"]
                     meta["epss_percentile"] = epss_info["percentile"]
                 if call_path:
                     meta["call_path"] = call_path
                     meta["call_path_provenance"] = call_path_provenance
+
+                fix_clause = f"fix: >= {effective_fixed}" if effective_fixed else "no upstream fix published yet"
+                rec_fix = (
+                    f"Upgrade '{adv.package}' in {manifest} to >= {effective_fixed}."
+                    if effective_fixed
+                    else f"No fixed version of '{adv.package}' is published yet for {adv.advisory_id}; apply vendor mitigations or consider an alternative package."
+                )
 
                 findings.append(
                     Finding(
@@ -438,11 +464,11 @@ class DependencyReachabilityAnalyzer:
                         message=(
                             f"Dependency '{adv.package}' version '{installed_ver}' "
                             f"({'lockfile' if dep.is_lockfile else 'manifest range'}) is affected by "
-                            f"{adv.advisory_id} (fix: >= {effective_fixed}). Reachability: {reachability}."
+                            f"{adv.advisory_id} ({fix_clause}). Reachability: {reachability}."
                             f"{risk_text}{cite_text}{path_text}"
                         ),
                         reachability=reachability,
-                        recommended_fix=f"Upgrade '{adv.package}' in {manifest} to >= {effective_fixed}.",
+                        recommended_fix=rec_fix,
                         metadata=meta,
                     )
                 )

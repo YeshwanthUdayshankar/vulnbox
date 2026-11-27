@@ -55,6 +55,20 @@ def test_taint_engine_guard_soundness_reassignment_and_fastapi_depends(tmp_path:
         "    with open(target) as f:\n"
         "        return f.read()\n"
         "\n"
+        "def vulnerable_wildcard_regex(filename):\n"
+        "    if re.fullmatch(r'^.*$', filename):\n"
+        "        target = os.path.join('/srv/public', filename)\n"
+        "        with open(target) as f:\n"
+        "            return f.read()\n"
+        "\n"
+        "def genuinely_safe_abort_guard(filename):\n"
+        "    from flask import abort\n"
+        "    target = os.path.join('/srv/data', filename)\n"
+        "    if not Path(target).resolve().is_relative_to(Path('/srv/data')):\n"
+        "        abort(403)\n"
+        "    with open(target) as f:\n"
+        "        return f.read()\n"
+        "\n"
         "def genuinely_safe_basename(filename):\n"
         "    safe_name = os.path.basename(filename)\n"
         "    target = os.path.join('/srv/public', safe_name)\n"
@@ -70,7 +84,21 @@ def test_taint_engine_guard_soundness_reassignment_and_fastapi_depends(tmp_path:
         "\n"
         "@app.get('/items')\n"
         "def fastapi_depends_not_tainted(cfg=Depends(lambda: 'https://api.internal')):\n"
-        "    return requests.get(cfg).text\n",
+        "    return requests.get(cfg).text\n"
+        "\n"
+        "@app.get('/ssrf-blocklist')\n"
+        "def ssrf_blocklist_not_allowlist(url: str):\n"
+        "    from urllib.parse import urlparse\n"
+        "    if urlparse(url).hostname != '169.254.169.254':\n"
+        "        return requests.get(url).text\n"
+        "\n"
+        "@app.get('/ssrf-allowlist-abort')\n"
+        "def ssrf_allowlist_abort(url: str):\n"
+        "    from urllib.parse import urlparse\n"
+        "    from flask import abort\n"
+        "    if urlparse(url).hostname not in ('api.example.com',):\n"
+        "        abort(403)\n"
+        "    return requests.get(url).text\n",
         encoding="utf-8",
     )
     findings = PythonSASTAnalyzer().analyze(tmp_path)
@@ -80,10 +108,48 @@ def test_taint_engine_guard_soundness_reassignment_and_fastapi_depends(tmp_path:
     assert "vulnerable_prefix_without_sep" in path_fns
     assert "vulnerable_reassigned_after_sanitize" in path_fns
     assert "vulnerable_noop_if_guard" in path_fns
+    assert "vulnerable_wildcard_regex" in path_fns
+    assert "genuinely_safe_abort_guard" not in path_fns
     assert "genuinely_safe_basename" not in path_fns
     assert "genuinely_safe_sep_guard" not in path_fns
-    # FastAPI Depends(...) param MUST NOT trigger PY-SSRF-001
-    assert [f for f in findings if f.rule_id == "PY-SSRF-001"] == []
+    # FastAPI Depends(...) and allowlist+abort MUST NOT trigger PY-SSRF-001,
+    # whereas hostname != '169.254.169.254' blocklist MUST still trigger PY-SSRF-001!
+    ssrf_lines = [f.start_line for f in findings if f.rule_id == "PY-SSRF-001"]
+    assert len(ssrf_lines) == 1
+
+    # JS taint: `if (!p.startsWith('/')) return;` MUST NOT count as path confinement,
+    # and bare `next.startsWith('/')` MUST NOT count as an open-redirect guard!
+    from vulnbox.analyzers.taint import JsTaintTracker
+    from vulnbox.callgraph.ts_utils import parse_source, walk_nodes
+
+    js_src = (
+        "const path = require('path');\n"
+        "function handler(req, res) {\n"
+        "  const p = path.resolve('/srv/data', req.query.file);\n"
+        "  if (!p.startsWith('/')) return;\n"
+        "  const badTarget = p;\n"
+        "  const nxt = req.query.next;\n"
+        "  if (nxt.startsWith('/')) {\n"
+        "    res.redirect(nxt);\n"
+        "  }\n"
+        "}\n"
+    )
+    tree, raw = parse_source(js_src, ".js")
+    assert tree is not None
+    tracker = JsTaintTracker(tree.root_node, raw)
+    # Find the `badTarget = p` rhs identifier `p` and verify it is NOT sanitized for `path`
+    assign_p = [
+        n.child_by_field_name("value")
+        for n in walk_nodes(tree.root_node)
+        if n.type == "variable_declarator"
+        and n.child_by_field_name("name") is not None
+        and raw[n.child_by_field_name("name").start_byte : n.child_by_field_name("name").end_byte] == b"badTarget"
+    ][0]
+    assert tracker.is_tainted(assign_p, "path") is not None
+    # Bare `nxt.startsWith('/')` must still be flagged as JS-REDIR-001
+    (tmp_path / "js_redir.js").write_text(js_src, encoding="utf-8")
+    js_redirs = [f for f in NodeSASTAnalyzer().analyze(tmp_path) if f.rule_id == "JS-REDIR-001"]
+    assert len(js_redirs) == 1
 
 
 def test_python_xxe_lxml_high_vs_stdlib_low_and_ast_defusedxml(tmp_path: Path):
@@ -121,6 +187,20 @@ def test_python_xxe_lxml_high_vs_stdlib_low_and_ast_defusedxml(tmp_path: Path):
     assert by_file["stdlib_vs_defused.py"].severity == "low"
     assert by_file["stdlib_vs_defused.py"].cwe_id == "CWE-776"
     assert "real_defused.py" not in by_file
+
+    # When lockfile pins lxml >= 5.0, default parser drops to low, while explicit resolve_entities=True stays high!
+    lxml5_dir = tmp_path / "lxml5_app"
+    lxml5_dir.mkdir()
+    (lxml5_dir / "uv.lock").write_text('[[package]]\nname = "lxml"\nversion = "5.3.0"\n', encoding="utf-8")
+    (lxml5_dir / "xml_app.py").write_text(
+        "from lxml import etree\n"
+        "def default_p(data):\n    return etree.fromstring(data)\n"
+        "def explicit_xxe(data):\n    p = etree.XMLParser(resolve_entities=True)\n    return etree.fromstring(data, parser=p)\n",
+        encoding="utf-8",
+    )
+    lxml5_xxe = [f for f in PythonSASTAnalyzer().analyze(lxml5_dir) if f.rule_id == "PY-XXE-001"]
+    sevs = sorted(f.severity for f in lxml5_xxe)
+    assert "high" in sevs and "low" in sevs
 
 
 def test_python_owasp_rule_families_detection_and_negative_guards(tmp_path: Path):
@@ -164,10 +244,17 @@ def test_python_owasp_rule_families_detection_and_negative_guards(tmp_path: Path
         "    nxt = request.args.get('next')\n"
         "    return redirect(nxt)\n"
         "\n"
+        "@app.route('/bypass-go')\n"
+        "def proto_rel_bypass_redir():\n"
+        "    nxt = request.args.get('next')\n"
+        "    if nxt.startswith('/'):\n"
+        "        return redirect(nxt)\n"
+        "    return redirect('/')\n"
+        "\n"
         "@app.route('/safe-go')\n"
         "def safe_redir():\n"
         "    nxt = request.args.get('next')\n"
-        "    if nxt.startswith('/'):\n"
+        "    if nxt.startswith('/') and not nxt.startswith('//'):\n"
         "        return redirect(nxt)\n"
         "    return redirect('/')\n",
         encoding="utf-8",
@@ -187,8 +274,10 @@ def test_python_owasp_rule_families_detection_and_negative_guards(tmp_path: Path
     ):
         assert expected in rule_ids, f"Missing expected rule {expected}; got {rule_ids}"
 
+    # Both unguarded `open_redir` AND bare-slash `proto_rel_bypass_redir` trigger PY-REDIR-001,
+    # while `safe_redir` (checks `/` AND `not //`) does NOT!
     redir_lines = [f.start_line for f in findings if f.rule_id == "PY-REDIR-001"]
-    assert len(redir_lines) == 1
+    assert len(redir_lines) == 2
 
 
 def test_node_owasp_rule_families_detection(tmp_path: Path):

@@ -451,14 +451,15 @@ def parse_node_dependencies(workspace_dir: Path) -> list[InstalledPackage]:
     return deps
 
 
-_GO_REQ_LINE_RE = re.compile(r"^\s*([A-Za-z0-9_./-]+)\s+(v[0-9][^\s/]*)(?:\s*//.*)?$")
+_GO_DIRECTIVE_RE = re.compile(r"^\s*go\s+([0-9]+\.[0-9]+(?:\.[0-9]+)?)\b")
+_GO_REQ_LINE_RE = re.compile(r"^\s*([A-Za-z0-9_./-]+)\s+(v[0-9][^\s/]*)(\s*//.*)?$")
 _GO_REPLACE_RE = re.compile(
     r"^\s*([A-Za-z0-9_./-]+)(?:\s+v[^\s]+)?\s*=>\s*([A-Za-z0-9_./-]+)\s+(v[0-9][^\s/]*)(?:\s*//.*)?$"
 )
 
 
 def parse_go_mod(workspace_dir: Path) -> list[InstalledPackage]:
-    """Parse `go.mod` module requirements (single-line, block `require (...)`, and `replace`)."""
+    """Parse `go.mod` `go` stdlib version and module requirements (`require`, `replace`)."""
     deps: list[InstalledPackage] = []
     for mod_file in _iter_manifest_files(workspace_dir, ("go.mod",)):
         rel = str(mod_file.relative_to(workspace_dir))
@@ -468,12 +469,27 @@ def parse_go_mod(workspace_dir: Path) -> list[InstalledPackage]:
             continue
         in_require = False
         in_replace = False
-        reqs: dict[str, tuple[str, int]] = {}
+        reqs: dict[str, tuple[str, int, bool]] = {}
         replaces: dict[str, tuple[str, str]] = {}
 
         for idx, raw_line in enumerate(lines, start=1):
             stripped = raw_line.strip()
             if not stripped or stripped.startswith("//"):
+                continue
+            go_m = _GO_DIRECTIVE_RE.match(stripped)
+            if go_m and not in_require and not in_replace:
+                go_ver = go_m.group(1)
+                deps.append(
+                    InstalledPackage(
+                        ecosystem="go",
+                        name="stdlib",
+                        version=go_ver,
+                        manifest=rel,
+                        line_no=idx,
+                        is_lockfile=True,
+                        raw_spec=f"go {go_ver}",
+                    )
+                )
                 continue
             if stripped.startswith("require ("):
                 in_require = True
@@ -489,11 +505,13 @@ def parse_go_mod(workspace_dir: Path) -> list[InstalledPackage]:
             if stripped.startswith("require ") and not in_require:
                 m = _GO_REQ_LINE_RE.match(stripped[len("require ") :])
                 if m:
-                    reqs[m.group(1)] = (m.group(2), idx)
+                    is_indirect = "indirect" in (m.group(3) or "").lower()
+                    reqs[m.group(1)] = (m.group(2), idx, is_indirect)
             elif in_require:
                 m = _GO_REQ_LINE_RE.match(stripped)
                 if m:
-                    reqs[m.group(1)] = (m.group(2), idx)
+                    is_indirect = "indirect" in (m.group(3) or "").lower()
+                    reqs[m.group(1)] = (m.group(2), idx, is_indirect)
             elif stripped.startswith("replace ") and not in_replace:
                 rm = _GO_REPLACE_RE.match(stripped[len("replace ") :])
                 if rm:
@@ -503,8 +521,9 @@ def parse_go_mod(workspace_dir: Path) -> list[InstalledPackage]:
                 if rm:
                     replaces[rm.group(1)] = (rm.group(2), rm.group(3))
 
-        for mod_path, (ver, line_no) in reqs.items():
+        for mod_path, (ver, line_no, is_indirect) in reqs.items():
             eff_mod, eff_ver = replaces.get(mod_path, (mod_path, ver))
+            raw_spec = f"{eff_ver} // indirect" if is_indirect else eff_ver
             deps.append(
                 InstalledPackage(
                     ecosystem="go",
@@ -513,7 +532,121 @@ def parse_go_mod(workspace_dir: Path) -> list[InstalledPackage]:
                     manifest=rel,
                     line_no=line_no,
                     is_lockfile=True,
-                    raw_spec=eff_ver,
+                    raw_spec=raw_spec,
                 )
             )
     return deps
+
+
+def compute_reverse_dependents(
+    workspace_dir: Path,
+    ecosystem: str,
+) -> tuple[dict[str, set[str]], bool]:
+    """Build `{package_name: {other_packages_that_depend_on_it}}` from lockfiles.
+
+    Returns `(reverse_dependents_map, graph_known)`.
+    When `graph_known` is False (e.g., flat `requirements.txt` or `package.json` with no
+    lockfile dependency graph), callers cannot prove that no other dependency invokes the package.
+    """
+    rev: dict[str, set[str]] = {}
+    graph_known = False
+
+    if ecosystem == "python":
+        for lock_file in _iter_manifest_files(workspace_dir, ("uv.lock", "poetry.lock")):
+            try:
+                data = tomllib.loads(lock_file.read_text(encoding="utf-8", errors="ignore"))
+            except (OSError, tomllib.TOMLDecodeError):
+                continue
+            packages = data.get("package")
+            if not isinstance(packages, list) or not packages:
+                continue
+            graph_known = True
+            # Determine root project package name (in uv.lock, editable/virtual root has source = { virtual = "." } or { editable = "." })
+            for entry in packages:
+                if not isinstance(entry, dict):
+                    continue
+                parent = str(entry.get("name") or "").lower()
+                if not parent:
+                    continue
+                src = entry.get("source")
+                if isinstance(src, dict) and ("virtual" in src or "editable" in src):
+                    # Root application itself is not a third-party dependent
+                    continue
+                # uv.lock format: dependencies = [{ name = "urllib3" }, ...]
+                dep_list = entry.get("dependencies")
+                if isinstance(dep_list, list):
+                    for d in dep_list:
+                        if isinstance(d, dict) and d.get("name"):
+                            rev.setdefault(str(d["name"]).lower(), set()).add(parent)
+                # poetry.lock format: [package.dependencies] dict { urllib3 = ">=1.21" }
+                elif isinstance(dep_list, dict):
+                    for child_name in dep_list:
+                        rev.setdefault(str(child_name).lower(), set()).add(parent)
+                opt_deps = entry.get("optional-dependencies")
+                if isinstance(opt_deps, dict):
+                    for group_list in opt_deps.values():
+                        if isinstance(group_list, list):
+                            for d in group_list:
+                                if isinstance(d, dict) and d.get("name"):
+                                    rev.setdefault(str(d["name"]).lower(), set()).add(parent)
+        return rev, graph_known
+
+    if ecosystem == "node":
+        for lock_file in _iter_manifest_files(workspace_dir, ("package-lock.json",)):
+            try:
+                data = json.loads(lock_file.read_text(encoding="utf-8", errors="ignore"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if not isinstance(data, dict):
+                continue
+            packages = data.get("packages")
+            if isinstance(packages, dict) and packages:
+                graph_known = True
+                for pkg_path, entry in packages.items():
+                    if not pkg_path or not isinstance(entry, dict):
+                        # pkg_path == "" is the root application itself, not a third-party dep
+                        continue
+                    parent = (
+                        pkg_path.rsplit("node_modules/", 1)[-1].lower()
+                        if "node_modules/" in pkg_path
+                        else str(entry.get("name") or pkg_path).lower()
+                    )
+                    for sec in ("dependencies", "optionalDependencies", "peerDependencies"):
+                        dmap = entry.get(sec)
+                        if isinstance(dmap, dict):
+                            for child in dmap:
+                                rev.setdefault(str(child).lower(), set()).add(parent)
+            elif isinstance(data.get("dependencies"), dict) and data["dependencies"]:
+                graph_known = True
+                for parent, entry in data["dependencies"].items():
+                    if isinstance(entry, dict) and isinstance(entry.get("requires"), dict):
+                        for child in entry["requires"]:
+                            rev.setdefault(str(child).lower(), set()).add(str(parent).lower())
+
+        for lock_file in _iter_manifest_files(workspace_dir, ("pnpm-lock.yaml",)):
+            try:
+                data = yaml.safe_load(lock_file.read_text(encoding="utf-8", errors="ignore"))
+            except (OSError, yaml.YAMLError):
+                continue
+            if not isinstance(data, dict):
+                continue
+            for sec_name in ("packages", "snapshots"):
+                sec_map = data.get(sec_name)
+                if not isinstance(sec_map, dict) or not sec_map:
+                    continue
+                graph_known = True
+                for pkg_key, entry in sec_map.items():
+                    if not isinstance(pkg_key, str) or not isinstance(entry, dict):
+                        continue
+                    m = PNPM_KEY_RE.match(pkg_key.strip("'\""))
+                    if not m:
+                        continue
+                    pnpm_parent = m.group(1).lower()
+                    for dep_sec in ("dependencies", "optionalDependencies", "peerDependencies"):
+                        dmap = entry.get(dep_sec)
+                        if isinstance(dmap, dict):
+                            for child in dmap:
+                                rev.setdefault(str(child).lower(), set()).add(pnpm_parent)
+        return rev, graph_known
+
+    return rev, False

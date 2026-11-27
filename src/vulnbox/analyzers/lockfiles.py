@@ -293,15 +293,22 @@ def _parse_toml_lockfile(lock_file: Path, workspace_dir: Path) -> list[Installed
 
 
 def parse_python_dependencies(workspace_dir: Path) -> list[InstalledPackage]:
-    """Extract Python dependencies, preferring lockfiles (`uv.lock`, `poetry.lock`) per directory."""
+    """Extract Python dependencies, preferring lockfiles (`uv.lock`, `poetry.lock`) over manifests."""
     deps: list[InstalledPackage] = []
     locked_dirs: set[Path] = set()
+    locked_pkgs: set[str] = set()
 
     for lock_file in _iter_manifest_files(workspace_dir, ("uv.lock", "poetry.lock")):
         parsed = _parse_toml_lockfile(lock_file, workspace_dir)
         if parsed:
             deps.extend(parsed)
             locked_dirs.add(lock_file.parent)
+            locked_pkgs.update(p.name for p in parsed)
+
+    def _is_covered_by_lockfile(path: Path, pkg: str) -> bool:
+        if path.parent in locked_dirs:
+            return True
+        return pkg in locked_pkgs and any(anc in locked_dirs for anc in path.parents)
 
     for req_file in _iter_manifest_files(workspace_dir, ("requirements.txt",)):
         if req_file.parent in locked_dirs:
@@ -316,6 +323,8 @@ def parse_python_dependencies(workspace_dir: Path) -> list[InstalledPackage]:
             m = REQ_LINE_RE.match(stripped)
             if m:
                 pkg, op, ver = m.group(1).lower(), m.group(2), m.group(3)
+                if _is_covered_by_lockfile(req_file, pkg):
+                    continue
                 deps.append(
                     InstalledPackage(
                         ecosystem="python",
@@ -338,6 +347,8 @@ def parse_python_dependencies(workspace_dir: Path) -> list[InstalledPackage]:
             for m in PYPROJECT_DEP_RE.finditer(line):
                 pkg, op, ver = m.group(1).lower(), m.group(2), m.group(3)
                 if op in ("==", "<=", "<", "~="):
+                    if _is_covered_by_lockfile(pyproj, pkg):
+                        continue
                     deps.append(
                         InstalledPackage(
                             ecosystem="python",

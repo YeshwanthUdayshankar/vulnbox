@@ -9,10 +9,10 @@ from vulnbox.analyzers.base import SKIP_DIRS, extract_snippet, make_finding_id
 from vulnbox.constants import is_test_or_fixture_path
 from vulnbox.models import Finding, ScrubSummary, Severity
 
-FROM_RE = re.compile(r"^\s*FROM\s+([^\s]+)", re.IGNORECASE)
+FROM_RE = re.compile(r"^\s*FROM\s+(?:--[A-Za-z0-9_-]+=\S+\s+)*([^\s]+)", re.IGNORECASE)
 USER_RE = re.compile(r"^\s*USER\s+([^\s]+)", re.IGNORECASE)
 ENV_SECRET_RE = re.compile(
-    r"^\s*(?:ENV|ARG)\s+([A-Z0-9_]*(?:SECRET|PASSWORD|TOKEN|API_KEY|PRIVATE_KEY)[A-Z0-9_]*)\s*[=\s]+(.+)",
+    r"^\s*(?:ENV|ARG)\s+([A-Z0-9_]*(?:^|_)(?:SECRET|PASSWORD|PASSWD|TOKEN|API_KEY|ACCESS_KEY|PRIVATE_KEY|AUTH_KEY)(?:_|$)[A-Z0-9_]*)\s*[=\s]+(.+)",
     re.IGNORECASE,
 )
 ADD_URL_RE = re.compile(r"^\s*ADD\s+https?://", re.IGNORECASE)
@@ -179,23 +179,34 @@ class ConfigHygieneAnalyzer:
                 last_user = user_m.group(1).strip()
                 last_user_line = idx
 
-            if ENV_SECRET_RE.match(line):
-                findings.append(
-                    Finding(
-                        finding_id=make_finding_id("CFG-DOCKER-003", rel, idx),
-                        rule_id="CFG-DOCKER-003",
-                        cwe_id="CWE-798",
-                        title="Secret Exposed in Dockerfile ENV/ARG",
-                        category="config",
-                        severity="high",
-                        file_path=rel,
-                        start_line=idx,
-                        end_line=idx,
-                        snippet=extract_snippet(lines, idx, idx),
-                        message="Secrets passed via ENV or ARG are baked into container image metadata/layers.",
-                        recommended_fix="Inject secrets at runtime via environment variables or Docker BuildKit --mount=type=secret.",
-                    )
+            env_m = ENV_SECRET_RE.match(line)
+            if env_m:
+                raw_val = env_m.group(2).strip().rstrip("\\").strip()
+                # Take only the first token when multiple ENV key=val pairs appear on one line
+                first_val = raw_val.split()[0] if raw_val else ""
+                unquoted = first_val.strip("'\"")
+                is_empty_or_ref = (
+                    not unquoted
+                    or unquoted.startswith("$")
+                    or unquoted.lower() in ("true", "false", "none", "null")
                 )
+                if not is_empty_or_ref:
+                    findings.append(
+                        Finding(
+                            finding_id=make_finding_id("CFG-DOCKER-003", rel, idx),
+                            rule_id="CFG-DOCKER-003",
+                            cwe_id="CWE-798",
+                            title="Secret Exposed in Dockerfile ENV/ARG",
+                            category="config",
+                            severity="high",
+                            file_path=rel,
+                            start_line=idx,
+                            end_line=idx,
+                            snippet=extract_snippet(lines, idx, idx),
+                            message="Secrets passed via ENV or ARG are baked into container image metadata/layers.",
+                            recommended_fix="Inject secrets at runtime via environment variables or Docker BuildKit --mount=type=secret.",
+                        )
+                    )
 
             if ADD_URL_RE.match(line):
                 findings.append(

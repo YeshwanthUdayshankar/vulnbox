@@ -12,7 +12,7 @@ from vulnbox.models import Finding
 
 SQL_KW_RE = re.compile(r"\b(?:SELECT|INSERT|UPDATE|DELETE)\b", re.IGNORECASE)
 JS_EXTS = (".js", ".mjs", ".cjs", ".ts", ".tsx")
-MINIFIED_SUFFIXES = (".min.js", ".min.mjs", ".bundle.js")
+MINIFIED_SUFFIXES = (".min.js", ".min.mjs", ".bundle.js", "-bundle.js", ".chunk.js")
 _JS_SEC_RANDOM_HINTS = (
     "token",
     "secret",
@@ -32,6 +32,17 @@ _JS_SEC_RANDOM_HINTS = (
 def _is_minified_vendor_file(path: Path) -> bool:
     low = path.name.lower()
     return low.endswith(MINIFIED_SUFFIXES)
+
+
+def _is_minified_source(source: str) -> bool:
+    if len(source) < 100_000:
+        return False
+    lines = source.splitlines()
+    if not lines:
+        return False
+    if (len(source) / len(lines)) > 300:
+        return True
+    return any(len(line) > 10_000 for line in lines[:50])
 
 
 def _strip_quotes(text: str) -> str:
@@ -64,6 +75,8 @@ class NodeSASTAnalyzer:
             try:
                 source = js_file.read_text(encoding="utf-8", errors="ignore")
             except OSError:
+                continue
+            if _is_minified_source(source):
                 continue
             tree, raw = parse_source(source, js_file.suffix)
             if tree is None:
@@ -127,7 +140,7 @@ class NodeSASTAnalyzer:
                             left.type == "member_expression"
                             and left_txt.endswith((".innerHTML", ".outerHTML"))
                             and _has_dynamic_arg(right, raw)
-                            and "DOMPurify.sanitize" not in right_txt
+                            and not taint.is_sanitized(right, "xss")
                         ):
                             findings.append(
                                 Finding(
@@ -382,7 +395,25 @@ class NodeSASTAnalyzer:
                 # JS-SSRF-001: Tainted URL passed to fetch / axios / http.get / https.get / got
                 if fn_txt in ("fetch", "globalThis.fetch", "got", "http.get", "https.get", "http.request", "https.request") or fn_txt.startswith("axios."):
                     if arg_nodes and _has_dynamic_arg(arg_nodes[0], raw):
-                        ssrf_src = taint.is_tainted(arg_nodes[0], "ssrf")
+                        url_arg = arg_nodes[0]
+                        ssrf_src: str | None = None
+                        if url_arg.type == "template_string":
+                            # Only flag SSRF if a tainted substitution can control the URL origin
+                            # (not merely query parameters after '?' or path suffix after a fixed untainted base).
+                            saw_origin_delimiter = False
+                            for ch in url_arg.children:
+                                if ch.type == "string_fragment":
+                                    frag = node_text(ch, raw)
+                                    if "?" in frag or ("/" in frag and not frag.endswith("://")):
+                                        saw_origin_delimiter = True
+                                elif ch.type == "template_substitution":
+                                    if not saw_origin_delimiter:
+                                        hit = taint.is_tainted(ch, "ssrf")
+                                        if hit:
+                                            ssrf_src = hit
+                                            break
+                        else:
+                            ssrf_src = taint.is_tainted(url_arg, "ssrf")
                         if ssrf_src:
                             findings.append(
                                 Finding(

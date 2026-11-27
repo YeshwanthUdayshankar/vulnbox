@@ -89,9 +89,10 @@ def _analyze_python_leaks(
 
         for cname, (decl_line, kind) in mod_containers.items():
             # Check if module has eviction/size-bound operations on this container
+            # (including callback references such as task.add_done_callback(tasks.discard))
             has_eviction = bool(
                 re.search(
-                    rf"\b{re.escape(cname)}\.(?:pop|popitem|clear|remove)\s*\("
+                    rf"\b{re.escape(cname)}\.(?:pop|popitem|clear|remove|discard)\b"
                     rf"|\bdel\s+{re.escape(cname)}\b"
                     rf"|\blen\s*\(\s*{re.escape(cname)}\s*\)\s*(?:>=|>|==)",
                     source,
@@ -315,12 +316,16 @@ def _analyze_node_leaks(
 ) -> list[Finding]:
     findings: list[Finding] = []
     for js_file in iter_source_files(workspace_dir, JS_EXTS):
-        if js_file.name.lower().endswith((".min.js", ".min.mjs", ".bundle.js")):
+        if js_file.name.lower().endswith((".min.js", ".min.mjs", ".bundle.js", "-bundle.js", ".chunk.js")):
             continue
         try:
             source = js_file.read_text(encoding="utf-8", errors="ignore")
         except OSError:
             continue
+        if len(source) > 100_000:
+            src_lines = source.splitlines()
+            if src_lines and ((len(source) / len(src_lines)) > 300 or any(len(ln) > 10_000 for ln in src_lines[:50])):
+                continue
         tree, raw = parse_source(source, js_file.suffix)
         if tree is None:
             continue

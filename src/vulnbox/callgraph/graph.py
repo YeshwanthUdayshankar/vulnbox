@@ -27,6 +27,7 @@ class CallGraph:
     def __init__(self) -> None:
         self.nodes: dict[str, CallNode] = {}
         self._edge_map: dict[tuple[str, str], CallEdge] = {}
+        self._adj_cache: dict[str, list[CallEdge]] | None = None
         self.unresolved_sites: list[UnresolvedCallSite] = []
         self.runtime_resolved_count: int = 0
 
@@ -56,9 +57,11 @@ class CallGraph:
         existing = self._edge_map.get(key)
         if existing is None:
             self._edge_map[key] = edge
+            self._adj_cache = None
             return
         if _PROVENANCE_RANK.get(edge.provenance, 0) > _PROVENANCE_RANK.get(existing.provenance, 0):
             self._edge_map[key] = edge
+            self._adj_cache = None
 
     def add_unresolved(self, site: UnresolvedCallSite) -> None:
         for existing in self.unresolved_sites:
@@ -96,10 +99,12 @@ class CallGraph:
             self.unresolved_sites = remaining
 
     def adjacency(self) -> dict[str, list[CallEdge]]:
-        adj: dict[str, list[CallEdge]] = {}
-        for edge in self._edge_map.values():
-            adj.setdefault(edge.caller, []).append(edge)
-        return adj
+        if self._adj_cache is None:
+            adj: dict[str, list[CallEdge]] = {}
+            for edge in self._edge_map.values():
+                adj.setdefault(edge.caller, []).append(edge)
+            self._adj_cache = adj
+        return self._adj_cache
 
     def reverse_adjacency(self) -> dict[str, list[CallEdge]]:
         rev: dict[str, list[CallEdge]] = {}

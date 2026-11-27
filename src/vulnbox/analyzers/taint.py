@@ -174,13 +174,15 @@ class PythonTaintTracker:
                 names = _expr_names(sub)
                 # Path confinement: target.is_relative_to(base), os.path.commonpath([...]),
                 # resolved.startswith(base), re.fullmatch(r'[A-Za-z0-9_-]+', x)
-                if cname.endswith(".is_relative_to") or cname in ("os.path.commonpath", "commonpath"):
+                if cname.endswith(".is_relative_to") or cname == "is_relative_to" or cname in ("os.path.commonpath", "commonpath"):
                     self.sanitized["path"].update(names)
-                elif cname.endswith(".startswith"):
+                elif cname.endswith(".startswith") or cname == "startswith":
                     recv = sub.func.value if isinstance(sub.func, ast.Attribute) else None
                     recv_name = recv.id if isinstance(recv, ast.Name) else None
                     if recv_name and recv_name in self._resolved_path_vars:
                         self.sanitized["path"].add(recv_name)
+                    elif recv is not None and self._is_path_resolve_expr(recv):
+                        self.sanitized["path"].update(_expr_names(recv))
                     if sub.args and isinstance(sub.args[0], ast.Constant) and sub.args[0].value == "/":
                         if recv_name:
                             self.sanitized["redirect"].add(recv_name)
@@ -273,8 +275,9 @@ class PythonTaintTracker:
 _JS_TAINT_SOURCE_RE = re.compile(
     r"\b(?:req|request)\.(?:query|params|body|headers|cookies|url|originalUrl|path)\b"
     r"|\b(?:location|window\.location|document\.location)\.(?:search|hash|href)\b"
-    r"|\bnew\s+URLSearchParams\b"
+    r"|\bnew\s+URLSearchParams\s*\(\s*(?:(?:window\.|document\.)?location\.(?:search|hash|href)|(?:req|request)\.(?:url|originalUrl|query))"
 )
+_JS_IDENT_RE = re.compile(r"\b[A-Za-z_$][A-Za-z0-9_$]*\b")
 
 
 class JsTaintTracker:
@@ -295,52 +298,72 @@ class JsTaintTracker:
         self._analyze()
 
     def _analyze(self) -> None:
-        # Track destructured & simple variable declarations from req.query/params/body
-        for _ in range(2):
-            for node in walk_nodes(self.scope_node):
-                if node.type == "variable_declarator":
-                    name_n = node.child_by_field_name("name")
-                    val_n = node.child_by_field_name("value")
-                    if not name_n or not val_n:
-                        continue
+        # Single AST walk to collect declarators and if-statement guards
+        declarators: list[tuple[Any, str, set[str]]] = []
+        if_conds: list[str] = []
+        for node in walk_nodes(self.scope_node):
+            if node.type == "variable_declarator":
+                name_n = node.child_by_field_name("name")
+                val_n = node.child_by_field_name("value")
+                if name_n and val_n:
                     vtxt = node_text(val_n, self.raw)
-                    src_m = _JS_TAINT_SOURCE_RE.search(vtxt)
-                    src = src_m.group(0) if src_m else None
-                    if src is None:
-                        for ident, origin in self.tainted.items():
-                            if re.search(rf"\b{re.escape(ident)}\b", vtxt):
-                                src = origin
-                                break
-                    is_path_san = "path.basename(" in vtxt
-                    is_xss_san = any(tok in vtxt for tok in ("DOMPurify.sanitize(", "escapeHtml(", "encodeURIComponent("))
-                    if name_n.type == "identifier":
-                        var = node_text(name_n, self.raw)
-                        if is_path_san:
-                            self.sanitized["path"].add(var)
-                        if is_xss_san:
-                            self.sanitized["xss"].add(var)
-                        if src:
-                            self.tainted[var] = src
-                    elif name_n.type == "object_pattern" and src:
-                        for sub in walk_nodes(name_n):
-                            if sub.type in ("shorthand_property_identifier_pattern", "identifier"):
-                                self.tainted[node_text(sub, self.raw)] = src
+                    declarators.append((name_n, vtxt, set(_JS_IDENT_RE.findall(vtxt))))
+            elif node.type == "if_statement":
+                cond = node.child_by_field_name("condition")
+                if cond:
+                    if_conds.append(node_text(cond, self.raw))
+
+        # Two-pass propagation using O(1) identifier set intersection
+        for _ in range(2):
+            for name_n, vtxt, v_idents in declarators:
+                src_m = _JS_TAINT_SOURCE_RE.search(vtxt)
+                src = src_m.group(0) if src_m else None
+                if src is None and self.tainted:
+                    for ident in v_idents:
+                        origin = self.tainted.get(ident)
+                        if origin is not None:
+                            src = origin
+                            break
+                is_path_san = "path.basename(" in vtxt
+                is_xss_san = any(tok in vtxt for tok in ("DOMPurify.sanitize(", "escapeHtml(", "encodeURIComponent("))
+                if name_n.type == "identifier":
+                    var = node_text(name_n, self.raw)
+                    if is_path_san:
+                        self.sanitized["path"].add(var)
+                    if is_xss_san:
+                        self.sanitized["xss"].add(var)
+                    if src:
+                        self.tainted[var] = src
+                elif name_n.type == "object_pattern" and src:
+                    for sub in walk_nodes(name_n):
+                        if sub.type in ("shorthand_property_identifier_pattern", "identifier"):
+                            self.tainted[node_text(sub, self.raw)] = src
 
         # Record per-variable guard barriers inside if conditions
-        for node in walk_nodes(self.scope_node):
-            if node.type == "if_statement":
-                cond = node.child_by_field_name("condition")
-                if not cond:
-                    continue
-                ctxt = node_text(cond, self.raw)
-                idents = set(re.findall(r"\b[A-Za-z_$][A-Za-z0-9_$]*\b", ctxt))
-                if ".startsWith(" in ctxt and ("path.resolve(" in self.scope_text or "path.relative(" in ctxt):
-                    self.sanitized["path"].update(idents)
-                if "startsWith('/')" in ctxt or 'startsWith("/")' in ctxt:
-                    self.sanitized["redirect"].update(idents)
-                if any(tok in ctxt for tok in ("allowedHosts", "allowedOrigins", "isAllowedUrl", "ALLOWED_HOSTS")):
-                    self.sanitized["ssrf"].update(idents)
-                    self.sanitized["redirect"].update(idents)
+        has_path_resolve = "path.resolve(" in self.scope_text
+        for ctxt in if_conds:
+            idents = set(_JS_IDENT_RE.findall(ctxt))
+            if ".startsWith(" in ctxt and (has_path_resolve or "path.relative(" in ctxt):
+                self.sanitized["path"].update(idents)
+            if "startsWith('/')" in ctxt or 'startsWith("/")' in ctxt:
+                self.sanitized["redirect"].update(idents)
+            if any(tok in ctxt for tok in ("allowedHosts", "allowedOrigins", "isAllowedUrl", "ALLOWED_HOSTS")):
+                self.sanitized["ssrf"].update(idents)
+                self.sanitized["redirect"].update(idents)
+
+    def is_sanitized(self, expr_node: Any, sink_kind: str) -> bool:
+        etxt = node_text(expr_node, self.raw)
+        if sink_kind == "path" and "path.basename(" in etxt:
+            return True
+        if sink_kind == "xss" and any(
+            tok in etxt for tok in ("DOMPurify.sanitize(", "escapeHtml(", "encodeURIComponent(")
+        ):
+            return True
+        san = self.sanitized.get(sink_kind, set())
+        if not san:
+            return False
+        idents = set(_JS_IDENT_RE.findall(etxt))
+        return bool(idents) and idents.issubset(san)
 
     def is_tainted(self, expr_node: Any, sink_kind: str) -> str | None:
         etxt = node_text(expr_node, self.raw)
@@ -351,8 +374,12 @@ class JsTaintTracker:
         m = _JS_TAINT_SOURCE_RE.search(etxt)
         if m:
             return m.group(0)
+        if not self.tainted:
+            return None
         san = self.sanitized.get(sink_kind, set())
-        for ident, origin in self.tainted.items():
-            if ident not in san and re.search(rf"\b{re.escape(ident)}\b", etxt):
-                return origin
+        for ident in _JS_IDENT_RE.findall(etxt):
+            if ident not in san:
+                origin = self.tainted.get(ident)
+                if origin is not None:
+                    return origin
         return None

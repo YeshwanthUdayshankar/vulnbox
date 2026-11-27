@@ -554,6 +554,7 @@ class _PythonSecurityVisitor(ast.NodeVisitor):
         # PY-JWT-001: JWT verification disabled or alg=none
         if name in ("jwt.decode", "jose.jwt.decode"):
             bad_jwt = False
+            alg_none = False
             for kw in node.keywords:
                 if kw.arg == "verify" and isinstance(kw.value, ast.Constant) and kw.value.value is False:
                     bad_jwt = True
@@ -569,13 +570,45 @@ class _PythonSecurityVisitor(ast.NodeVisitor):
                 elif kw.arg == "algorithms":
                     if isinstance(kw.value, ast.Constant) and str(kw.value.value).lower() == "none":
                         bad_jwt = True
+                        alg_none = True
                     elif isinstance(kw.value, (ast.List, ast.Tuple)):
                         if any(
                             isinstance(e, ast.Constant) and str(e.value).lower() == "none"
                             for e in kw.value.elts
                         ):
                             bad_jwt = True
-            if bad_jwt:
+                            alg_none = True
+            # Skip unverified issuer/header peeks when the same function later verifies the JWT
+            verified_later = False
+            if bad_jwt and not alg_none and self._func_stack:
+                cur_fn = self._func_stack[-1]
+                cur_line = getattr(node, "lineno", 0)
+                for sub in ast.walk(cur_fn):
+                    if (
+                        isinstance(sub, ast.Call)
+                        and sub is not node
+                        and getattr(sub, "lineno", 0) > cur_line
+                        and _dotted_name(sub.func) in ("jwt.decode", "jose.jwt.decode")
+                    ):
+                        has_unverified_opt = any(
+                            (kw.arg == "verify" and isinstance(kw.value, ast.Constant) and kw.value.value is False)
+                            or (
+                                kw.arg == "options"
+                                and isinstance(kw.value, ast.Dict)
+                                and any(
+                                    isinstance(kn, ast.Constant)
+                                    and kn.value == "verify_signature"
+                                    and isinstance(vn, ast.Constant)
+                                    and vn.value is False
+                                    for kn, vn in zip(kw.value.keys, kw.value.values, strict=False)
+                                )
+                            )
+                            for kw in sub.keywords
+                        )
+                        if not has_unverified_opt:
+                            verified_later = True
+                            break
+            if bad_jwt and not verified_later:
                 self._add(
                     rule_id="PY-JWT-001",
                     cwe_id="CWE-347",

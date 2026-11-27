@@ -114,10 +114,39 @@ def _parse_node_dependencies(workspace_dir: Path) -> list[InstalledPackage]:
     return parse_node_dependencies(workspace_dir)
 
 
+def _build_python_ast_index(workspace_dir: Path) -> list[tuple[str, ast.AST]]:
+    index: list[tuple[str, ast.AST]] = []
+    for py_file in iter_source_files(workspace_dir, (".py",)):
+        try:
+            src = py_file.read_text(encoding="utf-8", errors="ignore")
+            tree = safe_ast_parse(src, filename=str(py_file))
+        except (OSError, SyntaxError):
+            continue
+        index.append((str(py_file.relative_to(workspace_dir)), tree))
+    return index
+
+
+def _build_node_source_index(workspace_dir: Path) -> list[tuple[str, str, list[str]]]:
+    index: list[tuple[str, str, list[str]]] = []
+    for js_file in iter_source_files(workspace_dir, (".js", ".mjs", ".cjs", ".ts")):
+        low = js_file.name.lower()
+        if low.endswith((".min.js", ".min.mjs", ".bundle.js", "-bundle.js", ".chunk.js")):
+            continue
+        try:
+            src = js_file.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        if len(src) > 250_000:
+            continue
+        index.append((str(js_file.relative_to(workspace_dir)), src, src.splitlines()))
+    return index
+
+
 def _check_python_reachability(
     workspace_dir: Path,
     import_names: list[str],
     vulnerable_symbols: list[str],
+    py_index: list[tuple[str, ast.AST]] | None = None,
 ) -> tuple[ReachabilityStatus, list[str]]:
     """Perform deterministic Python AST import & symbol call-graph reachability."""
     imported_files: list[str] = []
@@ -125,14 +154,8 @@ def _check_python_reachability(
     targets = set(import_names)
     sym_tails = {s.split(".")[-1] for s in vulnerable_symbols}
 
-    for py_file in iter_source_files(workspace_dir, (".py",)):
-        try:
-            src = py_file.read_text(encoding="utf-8", errors="ignore")
-            tree = safe_ast_parse(src, filename=str(py_file))
-        except (OSError, SyntaxError):
-            continue
-
-        rel = str(py_file.relative_to(workspace_dir))
+    entries = py_index if py_index is not None else _build_python_ast_index(workspace_dir)
+    for rel, tree in entries:
         aliases: set[str] = set()
         direct_syms: set[str] = set()
         file_imports = False
@@ -181,34 +204,30 @@ def _check_node_reachability(
     workspace_dir: Path,
     import_names: list[str],
     vulnerable_symbols: list[str],
+    js_index: list[tuple[str, str, list[str]]] | None = None,
 ) -> tuple[ReachabilityStatus, list[str]]:
     """Perform deterministic JS/TS import/require & symbol reachability."""
     imported_files: list[str] = []
     symbol_citations: list[str] = []
+    import_patterns = [
+        re.compile(
+            rf"""(?:require\s*\(\s*['"]{re.escape(pkg)}['"]\s*\)|from\s+['"]{re.escape(pkg)}['"])"""
+        )
+        for pkg in import_names
+    ]
+    sym_patterns = [(sym, re.compile(rf"\b{re.escape(sym)}\s*\(")) for sym in vulnerable_symbols]
 
-    for js_file in iter_source_files(workspace_dir, (".js", ".mjs", ".cjs", ".ts")):
-        try:
-            src = js_file.read_text(encoding="utf-8", errors="ignore")
-        except OSError:
-            continue
-        rel = str(js_file.relative_to(workspace_dir))
-        lines = src.splitlines()
-        file_imports = False
-        for pkg in import_names:
-            pattern = re.compile(
-                rf"""(?:require\s*\(\s*['"]{re.escape(pkg)}['"]\s*\)|from\s+['"]{re.escape(pkg)}['"])"""
-            )
-            if pattern.search(src):
-                file_imports = True
-                break
+    entries = js_index if js_index is not None else _build_node_source_index(workspace_dir)
+    for rel, src, lines in entries:
+        file_imports = any(pat.search(src) for pat in import_patterns)
         if not file_imports:
             continue
         imported_files.append(rel)
-        if not vulnerable_symbols:
+        if not sym_patterns:
             continue
         for idx, line in enumerate(lines, start=1):
-            for sym in vulnerable_symbols:
-                if re.search(rf"\b{re.escape(sym)}\s*\(", line):
+            for sym, spat in sym_patterns:
+                if spat.search(line):
                     symbol_citations.append(f"{rel}:{idx} ({sym})")
 
     if not imported_files:
@@ -271,6 +290,9 @@ class DependencyReachabilityAnalyzer:
         node_deps = _parse_node_dependencies(workspace_dir)
         kev_cves, epss_scores = load_offline_enrichment(self.cache_dir)
 
+        py_index: list[tuple[str, ast.AST]] | None = None
+        js_index: list[tuple[str, str, list[str]]] | None = None
+
         for adv in self.advisories:
             target_deps = py_deps if adv.ecosystem == "python" else node_deps
             for dep in target_deps:
@@ -284,12 +306,22 @@ class DependencyReachabilityAnalyzer:
                     continue
 
                 if adv.ecosystem == "python":
+                    if py_index is None:
+                        py_index = _build_python_ast_index(workspace_dir)
                     reachability, citations = _check_python_reachability(
-                        workspace_dir, adv.imports or [adv.package], adv.vulnerable_symbols
+                        workspace_dir,
+                        adv.imports or [adv.package],
+                        adv.vulnerable_symbols,
+                        py_index=py_index,
                     )
                 else:
+                    if js_index is None:
+                        js_index = _build_node_source_index(workspace_dir)
                     reachability, citations = _check_node_reachability(
-                        workspace_dir, adv.imports or [adv.package], adv.vulnerable_symbols
+                        workspace_dir,
+                        adv.imports or [adv.package],
+                        adv.vulnerable_symbols,
+                        js_index=js_index,
                     )
 
                 call_path: list[str] = []
@@ -307,9 +339,19 @@ class DependencyReachabilityAnalyzer:
 
                     cg_hit = call_graph.shortest_path_from_entrypoints(_matches_vuln)
                     if cg_hit is not None:
-                        call_path, call_path_provenance = cg_hit
-                        if reachability != "reachable":
-                            reachability = "reachable"
+                        cand_path, cand_prov = cg_hit
+                        # Guard against cross-ecosystem external symbol collisions (e.g. npm `uuid` matching Python stdlib `uuid`)
+                        caller_id = cand_path[0] if cand_path else ""
+                        caller_file = caller_id.split("::", 1)[0].lower()
+                        eco_ok = (
+                            caller_file.endswith(".py")
+                            if adv.ecosystem == "python"
+                            else caller_file.endswith((".js", ".mjs", ".cjs", ".ts", ".tsx"))
+                        )
+                        if eco_ok:
+                            call_path, call_path_provenance = cand_path, cand_prov
+                            if reachability != "reachable":
+                                reachability = "reachable"
 
                 rule_id = f"DEP-{adv.advisory_id}"
                 cite_text = f" Citations: {', '.join(citations)}." if citations else ""

@@ -36,7 +36,12 @@ def build_sarif(report: AuditReport) -> dict[str, Any]:
     rules_map: dict[str, dict[str, Any]] = {}
     results: list[dict[str, Any]] = []
 
-    for f in report.findings:
+    all_entries: list[tuple[Any, bool]] = [
+        *((f, False) for f in report.findings),
+        *((f, True) for f in report.suppressed_findings),
+    ]
+
+    for f, is_suppressed in all_entries:
         if f.rule_id not in rules_map:
             rules_map[f.rule_id] = {
                 "id": f.rule_id,
@@ -93,28 +98,38 @@ def build_sarif(report: AuditReport) -> dict[str, Any]:
             if ver.memory_leak_confirmed_and_fixed is not None:
                 props["memoryLeakConfirmedAndFixed"] = ver.memory_leak_confirmed_and_fixed
 
-        results.append(
-            {
-                "ruleId": f.rule_id,
-                "level": _severity_to_sarif_level(f.severity),
-                "message": {"text": f.message},
-                "partialFingerprints": {
-                    "primaryLocationLineHash": compute_finding_fingerprint(f),
-                },
-                "locations": [
-                    {
-                        "physicalLocation": {
-                            "artifactLocation": {"uri": f.file_path},
-                            "region": {
-                                "startLine": max(1, f.start_line),
-                                "endLine": max(1, f.end_line),
-                            },
-                        }
+        result_obj: dict[str, Any] = {
+            "ruleId": f.rule_id,
+            "level": _severity_to_sarif_level(f.severity),
+            "message": {"text": f.message},
+            "partialFingerprints": {
+                "primaryLocationLineHash": compute_finding_fingerprint(f),
+            },
+            "locations": [
+                {
+                    "physicalLocation": {
+                        "artifactLocation": {"uri": f.file_path},
+                        "region": {
+                            "startLine": max(1, f.start_line),
+                            "endLine": max(1, f.end_line),
+                        },
                     }
-                ],
-                "properties": props,
-            }
-        )
+                }
+            ],
+            "properties": props,
+        }
+        if is_suppressed:
+            result_obj["suppressions"] = [
+                {
+                    "kind": str(f.metadata.get("suppression_kind") or "inSource"),
+                    "status": "accepted",
+                    "justification": str(
+                        f.metadata.get("suppression_reason")
+                        or "Suppressed via inline vulnbox: ignore directive"
+                    ),
+                }
+            ]
+        results.append(result_obj)
 
     return {
         "$schema": SARIF_SCHEMA_URL,

@@ -11,6 +11,7 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from vulnbox.analyzers.advisory_feed import (
+    PYPI_IMPORT_ALIASES,
     load_offline_enrichment,
     load_offline_osv_advisories,
 )
@@ -18,6 +19,7 @@ from vulnbox.analyzers.base import iter_source_files, make_finding_id, safe_ast_
 from vulnbox.analyzers.lockfiles import (
     InstalledPackage,
     is_version_below,
+    is_version_in_ranges,
     parse_node_dependencies,
     parse_python_dependencies,
 )
@@ -28,10 +30,11 @@ class Advisory(BaseModel):
     """Normalized dependency vulnerability advisory."""
 
     advisory_id: str
-    ecosystem: str  # "python" or "node"
+    ecosystem: str  # "python", "node", or "go"
     package: str
-    affected_below: str
-    fixed_version: str
+    affected_below: str = ""
+    fixed_version: str = ""
+    affected_ranges: list[dict[str, str]] = Field(default_factory=list)
     severity: Severity = "high"
     cwe_id: str = "CWE-1104"
     title: str
@@ -192,11 +195,14 @@ def _check_python_reachability(
                     symbol_citations.append(f"{rel}:{node.lineno} ({node.func.id}())")
 
     if not imported_files:
-        return "not_reachable", []
+        # Never claim `not_reachable` merely because a package is not directly imported:
+        # it may be pulled in transitively (e.g. urllib3 via requests) or use a non-obvious import alias.
+        return "under_investigation", []
     if not vulnerable_symbols:
         return "under_investigation", imported_files
     if symbol_citations:
         return "reachable", sorted(set(symbol_citations))
+    # Direct import confirmed, explicit vulnerable_symbols known, and zero vulnerable symbols invoked
     return "not_reachable", imported_files
 
 
@@ -231,11 +237,14 @@ def _check_node_reachability(
                     symbol_citations.append(f"{rel}:{idx} ({sym})")
 
     if not imported_files:
-        return "not_reachable", []
+        # Never claim `not_reachable` merely because a package is not directly imported:
+        # it may be pulled in transitively (e.g. urllib3 via requests) or use a non-obvious import alias.
+        return "under_investigation", []
     if not vulnerable_symbols:
         return "under_investigation", imported_files
     if symbol_citations:
         return "reachable", sorted(set(symbol_citations))
+    # Direct import confirmed, explicit vulnerable_symbols known, and zero vulnerable symbols invoked
     return "not_reachable", imported_files
 
 
@@ -294,6 +303,8 @@ class DependencyReachabilityAnalyzer:
         js_index: list[tuple[str, str, list[str]]] | None = None
 
         for adv in self.advisories:
+            if adv.ecosystem not in ("python", "node"):
+                continue
             target_deps = py_deps if adv.ecosystem == "python" else node_deps
             for dep in target_deps:
                 pkg = dep.name
@@ -302,15 +313,35 @@ class DependencyReachabilityAnalyzer:
                 line_no = dep.line_no
                 if pkg != adv.package.lower():
                     continue
-                if not _is_version_below(installed_ver, adv.affected_below, ecosystem=adv.ecosystem):
-                    continue
+                if adv.affected_ranges:
+                    affected, branch_fixed = is_version_in_ranges(
+                        installed_ver, adv.affected_ranges, ecosystem=adv.ecosystem
+                    )
+                    if not affected:
+                        continue
+                    effective_fixed = branch_fixed or adv.fixed_version or "latest patched"
+                else:
+                    if not adv.affected_below or not _is_version_below(
+                        installed_ver, adv.affected_below, ecosystem=adv.ecosystem
+                    ):
+                        continue
+                    effective_fixed = adv.fixed_version or adv.affected_below
+
+                # Merge any known PyPI distribution -> import module aliases
+                import_candidates = list(adv.imports or [])
+                if adv.ecosystem == "python":
+                    for alias_imp in PYPI_IMPORT_ALIASES.get(adv.package.lower(), []):
+                        if alias_imp not in import_candidates:
+                            import_candidates.append(alias_imp)
+                if not import_candidates:
+                    import_candidates = [adv.package.lower().replace("-", "_")]
 
                 if adv.ecosystem == "python":
                     if py_index is None:
                         py_index = _build_python_ast_index(workspace_dir)
                     reachability, citations = _check_python_reachability(
                         workspace_dir,
-                        adv.imports or [adv.package],
+                        import_candidates,
                         adv.vulnerable_symbols,
                         py_index=py_index,
                     )
@@ -319,7 +350,7 @@ class DependencyReachabilityAnalyzer:
                         js_index = _build_node_source_index(workspace_dir)
                     reachability, citations = _check_node_reachability(
                         workspace_dir,
-                        adv.imports or [adv.package],
+                        import_candidates,
                         adv.vulnerable_symbols,
                         js_index=js_index,
                     )
@@ -327,7 +358,7 @@ class DependencyReachabilityAnalyzer:
                 call_path: list[str] = []
                 call_path_provenance: list[str] = []
                 if call_graph is not None:
-                    pkg_prefixes = [f"external::{imp}" for imp in (adv.imports or [adv.package])]
+                    pkg_prefixes = [f"external::{imp}" for imp in import_candidates]
                     sym_tails = [s.split(".")[-1] for s in adv.vulnerable_symbols]
 
                     def _matches_vuln(node_id: str, prefixes=pkg_prefixes, tails=sym_tails) -> bool:
@@ -353,6 +384,15 @@ class DependencyReachabilityAnalyzer:
                             if reachability != "reachable":
                                 reachability = "reachable"
 
+                if reachability == "reachable":
+                    reach_basis = "symbol_call_confirmed"
+                elif reachability == "not_reachable":
+                    reach_basis = "imported_safe_symbols_only"
+                elif citations:
+                    reach_basis = "imported_no_symbol_metadata"
+                else:
+                    reach_basis = "not_directly_imported"
+
                 rule_id = f"DEP-{adv.advisory_id}"
                 cite_text = f" Citations: {', '.join(citations)}." if citations else ""
                 path_text = f" Call path: {' -> '.join(call_path)}." if call_path else ""
@@ -370,9 +410,10 @@ class DependencyReachabilityAnalyzer:
                     "package": adv.package,
                     "installed_version": installed_ver,
                     "version_source": "lockfile" if dep.is_lockfile else "manifest_range",
-                    "fixed_version": adv.fixed_version,
+                    "fixed_version": effective_fixed,
                     "advisory_id": adv.advisory_id,
                     "citations": citations,
+                    "reachability_basis": reach_basis,
                     "cisa_kev": is_kev,
                 }
                 if epss_info:
@@ -397,11 +438,11 @@ class DependencyReachabilityAnalyzer:
                         message=(
                             f"Dependency '{adv.package}' version '{installed_ver}' "
                             f"({'lockfile' if dep.is_lockfile else 'manifest range'}) is affected by "
-                            f"{adv.advisory_id} (< {adv.affected_below}). Reachability: {reachability}."
+                            f"{adv.advisory_id} (fix: >= {effective_fixed}). Reachability: {reachability}."
                             f"{risk_text}{cite_text}{path_text}"
                         ),
                         reachability=reachability,
-                        recommended_fix=f"Upgrade '{adv.package}' in {manifest} to >= {adv.fixed_version}.",
+                        recommended_fix=f"Upgrade '{adv.package}' in {manifest} to >= {effective_fixed}.",
                         metadata=meta,
                     )
                 )

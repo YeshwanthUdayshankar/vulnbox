@@ -228,7 +228,7 @@ def test_open_webui_precision_guards(tmp_path: Path):
     assert [f for f in js_findings if f.file_path == "client.ts" and f.rule_id in ("JS-SSRF-001", "JS-XSS-001")] == []
     assert any(f.file_path == "real_ssrf.js" and f.rule_id == "JS-SSRF-001" for f in js_findings)
 
-    # 2. PY-JWT-001 issuer peek before verified decode & PY-PATH-001 inline realpath().startswith()
+    # 2. PY-JWT-001 issuer peek before verified decode & PY-PATH-001 inline realpath().startswith(... + os.sep)
     (tmp_path / "auth_and_audio.py").write_text(
         "import os, jwt\n"
         "def verify_logout(logout_token, key):\n"
@@ -236,7 +236,7 @@ def test_open_webui_precision_guards(tmp_path: Path):
         "    return jwt.decode(logout_token, key, algorithms=['RS256'], issuer=iss)\n"
         "def save_upload(file_dir, filename):\n"
         "    file_path = os.path.join(file_dir, filename)\n"
-        "    if not os.path.realpath(file_path).startswith(os.path.realpath(file_dir)):\n"
+        "    if not os.path.realpath(file_path).startswith(os.path.realpath(file_dir) + os.sep):\n"
         "        raise ValueError('bad path')\n"
         "    with open(file_path, 'wb') as f:\n"
         "        f.write(b'ok')\n",
@@ -303,5 +303,5 @@ def test_open_webui_precision_guards(tmp_path: Path):
     cg.add_edge(CallEdge(caller="backend/app.py::handler", callee="external::uuid.uuid4", file_path="backend/app.py", line=2, provenance="static_exact"))
     dep_findings = DependencyReachabilityAnalyzer(adv_file).analyze(tmp_path, call_graph=cg)
     assert len(dep_findings) == 1
-    assert dep_findings[0].reachability == "not_reachable"
+    assert dep_findings[0].reachability == "under_investigation"
     assert "call_path" not in dep_findings[0].metadata

@@ -1,5 +1,6 @@
-"""Tests for Tier 1: lockfile-accurate parsing, PEP 440/SemVer pre-releases, offline OSV/KEV/EPSS cache,
-OpenVEX v0.2.0 & CycloneDX 1.5 VEX output, CI gating, baselines, inline suppressions, and SARIF fingerprints."""
+"""Tests for Tier 1: lockfile-accurate parsing, PEP 440/SemVer pre-releases, multi-branch OSV ranges,
+CVSS v3 scoring, PyPI import aliases, sound OpenVEX/CycloneDX VEX output, CI gating, baselines,
+and inline suppression visibility in Markdown & SARIF."""
 
 from __future__ import annotations
 
@@ -9,15 +10,21 @@ from pathlib import Path
 from typer.testing import CliRunner
 
 from vulnbox.analyzers import run_all_analyzers
-from vulnbox.analyzers.advisory_feed import normalize_osv_record
+from vulnbox.analyzers.advisory_feed import (
+    compute_cvss_v3_base_score,
+    normalize_osv_record,
+)
 from vulnbox.analyzers.dependency_reachability import DependencyReachabilityAnalyzer
 from vulnbox.analyzers.lockfiles import (
     is_version_below,
+    is_version_in_ranges,
     parse_node_dependencies,
     parse_python_dependencies,
 )
 from vulnbox.cli import app
 from vulnbox.engine import VulnBoxEngine
+from vulnbox.models import VerificationResult
+from vulnbox.reporting.markdown import render_markdown_report
 from vulnbox.reporting.sarif import build_sarif, validate_sarif
 from vulnbox.reporting.vex import build_cyclonedx_vex, build_openvex
 from vulnbox.suppressions import (
@@ -30,7 +37,6 @@ from vulnbox.suppressions import (
 
 
 def test_semver_and_pep440_prerelease_version_comparison():
-    # Pre-releases must sort strictly below the final release
     assert is_version_below("1.0rc1", "1.0", ecosystem="python") is True
     assert is_version_below("1.0.0a1", "1.0.0", ecosystem="python") is True
     assert is_version_below("5.4", "5.4", ecosystem="python") is False
@@ -39,8 +45,69 @@ def test_semver_and_pep440_prerelease_version_comparison():
     assert is_version_below("1.0.0-alpha.1", "1.0.0-beta.1", ecosystem="node") is True
 
 
+def test_osv_multibranch_ranges_cvss3_vector_scoring_and_pypi_aliases():
+    # Exact CVSS v3.1 Base Score calculation from vector strings
+    assert compute_cvss_v3_base_score("CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H") == 9.8
+    assert compute_cvss_v3_base_score("CVSS:3.1/AV:N/AC:H/PR:L/UI:R/S:U/C:L/I:N/A:N") == 2.6
+    assert compute_cvss_v3_base_score("CVSS:3.1/AV:N/AC:L/PR:L/UI:R/S:C/C:L/I:L/A:N") == 5.4
+
+    # Multi-branch OSV advisory (e.g. Django 3.2.20 fixed on 3.2.x AND 4.2.3 fixed on 4.2.x)
+    norm_django = normalize_osv_record(
+        {
+            "id": "PYSEC-2023-DEMO",
+            "aliases": ["CVE-2023-36053"],
+            "summary": "Django multi-branch advisory",
+            "severity": [{"type": "CVSS_V3", "score": "CVSS:3.1/AV:N/AC:H/PR:L/UI:R/S:U/C:L/I:N/A:N"}],
+            "affected": [
+                {
+                    "package": {"ecosystem": "PyPI", "name": "Django"},
+                    "ranges": [
+                        {
+                            "type": "ECOSYSTEM",
+                            "events": [
+                                {"introduced": "3.2"},
+                                {"fixed": "3.2.20"},
+                                {"introduced": "4.2"},
+                                {"fixed": "4.2.3"},
+                            ],
+                        }
+                    ],
+                }
+            ],
+        },
+        ecosystem="python",
+        package_name="django",
+    )
+    assert norm_django is not None
+    assert norm_django["severity"] == "low"  # CVSS 2.6, NOT fallback "high"!
+    ranges = norm_django["affected_ranges"]
+    assert len(ranges) == 2
+    # Django 3.2.20 is ALREADY patched on 3.2.x -> MUST NOT be flagged against 4.2.3!
+    assert is_version_in_ranges("3.2.20", ranges, ecosystem="python") == (False, None)
+    # Django 3.2.19 IS affected and recommends upgrading to 3.2.20 (its own branch fix)
+    assert is_version_in_ranges("3.2.19", ranges, ecosystem="python") == (True, "3.2.20")
+    assert is_version_in_ranges("4.2.2", ranges, ecosystem="python") == (True, "4.2.3")
+    assert is_version_in_ranges("4.2.3", ranges, ecosystem="python") == (False, None)
+
+    # PyPI distribution -> import module alias mapping
+    for pkg, expected_imp in [("pillow", "PIL"), ("beautifulsoup4", "bs4"), ("pyyaml", "yaml")]:
+        rec = normalize_osv_record(
+            {
+                "id": f"GHSA-{pkg}-1",
+                "affected": [
+                    {
+                        "package": {"ecosystem": "PyPI", "name": pkg},
+                        "ranges": [{"type": "ECOSYSTEM", "events": [{"introduced": "0"}, {"fixed": "9.9.9"}]}],
+                    }
+                ],
+            },
+            ecosystem="python",
+            package_name=pkg,
+        )
+        assert rec is not None and expected_imp in rec["imports"]
+
+
 def test_lockfiles_override_loose_manifest_ranges(tmp_path: Path):
-    # package.json has loose range ^4.17.0, but package-lock.json pins patched 4.17.21 -> NOT vulnerable!
     node_v3 = tmp_path / "node_v3"
     node_v3.mkdir()
     (node_v3 / "package.json").write_text(
@@ -64,13 +131,9 @@ def test_lockfiles_override_loose_manifest_ranges(tmp_path: Path):
     assert deps[0].name == "lodash" and deps[0].version == "4.17.21" and deps[0].is_lockfile is True
     assert DependencyReachabilityAnalyzer().analyze(node_v3) == []
 
-    # yarn.lock & pnpm-lock.yaml & poetry.lock exact extraction
     yarn_dir = tmp_path / "yarn_app"
     yarn_dir.mkdir()
-    (yarn_dir / "yarn.lock").write_text(
-        '"minimist@^1.2.0":\n  version "1.2.5"\n',
-        encoding="utf-8",
-    )
+    (yarn_dir / "yarn.lock").write_text('"minimist@^1.2.0":\n  version "1.2.5"\n', encoding="utf-8")
     y_deps = parse_node_dependencies(yarn_dir)
     assert any(d.name == "minimist" and d.version == "1.2.5" and d.is_lockfile for d in y_deps)
 
@@ -93,11 +156,11 @@ def test_lockfiles_override_loose_manifest_ranges(tmp_path: Path):
     assert any(d.name == "pyyaml" and d.version == "5.3.1" and d.is_lockfile for d in py_deps)
 
 
-def test_offline_osv_cache_kev_epss_and_vex_generation(tmp_path: Path):
+def test_offline_osv_cache_kev_epss_and_sound_vex_generation(tmp_path: Path):
     cache_dir = tmp_path / "adv_cache"
     cache_dir.mkdir()
 
-    norm = normalize_osv_record(
+    norm_direct_safe = normalize_osv_record(
         {
             "id": "GHSA-demo-1234",
             "aliases": ["CVE-2024-99999"],
@@ -114,10 +177,27 @@ def test_offline_osv_cache_kev_epss_and_vex_generation(tmp_path: Path):
         ecosystem="python",
         package_name="demo-pkg",
     )
-    assert norm is not None and norm["advisory_id"] == "CVE-2024-99999"
+    norm_unimported = normalize_osv_record(
+        {
+            "id": "GHSA-trans-5678",
+            "aliases": ["CVE-2024-88888"],
+            "summary": "Transitive vuln in transitive-pkg",
+            "severity": [{"type": "CVSS_V3", "score": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"}],
+            "affected": [
+                {
+                    "package": {"ecosystem": "PyPI", "name": "transitive-pkg"},
+                    "ranges": [{"type": "ECOSYSTEM", "events": [{"introduced": "0"}, {"fixed": "3.0.0"}]}],
+                }
+            ],
+        },
+        ecosystem="python",
+        package_name="transitive-pkg",
+    )
+    assert norm_direct_safe is not None and norm_unimported is not None
+    assert norm_unimported["severity"] == "critical"
 
     (cache_dir / "osv_cache.json").write_text(
-        json.dumps({"updated_at": "2026-11-27T00:00:00Z", "advisories": [norm]}),
+        json.dumps({"updated_at": "2026-11-27T00:00:00Z", "advisories": [norm_direct_safe, norm_unimported]}),
         encoding="utf-8",
     )
     (cache_dir / "kev_cache.json").write_text(
@@ -136,9 +216,17 @@ def test_offline_osv_cache_kev_epss_and_vex_generation(tmp_path: Path):
 
     repo = tmp_path / "repo"
     repo.mkdir()
-    (repo / "requirements.txt").write_text("demo-pkg==1.5.0\npyyaml==5.3.1\n", encoding="utf-8")
-    # app.py imports yaml.load (reachable), but never imports demo_pkg (not_reachable!)
-    (repo / "app.py").write_text("import yaml\n\ndef load(s):\n    return yaml.load(s)\n", encoding="utf-8")
+    (repo / "requirements.txt").write_text(
+        "demo-pkg==1.5.0\ntransitive-pkg==1.0.0\npyyaml==5.3.1\n",
+        encoding="utf-8",
+    )
+    # app.py imports yaml (calls yaml.load -> affected), imports demo_pkg (calls safe_fn only -> not_affected!),
+    # and never imports transitive_pkg directly -> MUST stay under_investigation (not_affected would be unsound!)
+    (repo / "app.py").write_text(
+        "import yaml\nimport demo_pkg\n\n"
+        "def load(s):\n    demo_pkg.safe_fn()\n    return yaml.load(s)\n",
+        encoding="utf-8",
+    )
 
     out_dir = tmp_path / "out"
     engine = VulnBoxEngine(backend="local")
@@ -151,8 +239,11 @@ def test_offline_osv_cache_kev_epss_and_vex_generation(tmp_path: Path):
         f.metadata["advisory_id"]: f for f in report.findings if f.category == "dependency"
     }
     assert dep_by_cve["CVE-2024-99999"].reachability == "not_reachable"
+    assert dep_by_cve["CVE-2024-99999"].metadata["reachability_basis"] == "imported_safe_symbols_only"
     assert dep_by_cve["CVE-2024-99999"].metadata["cisa_kev"] is True
     assert dep_by_cve["CVE-2024-99999"].metadata["epss_score"] == 0.875
+    assert dep_by_cve["CVE-2024-88888"].reachability == "under_investigation"
+    assert dep_by_cve["CVE-2024-88888"].metadata["reachability_basis"] == "not_directly_imported"
     assert dep_by_cve["CVE-2020-14343"].reachability == "reachable"
 
     openvex = build_openvex(report)
@@ -160,14 +251,48 @@ def test_offline_osv_cache_kev_epss_and_vex_generation(tmp_path: Path):
     stmts = {s["vulnerability"]["name"]: s for s in openvex["statements"]}
     assert stmts["CVE-2024-99999"]["status"] == "not_affected"
     assert stmts["CVE-2024-99999"]["justification"] == "vulnerable_code_not_in_execute_path"
+    assert stmts["CVE-2024-88888"]["status"] == "under_investigation"
     assert stmts["CVE-2020-14343"]["status"] == "affected"
 
     cdx = build_cyclonedx_vex(report)
     assert cdx["bomFormat"] == "CycloneDX" and cdx["specVersion"] == "1.5"
+    # Every affects[].ref MUST exist in top-level CycloneDX `components`
+    comp_refs = {c["bom-ref"] for c in cdx["components"]}
+    for vuln in cdx["vulnerabilities"]:
+        for aff in vuln["affects"]:
+            assert aff["ref"] in comp_refs
     cdx_by_id = {v["id"]: v for v in cdx["vulnerabilities"]}
     assert cdx_by_id["CVE-2024-99999"]["analysis"]["state"] == "not_affected"
-    assert cdx_by_id["CVE-2024-99999"]["analysis"]["justification"] == "code_not_reachable"
+    assert cdx_by_id["CVE-2024-88888"]["analysis"]["state"] == "in_triage"
     assert cdx_by_id["CVE-2020-14343"]["analysis"]["state"] == "exploitable"
+
+    # Verified fixed VEX statement MUST attach to the PATCHED version's PURL (6.0.2), NOT old 5.3.1!
+    yaml_finding = dep_by_cve["CVE-2020-14343"]
+    fixed_report = report.model_copy(
+        update={
+            "verifications": [
+                VerificationResult(
+                    patch_id="p-yaml",
+                    finding_id=yaml_finding.finding_id,
+                    sandbox_backend="local",
+                    baseline_tests_passed=True,
+                    patch_applied=True,
+                    finding_resolved=True,
+                    no_new_findings=True,
+                    existing_tests_passed_after=True,
+                    verified=True,
+                    summary="upgraded",
+                )
+            ]
+        }
+    )
+    fixed_ov = {s["vulnerability"]["name"]: s for s in build_openvex(fixed_report)["statements"]}
+    assert fixed_ov["CVE-2020-14343"]["status"] == "fixed"
+    assert fixed_ov["CVE-2020-14343"]["products"][0]["@id"] == "pkg:pypi/pyyaml@6.0.2"
+    fixed_cdx = build_cyclonedx_vex(fixed_report)
+    fixed_cdx_yaml = {v["id"]: v for v in fixed_cdx["vulnerabilities"]}["CVE-2020-14343"]
+    assert fixed_cdx_yaml["affects"][0]["ref"] == "pkg:pypi/pyyaml@6.0.2"
+    assert "pkg:pypi/pyyaml@6.0.2" in {c["bom-ref"] for c in fixed_cdx["components"]}
 
     sarif = build_sarif(report)
     validate_sarif(sarif)
@@ -176,7 +301,7 @@ def test_offline_osv_cache_kev_epss_and_vex_generation(tmp_path: Path):
         assert "security-severity" in res["properties"]
 
 
-def test_inline_suppressions_baseline_and_cli_fail_on_gate(tmp_path: Path):
+def test_inline_suppressions_visibility_baseline_stability_and_cli_fail_on_gate(tmp_path: Path):
     repo = tmp_path / "ci_repo"
     repo.mkdir()
     (repo / "app.py").write_text(
@@ -184,15 +309,29 @@ def test_inline_suppressions_baseline_and_cli_fail_on_gate(tmp_path: Path):
         "def a(s):\n"
         "    return yaml.load(s)  # vulnbox: ignore[PY-YAML-001]\n"
         "def b(s):\n"
-        "    return yaml.load(s)\n",
+        "    x = 1\n"
+        "    return yaml.load(s)\n"
+        "    y = 2\n",
         encoding="utf-8",
     )
     findings = run_all_analyzers(repo)
     yaml_findings = [f for f in findings if f.rule_id == "PY-YAML-001"]
     assert len(yaml_findings) == 1
-    assert yaml_findings[0].start_line == 5
+    assert yaml_findings[0].start_line == 6
 
-    # Write baseline, then shift line numbers by inserting comments above -> baseline STILL matches!
+    # Inline suppressions MUST be surfaced in AuditReport, Markdown, and SARIF 2.1.0 `suppressions`
+    report, _ = VulnBoxEngine(backend="local").scan(repo)
+    assert len(report.suppressed_findings) == 1
+    assert report.suppressed_findings[0].rule_id == "PY-YAML-001"
+    md = render_markdown_report(report)
+    assert "Suppressed Findings (Inline)" in md
+    sarif = build_sarif(report)
+    validate_sarif(sarif)
+    suppressed_sarif = [r for r in sarif["runs"][0]["results"] if r.get("suppressions")]
+    assert len(suppressed_sarif) == 1
+    assert suppressed_sarif[0]["suppressions"][0]["kind"] == "inSource"
+
+    # Write baseline, then BOTH shift lines AND edit neighboring lines above/below -> baseline STILL matches!
     baseline_file = tmp_path / "baseline.json"
     write_baseline(yaml_findings, baseline_file)
     fp_before = compute_finding_fingerprint(yaml_findings[0])
@@ -202,11 +341,13 @@ def test_inline_suppressions_baseline_and_cli_fail_on_gate(tmp_path: Path):
         "def a(s):\n"
         "    return yaml.load(s)  # vulnbox: ignore[PY-YAML-001]\n"
         "def b(s):\n"
-        "    return yaml.load(s)\n",
+        "    x = 999  # edited neighboring line above\n"
+        "    return yaml.load(s)\n"
+        "    y = 888  # edited neighboring line below\n",
         encoding="utf-8",
     )
     shifted_findings = [f for f in run_all_analyzers(repo) if f.rule_id == "PY-YAML-001"]
-    assert shifted_findings[0].start_line == 7
+    assert shifted_findings[0].start_line == 8
     assert compute_finding_fingerprint(shifted_findings[0]) == fp_before
 
     kept, baselined_n = filter_by_baseline(shifted_findings, load_baseline(baseline_file))
@@ -214,7 +355,6 @@ def test_inline_suppressions_baseline_and_cli_fail_on_gate(tmp_path: Path):
     assert should_fail_ci(shifted_findings, "high") is True
     assert should_fail_ci(shifted_findings, "critical") is False
 
-    # CLI `--fail-on high` exits 1 without baseline and 0 with baseline!
     runner = CliRunner()
     res_fail = runner.invoke(
         app,

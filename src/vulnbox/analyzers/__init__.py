@@ -64,7 +64,7 @@ def register_builtin_analyzers(registry: PluginRegistry = default_registry) -> N
 register_builtin_analyzers(default_registry)
 
 
-def run_all_analyzers(
+def run_all_analyzers_with_suppressions(
     workspace_dir: Path,
     scrub_summary: ScrubSummary | None = None,
     advisories_path: Path | None = None,
@@ -73,8 +73,8 @@ def run_all_analyzers(
     call_graph: Any | None = None,
     advisory_cache_dir: Path | None = None,
     respect_suppressions: bool = True,
-) -> list[Finding]:
-    """Run all registered analyzers (including entry_points plugins), deduplicate, and apply suppressions."""
+) -> tuple[list[Finding], list[Finding]]:
+    """Run all registered analyzers, deduplicate, and return `(active_findings, suppressed_findings)`."""
     reg = registry or default_registry
     if reg is default_registry:
         reg.load_entry_point_plugins()
@@ -98,8 +98,32 @@ def run_all_analyzers(
             seen.add(f.finding_id)
             deduped.append(f)
     if respect_suppressions:
-        deduped, _ = apply_inline_suppressions(deduped, workspace_dir)
-    return deduped
+        return apply_inline_suppressions(deduped, workspace_dir)
+    return deduped, []
+
+
+def run_all_analyzers(
+    workspace_dir: Path,
+    scrub_summary: ScrubSummary | None = None,
+    advisories_path: Path | None = None,
+    profile: RepoProfile | None = None,
+    registry: PluginRegistry | None = None,
+    call_graph: Any | None = None,
+    advisory_cache_dir: Path | None = None,
+    respect_suppressions: bool = True,
+) -> list[Finding]:
+    """Run all registered analyzers (including entry_points plugins), deduplicate, and apply suppressions."""
+    active, _suppressed = run_all_analyzers_with_suppressions(
+        workspace_dir,
+        scrub_summary=scrub_summary,
+        advisories_path=advisories_path,
+        profile=profile,
+        registry=registry,
+        call_graph=call_graph,
+        advisory_cache_dir=advisory_cache_dir,
+        respect_suppressions=respect_suppressions,
+    )
+    return active
 
 
 __all__ = [
@@ -110,4 +134,5 @@ __all__ = [
     "PythonSASTAnalyzer",
     "register_builtin_analyzers",
     "run_all_analyzers",
+    "run_all_analyzers_with_suppressions",
 ]

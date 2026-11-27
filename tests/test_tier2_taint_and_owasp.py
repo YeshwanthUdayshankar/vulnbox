@@ -1,4 +1,4 @@
-"""Tests for Tier 2: intra-procedural source->sink taint engine & all 10 new OWASP rule families."""
+"""Tests for Tier 2: flow-sensitive source->sink taint engine & all 10 OWASP rule families."""
 
 from __future__ import annotations
 
@@ -13,30 +13,114 @@ from vulnbox.remediation.dynamic_probe import infer_probe_for_finding
 FIXTURES = Path(__file__).parent / "fixtures"
 
 
-def test_taint_engine_distinguishes_real_sanitizer_from_unrelated_resolve(tmp_path: Path):
-    # An unrelated `Path("x").resolve()` and `foo.startswith("a")` must NOT mask a real PY-PATH-001!
+def test_taint_engine_guard_soundness_reassignment_and_fastapi_depends(tmp_path: Path):
     (tmp_path / "tricky.py").write_text(
-        "import os\n"
+        "import os, re, requests\n"
         "from pathlib import Path\n"
+        "from fastapi import FastAPI, Depends\n"
+        "app = FastAPI()\n"
+        "\n"
         "def vulnerable_with_decoy(filename):\n"
         "    other = str(Path('config.ini').resolve())\n"
-        "    if other.startswith('/etc'):\n"
+        "    if other.startswith('/etc/'):\n"
         "        pass\n"
         "    target = os.path.join('/srv/public', filename)\n"
         "    with open(target) as f:\n"
         "        return f.read()\n"
         "\n"
-        "def genuinely_safe(filename):\n"
+        "def vulnerable_unanchored_re_match(filename):\n"
+        "    if re.match(r'[a-z]+', filename):\n"
+        "        target = os.path.join('/srv/public', filename)\n"
+        "        with open(target) as f:\n"
+        "            return f.read()\n"
+        "\n"
+        "def vulnerable_prefix_without_sep(filename):\n"
+        "    target = os.path.join('/srv/data', filename)\n"
+        "    if not os.path.realpath(target).startswith('/srv/data'):\n"
+        "        raise ValueError('bad')\n"
+        "    with open(target) as f:\n"
+        "        return f.read()\n"
+        "\n"
+        "def vulnerable_reassigned_after_sanitize(filename, request):\n"
+        "    safe = os.path.basename(filename)\n"
+        "    safe = request.args.get('file')\n"
+        "    target = os.path.join('/srv/public', safe)\n"
+        "    with open(target) as f:\n"
+        "        return f.read()\n"
+        "\n"
+        "def vulnerable_noop_if_guard(filename):\n"
+        "    target = os.path.join('/srv/public', filename)\n"
+        "    if Path(target).resolve().is_relative_to(Path('/srv/public')):\n"
+        "        pass\n"
+        "    with open(target) as f:\n"
+        "        return f.read()\n"
+        "\n"
+        "def genuinely_safe_basename(filename):\n"
         "    safe_name = os.path.basename(filename)\n"
         "    target = os.path.join('/srv/public', safe_name)\n"
         "    with open(target) as f:\n"
-        "        return f.read()\n",
+        "        return f.read()\n"
+        "\n"
+        "def genuinely_safe_sep_guard(filename):\n"
+        "    target = os.path.join('/srv/data', filename)\n"
+        "    if not os.path.realpath(target).startswith('/srv/data' + os.sep):\n"
+        "        raise ValueError('bad')\n"
+        "    with open(target) as f:\n"
+        "        return f.read()\n"
+        "\n"
+        "@app.get('/items')\n"
+        "def fastapi_depends_not_tainted(cfg=Depends(lambda: 'https://api.internal')):\n"
+        "    return requests.get(cfg).text\n",
         encoding="utf-8",
     )
-    findings = [f for f in PythonSASTAnalyzer().analyze(tmp_path) if f.rule_id == "PY-PATH-001"]
-    fns = {f.metadata["function"] for f in findings}
-    assert "vulnerable_with_decoy" in fns
-    assert "genuinely_safe" not in fns
+    findings = PythonSASTAnalyzer().analyze(tmp_path)
+    path_fns = {f.metadata["function"] for f in findings if f.rule_id == "PY-PATH-001"}
+    assert "vulnerable_with_decoy" in path_fns
+    assert "vulnerable_unanchored_re_match" in path_fns
+    assert "vulnerable_prefix_without_sep" in path_fns
+    assert "vulnerable_reassigned_after_sanitize" in path_fns
+    assert "vulnerable_noop_if_guard" in path_fns
+    assert "genuinely_safe_basename" not in path_fns
+    assert "genuinely_safe_sep_guard" not in path_fns
+    # FastAPI Depends(...) param MUST NOT trigger PY-SSRF-001
+    assert [f for f in findings if f.rule_id == "PY-SSRF-001"] == []
+
+
+def test_python_xxe_lxml_high_vs_stdlib_low_and_ast_defusedxml(tmp_path: Path):
+    (tmp_path / "lxml_vuln.py").write_text(
+        "from lxml import etree\n"
+        "def parse_untrusted(xml_bytes):\n"
+        "    return etree.fromstring(xml_bytes)\n"
+        "def parse_safe(xml_bytes):\n"
+        "    safe_parser = etree.XMLParser(resolve_entities=False, no_network=True)\n"
+        "    return etree.fromstring(xml_bytes, parser=safe_parser)\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "stdlib_vs_defused.py").write_text(
+        "# comment mentioning defusedxml should NOT disable stdlib detection\n"
+        "import xml.etree.ElementTree as ET\n"
+        "def parse_stdlib(xml_bytes):\n"
+        "    return ET.fromstring(xml_bytes)\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "real_defused.py").write_text(
+        "import defusedxml.ElementTree as ET\n"
+        "def parse_ok(xml_bytes):\n"
+        "    return ET.fromstring(xml_bytes)\n",
+        encoding="utf-8",
+    )
+    findings = [f for f in PythonSASTAnalyzer().analyze(tmp_path) if f.rule_id == "PY-XXE-001"]
+    by_file = {f.file_path: f for f in findings}
+    assert "lxml_vuln.py" in by_file
+    assert by_file["lxml_vuln.py"].severity == "high"
+    assert by_file["lxml_vuln.py"].cwe_id == "CWE-611"
+    # parse_safe inside lxml_vuln.py must NOT be flagged (only 1 finding in lxml_vuln.py)
+    assert len([f for f in findings if f.file_path == "lxml_vuln.py"]) == 1
+
+    assert "stdlib_vs_defused.py" in by_file
+    assert by_file["stdlib_vs_defused.py"].severity == "low"
+    assert by_file["stdlib_vs_defused.py"].cwe_id == "CWE-776"
+    assert "real_defused.py" not in by_file
 
 
 def test_python_owasp_rule_families_detection_and_negative_guards(tmp_path: Path):
@@ -44,7 +128,7 @@ def test_python_owasp_rule_families_detection_and_negative_guards(tmp_path: Path
         "import random\n"
         "import requests\n"
         "import jwt\n"
-        "import xml.etree.ElementTree as ET\n"
+        "from lxml import etree\n"
         "from flask import Flask, request, redirect, render_template_string\n"
         "\n"
         "app = Flask(__name__)\n"
@@ -62,7 +146,7 @@ def test_python_owasp_rule_families_detection_and_negative_guards(tmp_path: Path
         "\n"
         "@app.route('/xxe')\n"
         "def xxe_route():\n"
-        "    return str(ET.fromstring(request.data))\n"
+        "    return str(etree.fromstring(request.data))\n"
         "\n"
         "def decode_bad_jwt(tok):\n"
         "    return jwt.decode(tok, options={'verify_signature': False})\n"
@@ -103,7 +187,6 @@ def test_python_owasp_rule_families_detection_and_negative_guards(tmp_path: Path
     ):
         assert expected in rule_ids, f"Missing expected rule {expected}; got {rule_ids}"
 
-    # Verify safe_redir did NOT trigger PY-REDIR-001
     redir_lines = [f.start_line for f in findings if f.rule_id == "PY-REDIR-001"]
     assert len(redir_lines) == 1
 

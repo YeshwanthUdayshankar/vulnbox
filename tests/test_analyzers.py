@@ -26,8 +26,8 @@ def test_python_fixture_analyzers():
         by_rule = {f.rule_id: f for f in findings}
         # PyYAML yaml.load is imported & invoked -> reachable
         assert by_rule["DEP-CVE-2020-14343"].reachability == "reachable"
-        # urllib3 is in requirements.txt but never imported -> not_reachable
-        assert by_rule["DEP-CVE-2023-45803"].reachability == "not_reachable"
+        # urllib3 is in requirements.txt but not directly imported (may be transitive) -> under_investigation
+        assert by_rule["DEP-CVE-2023-45803"].reachability == "under_investigation"
     finally:
         cleanup_workspace(ws)
 

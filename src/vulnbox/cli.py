@@ -485,9 +485,15 @@ def clean_cache() -> None:
 
 
 @app.command("mcp")
-def mcp_cmd() -> None:
-    """Start the stdio MCP (Model Context Protocol) server exposing scan, probe, and verify-patch tools."""
-    serve_mcp_stdio()
+def mcp_cmd(
+    allow_local: bool = typer.Option(
+        False,
+        "--allow-local",
+        help="Explicitly allow non-containerized local backend execution in MCP tools (unsafe for untrusted repos).",
+    ),
+) -> None:
+    """Start the stdio MCP (Model Context Protocol) server exposing scan, probe, and verify-patch tools (Docker by default)."""
+    serve_mcp_stdio(allow_local=allow_local)
 
 
 @app.command()

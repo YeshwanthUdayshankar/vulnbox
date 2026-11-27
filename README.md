@@ -190,9 +190,10 @@ go = "vulnbox_go:register"  # callable taking (registry: PluginRegistry) -> None
 
 ## CI Integration (GitHub Action & Pre-Commit) & Threat Model
 
-- **GitHub Action:** Use [`action.yml`](action.yml) to sync offline OSV/KEV/EPSS advisories, gate PRs with `fail-on: high`, emit OpenVEX/CycloneDX VEX, and upload `findings.sarif.json` (with `partialFingerprints` & `security-severity`) to GitHub Code Scanning.
+- **GitHub Action:** Use [`action.yml`](action.yml) to sync offline OSV/KEV/EPSS advisories, gate PRs with `fail-on: high`, emit OpenVEX/CycloneDX VEX, and upload `findings.sarif.json` (with `partialFingerprints`, `security-severity`, and SARIF `suppressions`) to GitHub Code Scanning. **Security warning:** Never enable `deep: true` (`--deep`) on `pull_request_target` workflows, because `--deep` executes the PR repository's code.
+- **MCP Server Hardening:** `vulnbox mcp` defaults all tools to `--backend docker`, refuses `local` (and silent `auto` fallback) unless explicitly launched with `vulnbox mcp --allow-local`, and validates `start_cmd`, diffs, probes, and regression tests through `guardrails.py`.
 - **Pre-Commit Hook:** Reference [`.pre-commit-hooks.yaml`](.pre-commit-hooks.yaml) (`id: vulnbox-scan`) in `.pre-commit-config.yaml`.
-- **Inline Suppressions:** Add `# vulnbox: ignore[PY-SQL-001]` (Python) or `// vulnbox: ignore[JS-XSS-001]` (JS/TS) on the same or preceding line.
+- **Inline Suppressions:** Add `# vulnbox: ignore[PY-SQL-001]` (Python) or `// vulnbox: ignore[JS-XSS-001]` (JS/TS) on the same or preceding line (surfaced transparently in Markdown & SARIF `suppressions`).
 - **Sandbox Threat Model:** See [`docs/threat-model.md`](docs/threat-model.md) for assets, trust boundaries, Docker vs. local sandbox guarantees, and explicit non-goals.
 
 ## Agent Skill

@@ -36,7 +36,19 @@
                           "required": ["text"],
                           "properties": { "text": { "type": "string" } }
                         },
-                        "properties": { "type": "object" }
+                        "suppressions": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "required": ["kind"],
+                    "properties": {
+                      "kind": { "type": "string" },
+                      "status": { "type": "string" },
+                      "justification": { "type": "string" }
+                    }
+                  }
+                },
+                "properties": { "type": "object" }
                       }
                     }
                   }
@@ -83,6 +95,18 @@
                           }
                         }
                       }
+                    }
+                  }
+                },
+                "suppressions": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "required": ["kind"],
+                    "properties": {
+                      "kind": { "type": "string" },
+                      "status": { "type": "string" },
+                      "justification": { "type": "string" }
                     }
                   }
                 },

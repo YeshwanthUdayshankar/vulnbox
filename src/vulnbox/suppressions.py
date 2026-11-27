@@ -6,7 +6,6 @@ import hashlib
 import json
 import re
 from pathlib import Path
-from typing import Any
 
 from vulnbox.models import Finding
 
@@ -24,15 +23,33 @@ INLINE_IGNORE_RE = re.compile(
 )
 
 
+_SNIPPET_LINENO_RE = re.compile(r"^\s*(\d+):\s?(.*)$")
+
+
 def compute_finding_fingerprint(finding: Finding) -> str:
-    """Compute a line-number-independent SHA-256 fingerprint for CI baselines & SARIF tracking."""
-    norm_lines: list[str] = []
+    """Compute a line-number-independent SHA-256 fingerprint using ONLY primary finding lines.
+
+    Excludes surrounding context lines (`start_line - 1`, `end_line + 1`) emitted by
+    `extract_snippet()` so editing an unrelated neighboring line does not break baselines.
+    """
+    primary_lines: list[str] = []
+    fallback_lines: list[str] = []
     for raw_line in (finding.snippet or "").splitlines():
-        # Strip leading `123: ` line number prefixes emitted by extract_snippet()
-        cleaned = re.sub(r"^\s*\d+:\s?", "", raw_line).strip()
-        if cleaned:
-            norm_lines.append(cleaned)
-    norm_code = "\n".join(norm_lines) if norm_lines else finding.title
+        m = _SNIPPET_LINENO_RE.match(raw_line)
+        if m:
+            ln = int(m.group(1))
+            code = m.group(2).strip()
+            if code:
+                fallback_lines.append(code)
+                if finding.start_line <= ln <= max(finding.start_line, finding.end_line):
+                    primary_lines.append(code)
+        else:
+            cleaned = raw_line.strip()
+            if cleaned:
+                fallback_lines.append(cleaned)
+
+    chosen = primary_lines if primary_lines else fallback_lines
+    norm_code = "\n".join(chosen) if chosen else finding.title
     payload = f"{finding.rule_id}|{finding.file_path}|{norm_code}"
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:24]
 
@@ -47,11 +64,15 @@ def _rules_ignored_on_line(line: str) -> set[str]:
 def apply_inline_suppressions(
     findings: list[Finding],
     workspace_dir: Path,
-) -> tuple[list[Finding], list[dict[str, Any]]]:
-    """Filter findings suppressed via `# vulnbox: ignore[RULE-ID]` or `// vulnbox: ignore[RULE-ID]`."""
+) -> tuple[list[Finding], list[Finding]]:
+    """Filter findings suppressed via `# vulnbox: ignore[RULE-ID]` or `// vulnbox: ignore[RULE-ID]`.
+
+    Returns `(active_findings, suppressed_findings)` so suppressed items can be surfaced
+    transparently in Markdown reports and SARIF 2.1.0 `suppressions`.
+    """
     file_cache: dict[str, list[str]] = {}
     active: list[Finding] = []
-    suppressed: list[dict[str, Any]] = []
+    suppressed: list[Finding] = []
 
     for f in findings:
         rel = f.file_path
@@ -68,20 +89,22 @@ def apply_inline_suppressions(
 
         lines = file_cache[rel]
         ignored_rules: set[str] = set()
+        matched_line_no: int | None = None
         for check_line in (f.start_line, f.start_line - 1):
             if 1 <= check_line <= len(lines):
-                ignored_rules.update(_rules_ignored_on_line(lines[check_line - 1]))
+                found_rules = _rules_ignored_on_line(lines[check_line - 1])
+                if found_rules:
+                    ignored_rules.update(found_rules)
+                    if matched_line_no is None:
+                        matched_line_no = check_line
 
         if "*" in ignored_rules or f.rule_id.upper() in ignored_rules:
-            suppressed.append(
-                {
-                    "finding_id": f.finding_id,
-                    "rule_id": f.rule_id,
-                    "file_path": f.file_path,
-                    "line": f.start_line,
-                    "reason": "inline_suppression",
-                }
+            sup_meta = dict(f.metadata)
+            sup_meta["suppression_kind"] = "inSource"
+            sup_meta["suppression_reason"] = (
+                f"Inline vulnbox: ignore directive on line {matched_line_no or f.start_line}"
             )
+            suppressed.append(f.model_copy(update={"metadata": sup_meta}))
         else:
             active.append(f)
 

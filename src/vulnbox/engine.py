@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from vulnbox._version import __version__ as TOOL_VERSION
-from vulnbox.analyzers import run_all_analyzers
+from vulnbox.analyzers import run_all_analyzers, run_all_analyzers_with_suppressions
 from vulnbox.callgraph import build_hybrid_call_graph
 from vulnbox.llm import (
     GuardrailPolicy,
@@ -152,7 +152,7 @@ class VulnBoxEngine:
                     policy=exec_policy,
                     include_runtime=deep,
                 )
-                findings = run_all_analyzers(
+                findings, suppressed_findings = run_all_analyzers_with_suppressions(
                     sws.path,
                     scrub_summary=sws.summary,
                     advisories_path=advisories_path,
@@ -191,6 +191,7 @@ class VulnBoxEngine:
                     profile=prof,
                     scrub_summary=sws.summary,
                     findings=findings,
+                    suppressed_findings=suppressed_findings,
                     call_graph_summary=cg.to_summary(),
                     memory_probes=memory_probes,
                 )

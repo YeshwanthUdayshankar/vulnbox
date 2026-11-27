@@ -18,7 +18,7 @@ inputs:
     required: false
     default: ""
   deep:
-    description: "Enable --deep runtime call-graph tracing & memory/FD leak probing"
+    description: "Enable --deep runtime call-graph tracing & memory/FD leak probing. WARNING: NEVER enable with pull_request_target because --deep executes the PR repository's code."
     required: false
     default: "false"
   sync-advisories:
@@ -46,45 +46,57 @@ runs:
   using: "composite"
   steps:
     - name: Set up Python 3.12
-      uses: actions/setup-python@v5
+      uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
       with:
         python-version: "3.12"
 
     - name: Install VulnBox
       shell: bash
-      run: python3 -m pip install --quiet "${{ github.action_path }}"
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+      run: python3 -m pip install --quiet "$ACTION_PATH"
 
     - name: Sync offline advisory cache (OSV + KEV + EPSS)
       if: ${{ inputs.sync-advisories == 'true' }}
       shell: bash
-      run: vulnbox sync-advisories "${{ inputs.path }}"
+      env:
+        INPUT_PATH: ${{ inputs.path }}
+      run: vulnbox sync-advisories "$INPUT_PATH"
 
     - name: Run VulnBox scan
       id: scan
       shell: bash
+      env:
+        INPUT_PATH: ${{ inputs.path }}
+        INPUT_OUT_DIR: ${{ inputs.out-dir }}
+        INPUT_FAIL_ON: ${{ inputs.fail-on }}
+        INPUT_BASELINE: ${{ inputs.baseline }}
+        INPUT_DEEP: ${{ inputs.deep }}
       run: |
-        ARGS=("scan" "${{ inputs.path }}" "--backend" "local" "--out" "${{ inputs.out-dir }}")
-        if [ -n "${{ inputs.fail-on }}" ]; then
-          ARGS+=("--fail-on" "${{ inputs.fail-on }}")
+        ARGS=("scan" "$INPUT_PATH" "--backend" "local" "--out" "$INPUT_OUT_DIR")
+        if [ -n "$INPUT_FAIL_ON" ]; then
+          ARGS+=("--fail-on" "$INPUT_FAIL_ON")
         fi
-        if [ -n "${{ inputs.baseline }}" ]; then
-          ARGS+=("--baseline" "${{ inputs.baseline }}")
+        if [ -n "$INPUT_BASELINE" ]; then
+          ARGS+=("--baseline" "$INPUT_BASELINE")
         fi
-        if [ "${{ inputs.deep }}" = "true" ]; then
+        if [ "$INPUT_DEEP" = "true" ]; then
           ARGS+=("--deep")
         fi
         set +e
         vulnbox "${ARGS[@]}"
         SCAN_RC=$?
         set -e
-        SARIF=$(find "${{ inputs.out-dir }}" -name "findings.sarif.json" | head -n 1)
-        VEX=$(find "${{ inputs.out-dir }}" -name "openvex.json" | head -n 1)
-        echo "sarif_path=${SARIF}" >> "$GITHUB_OUTPUT"
-        echo "openvex_path=${VEX}" >> "$GITHUB_OUTPUT"
-        exit $SCAN_RC
+        SARIF=$(find "$INPUT_OUT_DIR" -name "findings.sarif.json" | head -n 1)
+        VEX=$(find "$INPUT_OUT_DIR" -name "openvex.json" | head -n 1)
+        {
+          echo "sarif_path=${SARIF}"
+          echo "openvex_path=${VEX}"
+        } >> "$GITHUB_OUTPUT"
+        exit "$SCAN_RC"
 
     - name: Upload SARIF to GitHub Code Scanning
       if: ${{ always() && inputs.upload-sarif == 'true' && steps.scan.outputs.sarif_path != '' }}
-      uses: github/codeql-action/upload-sarif@v3
+      uses: github/codeql-action/upload-sarif@74c1aea9df7c0f02e9b7bfe4a8935abf2e5e3aa6 # v3
       with:
         sarif_file: ${{ steps.scan.outputs.sarif_path }}

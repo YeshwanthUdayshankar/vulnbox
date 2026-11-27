@@ -8,18 +8,42 @@ from typing import Any
 from vulnbox.models import AuditReport, Finding, VerificationResult
 
 
-def _package_purl(finding: Finding) -> str:
+def _package_purl(finding: Finding, *, use_fixed_version: bool = False) -> tuple[str, str, str]:
+    """Return `(purl, package_name, version)` for a dependency finding.
+
+    When `use_fixed_version=True` (for verified `"fixed"` / `"resolved"` statements),
+    attaches the VEX statement to the patched version's PURL rather than the vulnerable one.
+    """
     eco = str(finding.metadata.get("ecosystem") or "python").lower()
-    pkg = str(finding.metadata.get("package") or "unknown").lower()
-    ver = str(finding.metadata.get("installed_version") or "0.0.0").lstrip("^~>=<v")
-    purl_type = "pypi" if eco == "python" else "npm"
-    return f"pkg:{purl_type}/{pkg}@{ver}"
+    pkg = str(finding.metadata.get("package") or "unknown")
+    if eco != "go":
+        pkg = pkg.lower()
+    raw_ver = (
+        finding.metadata.get("fixed_version")
+        if use_fixed_version and finding.metadata.get("fixed_version")
+        else finding.metadata.get("installed_version")
+    )
+    ver = str(raw_ver or "0.0.0").lstrip("^~>=<v")
+    if eco == "python":
+        purl_type = "pypi"
+    elif eco == "go":
+        purl_type = "golang"
+    else:
+        purl_type = "npm"
+    return f"pkg:{purl_type}/{pkg}@{ver}", pkg, ver
 
 
 def _statement_state(
     finding: Finding, ver: VerificationResult | None
-) -> tuple[str, str | None, str, str]:
-    """Map VulnBox reachability + patch verification into OpenVEX & CycloneDX VEX states."""
+) -> tuple[str, str | None, str, str, bool]:
+    """Map VulnBox reachability + patch verification into OpenVEX & CycloneDX VEX states.
+
+    Returns `(openvex_status, openvex_justification, cdx_state, detail, use_fixed_purl)`.
+    Soundness rule: NEVER emit `not_affected` unless vulnerable-symbol absence is positively
+    proven on a directly imported package (`reachability_basis == "imported_safe_symbols_only"`
+    or `reachability == "not_reachable"` with direct citations). Unimported/transitive packages
+    remain `under_investigation` / `in_triage`.
+    """
     if ver is not None and ver.verified:
         fixed_ver = finding.metadata.get("fixed_version") or "patched version"
         return (
@@ -27,15 +51,23 @@ def _statement_state(
             None,
             "resolved",
             f"Verified dependency upgrade to {fixed_ver} inside isolated sandbox.",
+            True,
         )
 
-    if finding.reachability == "not_reachable":
+    basis = str(finding.metadata.get("reachability_basis") or "")
+    has_direct_proof = (
+        finding.reachability == "not_reachable"
+        and basis != "not_directly_imported"
+        and (basis == "imported_safe_symbols_only" or bool(finding.metadata.get("citations")))
+    )
+    if has_direct_proof:
         return (
             "not_affected",
             "vulnerable_code_not_in_execute_path",
             "not_affected",
-            f"VulnBox static/hybrid call-graph analysis verified that vulnerable symbols of "
-            f"'{finding.metadata.get('package', 'package')}' are not imported or reachable from application entrypoints.",
+            f"VulnBox AST/call-graph analysis confirmed '{finding.metadata.get('package', 'package')}' "
+            f"is directly imported using only non-vulnerable APIs (vulnerable symbols not invoked).",
+            False,
         )
 
     if finding.reachability == "reachable":
@@ -54,13 +86,24 @@ def _statement_state(
             None,
             "exploitable",
             f"Vulnerable code path is reachable{risk_note}.{path_note}",
+            False,
         )
 
+    if basis == "not_directly_imported":
+        triage_msg = (
+            "Package is not directly imported in application source, but may be invoked transitively "
+            "or via an indirect import alias; requires transitive/runtime verification before marking not_affected."
+        )
+    else:
+        triage_msg = (
+            "Package is imported; exact vulnerable symbol reachability requires deeper dynamic verification."
+        )
     return (
         "under_investigation",
         None,
         "in_triage",
-        "Package is imported; exact vulnerable symbol reachability requires deeper dynamic verification.",
+        triage_msg,
+        False,
     )
 
 
@@ -76,9 +119,9 @@ def build_openvex(report: AuditReport) -> dict[str, Any]:
         if f.category != "dependency":
             continue
         ver = ver_by_finding.get(f.finding_id)
-        ov_status, ov_just, _cdx_state, detail = _statement_state(f, ver)
+        ov_status, ov_just, _cdx_state, detail, use_fixed = _statement_state(f, ver)
         adv_id = str(f.metadata.get("advisory_id") or f.rule_id.removeprefix("DEP-"))
-        purl = _package_purl(f)
+        purl, _pkg, _ver = _package_purl(f, use_fixed_version=use_fixed)
 
         stmt: dict[str, Any] = {
             "vulnerability": {
@@ -109,7 +152,7 @@ def build_openvex(report: AuditReport) -> dict[str, Any]:
 
 
 def build_cyclonedx_vex(report: AuditReport) -> dict[str, Any]:
-    """Generate a CycloneDX 1.5 JSON VEX document enriched with reachability, EPSS, and KEV."""
+    """Generate a CycloneDX 1.5 JSON VEX document enriched with components BOM, reachability, EPSS, and KEV."""
     ver_by_finding = {v.finding_id: v for v in report.verifications}
     serial_hex = hashlib.sha256(
         f"cdx:{report.profile.repo_path}:{report.timestamp}".encode()
@@ -119,14 +162,24 @@ def build_cyclonedx_vex(report: AuditReport) -> dict[str, Any]:
         f"a{serial_hex[17:20]}-{serial_hex[20:32]}"
     )
 
+    components_by_ref: dict[str, dict[str, Any]] = {}
     vulns: list[dict[str, Any]] = []
     for f in report.findings:
         if f.category != "dependency":
             continue
         ver = ver_by_finding.get(f.finding_id)
-        _ov_status, _ov_just, cdx_state, detail = _statement_state(f, ver)
+        _ov_status, _ov_just, cdx_state, detail, use_fixed = _statement_state(f, ver)
         adv_id = str(f.metadata.get("advisory_id") or f.rule_id.removeprefix("DEP-"))
-        purl = _package_purl(f)
+        purl, pkg, pkg_ver = _package_purl(f, use_fixed_version=use_fixed)
+
+        if purl not in components_by_ref:
+            components_by_ref[purl] = {
+                "type": "library",
+                "bom-ref": purl,
+                "name": pkg,
+                "version": pkg_ver,
+                "purl": purl,
+            }
 
         analysis: dict[str, Any] = {
             "state": cdx_state,
@@ -174,5 +227,6 @@ def build_cyclonedx_vex(report: AuditReport) -> dict[str, Any]:
                 }
             ],
         },
+        "components": list(components_by_ref.values()),
         "vulnerabilities": vulns,
     }

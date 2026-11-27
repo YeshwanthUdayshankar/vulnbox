@@ -75,26 +75,62 @@ def _parse_semver(ver: str) -> tuple[int, int, int, int, tuple[tuple[int, int | 
     return (major, minor, patch, 0, tuple(pre_parts))
 
 
-def is_version_below(installed: str, threshold: str, ecosystem: str = "python") -> bool:
-    """Accurately compare `installed < threshold` using PEP 440 (Python) or SemVer 2.0 (Node)."""
-    if ecosystem == "node":
-        sv_inst = _parse_semver(installed)
-        sv_thresh = _parse_semver(threshold)
-        if sv_inst is not None and sv_thresh is not None:
-            return sv_inst < sv_thresh
+def compare_versions(a: str, b: str, ecosystem: str = "python") -> int:
+    """Compare two version strings using PEP 440 (Python) or SemVer 2.0 (Node/Go).
+
+    Returns -1 if `a < b`, 0 if `a == b`, or 1 if `a > b`.
+    """
+    if ecosystem in ("node", "go"):
+        sv_a = _parse_semver(a)
+        sv_b = _parse_semver(b)
+        if sv_a is not None and sv_b is not None:
+            return -1 if sv_a < sv_b else (1 if sv_a > sv_b else 0)
 
     try:
-        v_inst = Version(installed.strip().lstrip("^~>=<v"))
-        v_thresh = Version(threshold.strip().lstrip("^~>=<v"))
-        return v_inst < v_thresh
+        v_a = Version(a.strip().lstrip("^~>=<v"))
+        v_b = Version(b.strip().lstrip("^~>=<v"))
+        return -1 if v_a < v_b else (1 if v_a > v_b else 0)
     except InvalidVersion:
-        sv_inst = _parse_semver(installed)
-        sv_thresh = _parse_semver(threshold)
-        if sv_inst is not None and sv_thresh is not None:
-            return sv_inst < sv_thresh
-        nums_a = tuple(int(x) for x in re.findall(r"\d+", installed)[:4]) or (0,)
-        nums_b = tuple(int(x) for x in re.findall(r"\d+", threshold)[:4]) or (0,)
-        return nums_a < nums_b
+        sv_a = _parse_semver(a)
+        sv_b = _parse_semver(b)
+        if sv_a is not None and sv_b is not None:
+            return -1 if sv_a < sv_b else (1 if sv_a > sv_b else 0)
+        nums_a = tuple(int(x) for x in re.findall(r"\d+", a)[:4]) or (0,)
+        nums_b = tuple(int(x) for x in re.findall(r"\d+", b)[:4]) or (0,)
+        return -1 if nums_a < nums_b else (1 if nums_a > nums_b else 0)
+
+
+def is_version_below(installed: str, threshold: str, ecosystem: str = "python") -> bool:
+    """Accurately compare `installed < threshold` using PEP 440 (Python) or SemVer 2.0 (Node/Go)."""
+    return compare_versions(installed, threshold, ecosystem=ecosystem) < 0
+
+
+def is_version_in_ranges(
+    installed: str,
+    ranges: list[dict[str, str]],
+    ecosystem: str = "python",
+) -> tuple[bool, str | None]:
+    """Check whether `installed` falls inside any OSV version range `{introduced, fixed?, last_affected?}`.
+
+    Returns `(is_affected, matching_fixed_version)` for the specific affected branch so
+    multi-branch fixes (e.g. Django 3.2.20 vs 4.2.3) never falsely flag already-patched branches.
+    """
+    for rng in ranges:
+        intro = str(rng.get("introduced") or "0").strip()
+        fixed = str(rng.get("fixed") or "").strip()
+        last_aff = str(rng.get("last_affected") or "").strip()
+
+        if intro and intro != "0":
+            if compare_versions(installed, intro, ecosystem=ecosystem) < 0:
+                continue
+        if fixed:
+            if compare_versions(installed, fixed, ecosystem=ecosystem) >= 0:
+                continue
+        if last_aff:
+            if compare_versions(installed, last_aff, ecosystem=ecosystem) > 0:
+                continue
+        return True, (fixed or None)
+    return False, None
 
 
 def _iter_manifest_files(workspace_dir: Path, names: tuple[str, ...]) -> list[Path]:
@@ -412,4 +448,72 @@ def parse_node_dependencies(workspace_dir: Path) -> list[InstalledPackage]:
                     )
                 )
 
+    return deps
+
+
+_GO_REQ_LINE_RE = re.compile(r"^\s*([A-Za-z0-9_./-]+)\s+(v[0-9][^\s/]*)(?:\s*//.*)?$")
+_GO_REPLACE_RE = re.compile(
+    r"^\s*([A-Za-z0-9_./-]+)(?:\s+v[^\s]+)?\s*=>\s*([A-Za-z0-9_./-]+)\s+(v[0-9][^\s/]*)(?:\s*//.*)?$"
+)
+
+
+def parse_go_mod(workspace_dir: Path) -> list[InstalledPackage]:
+    """Parse `go.mod` module requirements (single-line, block `require (...)`, and `replace`)."""
+    deps: list[InstalledPackage] = []
+    for mod_file in _iter_manifest_files(workspace_dir, ("go.mod",)):
+        rel = str(mod_file.relative_to(workspace_dir))
+        try:
+            lines = mod_file.read_text(encoding="utf-8", errors="ignore").splitlines()
+        except OSError:
+            continue
+        in_require = False
+        in_replace = False
+        reqs: dict[str, tuple[str, int]] = {}
+        replaces: dict[str, tuple[str, str]] = {}
+
+        for idx, raw_line in enumerate(lines, start=1):
+            stripped = raw_line.strip()
+            if not stripped or stripped.startswith("//"):
+                continue
+            if stripped.startswith("require ("):
+                in_require = True
+                continue
+            if stripped.startswith("replace ("):
+                in_replace = True
+                continue
+            if stripped == ")":
+                in_require = False
+                in_replace = False
+                continue
+
+            if stripped.startswith("require ") and not in_require:
+                m = _GO_REQ_LINE_RE.match(stripped[len("require ") :])
+                if m:
+                    reqs[m.group(1)] = (m.group(2), idx)
+            elif in_require:
+                m = _GO_REQ_LINE_RE.match(stripped)
+                if m:
+                    reqs[m.group(1)] = (m.group(2), idx)
+            elif stripped.startswith("replace ") and not in_replace:
+                rm = _GO_REPLACE_RE.match(stripped[len("replace ") :])
+                if rm:
+                    replaces[rm.group(1)] = (rm.group(2), rm.group(3))
+            elif in_replace:
+                rm = _GO_REPLACE_RE.match(stripped)
+                if rm:
+                    replaces[rm.group(1)] = (rm.group(2), rm.group(3))
+
+        for mod_path, (ver, line_no) in reqs.items():
+            eff_mod, eff_ver = replaces.get(mod_path, (mod_path, ver))
+            deps.append(
+                InstalledPackage(
+                    ecosystem="go",
+                    name=eff_mod,
+                    version=eff_ver.lstrip("v"),
+                    manifest=rel,
+                    line_no=line_no,
+                    is_lockfile=True,
+                    raw_spec=eff_ver,
+                )
+            )
     return deps

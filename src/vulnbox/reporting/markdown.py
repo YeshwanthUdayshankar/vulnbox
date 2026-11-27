@@ -33,6 +33,7 @@ def render_markdown_report(report: AuditReport) -> str:
         f"| **Timestamp (UTC)** | `{report.timestamp}` |",
         f"| **Files Scrubbed / Secrets Redacted** | {len(report.scrub_summary.files_scrubbed)} files / {report.scrub_summary.secrets_redacted} redactions |",
         f"| **Total Findings** | {total} |",
+        f"| **Suppressed Findings (Inline)** | {len(report.suppressed_findings)} |",
         f"| **Dual-Verified Patches** | {verified_count} / {len(report.patches)} |",
         f"| **Actively Confirmed & Fixed (Live `curl` Probe)** | {active_confirmed} |",
         f"| **Memory & FD Leaks Confirmed & Fixed** | {mem_confirmed} |",
@@ -85,6 +86,23 @@ def render_markdown_report(report: AuditReport) -> str:
             lines.append(
                 f"| `{f.finding_id}` | `{f.rule_id}` | `{f.cwe_id}` | **{f.severity.upper()}** "
                 f"| `{f.file_path}:{f.start_line}` | `{f.reachability}` | {active_str} | **{patch_str}** |"
+            )
+
+    if report.suppressed_findings:
+        lines.extend(
+            [
+                "",
+                "## Suppressed Findings (Inline)",
+                "",
+                "| Finding ID | Rule | Severity | Location | Suppression Reason |",
+                "| :--- | :--- | :--- | :--- | :--- |",
+            ]
+        )
+        for sf in report.suppressed_findings:
+            reason = str(sf.metadata.get("suppression_reason") or "inline vulnbox: ignore")
+            lines.append(
+                f"| `{sf.finding_id}` | `{sf.rule_id}` | `{sf.severity}` "
+                f"| `{sf.file_path}:{sf.start_line}` | {reason} |"
             )
 
     lines.extend(["", "## Detailed Findings & Sandbox Verification Evidence", ""])

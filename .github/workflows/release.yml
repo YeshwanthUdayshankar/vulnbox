@@ -6,8 +6,58 @@ on:
       - "v*"
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+
+      - name: Set up Python 3.12
+        run: uv python install 3.12
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+
+      - name: Install dependencies
+        run: uv sync --extra dev
+
+      - name: Verify release tag matches package version
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+        run: |
+          uv run python -c '
+          import os, tomllib
+          from pathlib import Path
+          import vulnbox
+
+          tag_ver = os.environ["GITHUB_REF_NAME"].lstrip("v")
+          pyproject_ver = tomllib.loads(Path("pyproject.toml").read_text())["project"]["version"]
+          pkg_ver = vulnbox.__version__
+          assert pyproject_ver == pkg_ver, f"pyproject.toml ({pyproject_ver}) != vulnbox.__version__ ({pkg_ver})"
+          assert tag_ver == pyproject_ver, f"Git tag ({tag_ver}) != package version ({pyproject_ver})"
+          print(f"Release version verified: {tag_ver}")
+          '
+
+      - name: Lint, type-check, test, and self-scan
+        run: |
+          node --check src/vulnbox/ui/static/app.js
+          uv run ruff check src tests scripts plugins/vulnbox-go/src
+          uv run mypy src/vulnbox
+          uv run pytest -v -m "not docker"
+          uv run vulnbox scan . --backend local --fail-on low --out /tmp/vulnbox-release-self
+
   build-and-publish:
+    needs: verify
     runs-on: ubuntu-latest
     environment:
       name: pypi
@@ -17,10 +67,10 @@ jobs:
       contents: read
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
 
       - name: Set up Python 3.12
         run: uv python install 3.12
@@ -29,4 +79,4 @@ jobs:
         run: uv build
 
       - name: Publish to PyPI via Trusted Publisher (OIDC)
-        uses: pypa/gh-action-pypi-publish@release/v1
+        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # release/v1

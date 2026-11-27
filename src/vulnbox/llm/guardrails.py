@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import re
+import shlex
 from pathlib import Path
 
 from pydantic import BaseModel
@@ -410,6 +411,100 @@ def validate_llm_regression_test(
         decision="allow",
         finding_id=finding_id,
         reason=f"LLM regression test '{test_path}' passed syntax and safety checks.",
+    )
+
+
+ALLOWED_START_CMD_BINARIES = frozenset(
+    {
+        "python",
+        "python3",
+        "uvicorn",
+        "gunicorn",
+        "flask",
+        "hypercorn",
+        "daphne",
+        "fastapi",
+        "node",
+        "npm",
+        "npx",
+        "yarn",
+        "pnpm",
+        "bun",
+        "deno",
+        "go",
+    }
+)
+_SHELL_METACHAR_RE = re.compile(r"[;&|`$><\r\n]")
+_DISALLOWED_INLINE_CODE_FLAGS = frozenset({"-c", "-e", "--eval", "-p", "--print"})
+
+
+def validate_start_command(
+    start_cmd: str,
+    finding_id: str | None = None,
+) -> GuardrailEvent:
+    """Validate an agent-supplied server start_cmd against shell injection & arbitrary execution."""
+    raw = start_cmd.strip()
+    if not raw:
+        return GuardrailEvent(
+            gate="start_cmd_safety_gate",
+            decision="block",
+            finding_id=finding_id,
+            reason="Empty start_cmd is not allowed.",
+        )
+    if _SHELL_METACHAR_RE.search(raw):
+        return GuardrailEvent(
+            gate="start_cmd_safety_gate",
+            decision="block",
+            finding_id=finding_id,
+            reason="Blocked shell metacharacters or command chaining in start_cmd.",
+            details={"start_cmd": raw[:120]},
+        )
+    try:
+        tokens = shlex.split(raw)
+    except ValueError as exc:
+        return GuardrailEvent(
+            gate="start_cmd_safety_gate",
+            decision="block",
+            finding_id=finding_id,
+            reason=f"Malformed start_cmd quoting: {exc}.",
+        )
+    if not tokens:
+        return GuardrailEvent(
+            gate="start_cmd_safety_gate",
+            decision="block",
+            finding_id=finding_id,
+            reason="Empty start_cmd after parsing.",
+        )
+
+    bin_name = Path(tokens[0]).name.lower()
+    is_python_bin = bin_name in ("python", "python3") or bool(re.fullmatch(r"python3\.\d+", bin_name))
+    if not is_python_bin and bin_name not in ALLOWED_START_CMD_BINARIES:
+        return GuardrailEvent(
+            gate="start_cmd_safety_gate",
+            decision="block",
+            finding_id=finding_id,
+            reason=(
+                f"Blocked unsupported start_cmd executable '{tokens[0]}'. "
+                "Only standard Python/Node/Go app runners are permitted."
+            ),
+            details={"executable": tokens[0]},
+        )
+
+    for tok in tokens[1:]:
+        if tok in _DISALLOWED_INLINE_CODE_FLAGS or tok.startswith(("--eval=", "-c")):
+            return GuardrailEvent(
+                gate="start_cmd_safety_gate",
+                decision="block",
+                finding_id=finding_id,
+                reason=f"Blocked inline code execution flag '{tok}' in start_cmd.",
+                details={"flag": tok},
+            )
+
+    return GuardrailEvent(
+        gate="start_cmd_safety_gate",
+        decision="allow",
+        finding_id=finding_id,
+        reason=f"start_cmd '{tokens[0]}' passed shell-injection and binary allowlist checks.",
     )
 
 

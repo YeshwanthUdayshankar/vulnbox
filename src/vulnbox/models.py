@@ -387,6 +387,7 @@ class AuditReport(BaseModel):
     profile: RepoProfile
     scrub_summary: ScrubSummary
     findings: list[Finding] = Field(default_factory=list)
+    suppressed_findings: list[Finding] = Field(default_factory=list)
     patches: list[PatchCandidate] = Field(default_factory=list)
     verifications: list[VerificationResult] = Field(default_factory=list)
     call_graph_summary: CallGraphSummary | None = None

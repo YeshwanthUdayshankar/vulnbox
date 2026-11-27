@@ -90,10 +90,37 @@ class _PythonSecurityVisitor(ast.NodeVisitor):
         self.rel_path = rel_path
         self.lines = lines
         self.source = source
-        self.has_defusedxml = "defusedxml" in source
         self.findings: list[Finding] = []
         self._func_stack: list[ast.FunctionDef | ast.AsyncFunctionDef] = []
         self._taint_stack: list[PythonTaintTracker] = []
+        # Exact AST import table: local alias -> fully-qualified module or symbol path
+        self._import_map: dict[str, str] = {}
+        # Track safe lxml XMLParser variable names created with resolve_entities=False
+        self._safe_xml_parsers: set[str] = set()
+
+    def visit_Import(self, node: ast.Import) -> None:
+        for alias in node.names:
+            local = alias.asname or alias.name.split(".")[0]
+            self._import_map[local] = alias.name
+        self.generic_visit(node)
+
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+        mod = node.module or ""
+        for alias in node.names:
+            local = alias.asname or alias.name
+            self._import_map[local] = f"{mod}.{alias.name}" if mod else alias.name
+        self.generic_visit(node)
+
+    def _resolve_imported_name(self, raw_name: str) -> str:
+        """Resolve an AST dotted call name against actual `import` / `from ... import` bindings."""
+        if not raw_name:
+            return ""
+        parts = raw_name.split(".")
+        head = parts[0]
+        if head in self._import_map:
+            base = self._import_map[head]
+            return ".".join([base, *parts[1:]]) if len(parts) > 1 else base
+        return raw_name
 
     @property
     def _current_taint(self) -> PythonTaintTracker | None:
@@ -136,6 +163,19 @@ class _PythonSecurityVisitor(ast.NodeVisitor):
         )
 
     def visit_Assign(self, node: ast.Assign) -> None:
+        # Track `parser = lxml.etree.XMLParser(resolve_entities=False)` so calls using it aren't flagged
+        if isinstance(node.value, ast.Call):
+            resolved_ctor = self._resolve_imported_name(_dotted_name(node.value.func))
+            if resolved_ctor.endswith("XMLParser") and any(
+                kw.arg == "resolve_entities"
+                and isinstance(kw.value, ast.Constant)
+                and kw.value.value is False
+                for kw in node.value.keywords
+            ):
+                for tgt in node.targets:
+                    if isinstance(tgt, ast.Name):
+                        self._safe_xml_parsers.add(tgt.id)
+
         # PY-SECRET-001: Hardcoded Flask/Django SECRET_KEY or app.secret_key literal
         if isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
             val = node.value.value.strip()
@@ -188,72 +228,70 @@ class _PythonSecurityVisitor(ast.NodeVisitor):
         func: ast.FunctionDef | ast.AsyncFunctionDef,
         taint: PythonTaintTracker,
     ) -> None:
-        """Detect os.path.join used for file reads without per-variable path confinement."""
+        """Detect os.path.join used for file reads without flow-sensitive path confinement."""
         if Path(self.rel_path).name == "setup.py":
             return
 
         join_nodes: list[tuple[ast.Call, str | None]] = []
-        has_file_read = False
+        file_read_calls: list[ast.Call] = []
         for child in ast.walk(func):
             if isinstance(child, ast.Call):
                 name = _dotted_name(child.func)
                 if name == "os.path.join" and len(child.args) >= 2 and any(
                     _is_dynamic_expr(a) for a in child.args[1:]
                 ):
-                    # Verify whether any dynamic segment is NOT path-sanitized
                     taint_src: str | None = None
                     any_unsanitized = False
                     for arg in child.args[1:]:
                         if not _is_dynamic_expr(arg):
                             continue
-                        src_hit = taint.is_tainted(arg, "path")
+                        src_hit = taint.is_tainted(arg, "path", at_node=child)
                         if src_hit:
                             taint_src = src_hit
                             any_unsanitized = True
                         elif not any(
-                            isinstance(sub, ast.Name) and sub.id in taint.sanitized["path"]
+                            isinstance(sub, ast.Name) and taint.is_var_sanitized(sub.id, "path", at_node=child)
                             for sub in ast.walk(arg)
                         ):
                             any_unsanitized = True
-                    # Also check if the assigned target variable of os.path.join is confined later
                     if any_unsanitized:
                         join_nodes.append((child, taint_src))
                 if name in ("open", "Path.read_text", "Path.read_bytes") or (
                     isinstance(child.func, ast.Attribute)
                     and child.func.attr in ("read_text", "read_bytes", "open")
                 ):
-                    has_file_read = True
+                    file_read_calls.append(child)
 
-        # Check if the resulting path variable from os.path.join was explicitly confined by is_relative_to / realpath+startswith
+        if not file_read_calls:
+            return
+
+        # Verify whether the resulting path variable from os.path.join is confined at the actual file-read sink
         unconfined: list[tuple[ast.Call, str | None]] = []
         for jnode, jsrc in join_nodes:
-            # Find if jnode is assigned to a var that is later in taint.sanitized["path"]
-            assigned_sanitized = False
+            assigned_vars: set[str] = set()
             for sub in ast.walk(func):
-                if isinstance(sub, ast.Assign) and sub.value is jnode:
+                if isinstance(sub, ast.Assign) and any(ch is jnode for ch in ast.walk(sub.value)):
                     for tgt in sub.targets:
-                        if isinstance(tgt, ast.Name) and tgt.id in taint.sanitized["path"]:
-                            assigned_sanitized = True
-                elif isinstance(sub, ast.Assign) and isinstance(sub.value, ast.Call):
-                    # e.g. target = (BASE / filename).resolve() or Path(os.path.join(...)).resolve()
-                    if any(ch is jnode for ch in ast.walk(sub.value)):
-                        for tgt in sub.targets:
-                            if isinstance(tgt, ast.Name) and tgt.id in taint.sanitized["path"]:
-                                assigned_sanitized = True
-            if not assigned_sanitized and not (
-                # Also accept `Path(os.path.join(...)).resolve().is_relative_to(...)` inline
-                any(
-                    isinstance(sub, ast.Call)
-                    and _dotted_name(sub.func).endswith(".is_relative_to")
-                    for sub in ast.walk(func)
-                )
-                and any(
-                    v in taint.sanitized["path"] for v in taint.sanitized["path"]
-                )
-            ):
+                        if isinstance(tgt, ast.Name):
+                            assigned_vars.add(tgt.id)
+
+            confined_at_reads = False
+            if assigned_vars:
+                matching_reads = [
+                    rc
+                    for rc in file_read_calls
+                    if any(isinstance(sub, ast.Name) and sub.id in assigned_vars for sub in ast.walk(rc))
+                ]
+                if matching_reads and all(
+                    any(taint.is_var_sanitized(v, "path", at_node=rc) for v in assigned_vars)
+                    for rc in matching_reads
+                ):
+                    confined_at_reads = True
+
+            if not confined_at_reads:
                 unconfined.append((jnode, jsrc))
 
-        if unconfined and has_file_read:
+        if unconfined:
             node, taint_src = unconfined[0]
             direct_user_arg = any(
                 isinstance(a, ast.Name)
@@ -475,7 +513,7 @@ class _PythonSecurityVisitor(ast.NodeVisitor):
                 idx = 1 if name.endswith(".request") and len(node.args) >= 2 else 0
                 url_arg = node.args[idx]
             if url_arg is not None and not isinstance(url_arg, ast.Constant):
-                ssrf_src = taint.is_tainted(url_arg, "ssrf", require_http=True)
+                ssrf_src = taint.is_tainted(url_arg, "ssrf", require_http=True, at_node=node)
                 if ssrf_src:
                     self._add(
                         rule_id="PY-SSRF-001",
@@ -511,44 +549,96 @@ class _PythonSecurityVisitor(ast.NodeVisitor):
                 metadata={"call": name},
             )
 
-        # PY-XXE-001: Unsafe XML parser / resolve_entities=True
-        if not self.has_defusedxml:
-            if name in (
+        # PY-XXE-001: XXE via lxml.etree (HIGH) and XML entity-expansion DoS via stdlib xml.* (LOW)
+        resolved_call = self._resolve_imported_name(name)
+        is_defused = resolved_call.startswith("defusedxml.")
+        if not is_defused:
+            # 1. High-severity XXE: lxml.etree.XMLParser with resolve_entities=True or default without resolve_entities=False
+            if resolved_call.endswith("XMLParser"):
+                has_explicit_true = any(
+                    kw.arg == "resolve_entities"
+                    and isinstance(kw.value, ast.Constant)
+                    and kw.value.value is True
+                    for kw in node.keywords
+                )
+                has_explicit_false = any(
+                    kw.arg == "resolve_entities"
+                    and isinstance(kw.value, ast.Constant)
+                    and kw.value.value is False
+                    for kw in node.keywords
+                )
+                is_lxml_parser = resolved_call.startswith("lxml.")
+                if has_explicit_true or (is_lxml_parser and not has_explicit_false):
+                    self._add(
+                        rule_id="PY-XXE-001",
+                        cwe_id="CWE-611",
+                        title="XXE Risk via lxml XMLParser Without resolve_entities=False",
+                        severity="high",
+                        node=node,
+                        message=(
+                            "lxml XMLParser enables or fails to disable external entity resolution "
+                            "(resolve_entities=False), exposing the application to XXE file disclosure/SSRF."
+                        ),
+                        recommended_fix="Instantiate lxml.etree.XMLParser(resolve_entities=False, no_network=True, load_dtd=False) or use defusedxml.",
+                        metadata={"call": resolved_call},
+                    )
+            # 2. High-severity XXE: lxml.etree.parse / fromstring / XML / iterparse without safe parser=
+            elif resolved_call in (
+                "lxml.etree.parse",
+                "lxml.etree.fromstring",
+                "lxml.etree.XML",
+                "lxml.etree.iterparse",
+            ) and node.args and _is_dynamic_expr(node.args[0]):
+                safe_parser_arg = False
+                for kw in node.keywords:
+                    if kw.arg == "parser":
+                        if isinstance(kw.value, ast.Name) and kw.value.id in self._safe_xml_parsers:
+                            safe_parser_arg = True
+                        elif isinstance(kw.value, ast.Call) and any(
+                            pkw.arg == "resolve_entities"
+                            and isinstance(pkw.value, ast.Constant)
+                            and pkw.value.value is False
+                            for pkw in kw.value.keywords
+                        ):
+                            safe_parser_arg = True
+                if not safe_parser_arg:
+                    self._add(
+                        rule_id="PY-XXE-001",
+                        cwe_id="CWE-611",
+                        title="XML External Entity (XXE) via lxml.etree Default Parser",
+                        severity="high",
+                        node=node,
+                        message=(
+                            f"{resolved_call}() parses XML without a hardened parser "
+                            "(resolve_entities=False, no_network=True)."
+                        ),
+                        recommended_fix="Pass parser=lxml.etree.XMLParser(resolve_entities=False, no_network=True, load_dtd=False) or use defusedxml.",
+                        metadata={"call": resolved_call},
+                    )
+            # 3. Low-severity entity-expansion DoS: stdlib xml.* (expat disables external entities since Python 3.7.1)
+            elif resolved_call in (
                 "xml.etree.ElementTree.fromstring",
                 "xml.etree.ElementTree.parse",
-                "ET.fromstring",
-                "ET.parse",
                 "xml.sax.parse",
                 "xml.sax.parseString",
                 "xml.dom.minidom.parse",
                 "xml.dom.minidom.parseString",
-                "minidom.parseString",
+                "xml.dom.pulldom.parse",
+                "xml.dom.pulldom.parseString",
             ) and node.args and _is_dynamic_expr(node.args[0]):
                 self._add(
                     rule_id="PY-XXE-001",
-                    cwe_id="CWE-611",
-                    title="XML External Entity (XXE) / Unsafe XML Parser",
-                    severity="high",
+                    cwe_id="CWE-776",
+                    title="Unrestricted Stdlib XML Parser (Entity Expansion DoS Risk)",
+                    severity="low",
                     node=node,
-                    message=f"{name}() uses stdlib XML parsing vulnerable to entity expansion/XXE attacks.",
-                    recommended_fix="Use defusedxml (e.g. defusedxml.ElementTree.fromstring) instead of stdlib xml modules.",
-                    metadata={"call": name},
-                )
-            elif name.endswith("XMLParser") and any(
-                kw.arg == "resolve_entities"
-                and isinstance(kw.value, ast.Constant)
-                and kw.value.value is True
-                for kw in node.keywords
-            ):
-                self._add(
-                    rule_id="PY-XXE-001",
-                    cwe_id="CWE-611",
-                    title="XXE Enabled via XMLParser(resolve_entities=True)",
-                    severity="high",
-                    node=node,
-                    message="XMLParser explicitly enables resolve_entities=True, exposing the app to XXE file disclosure.",
-                    recommended_fix="Set resolve_entities=False and no_network=True on XMLParser().",
-                    metadata={"call": name},
+                    message=(
+                        f"{resolved_call}() uses Python's stdlib XML parser. While expat blocks external "
+                        "entities (XXE) since Python 3.7.1, defusedxml provides defense-in-depth against "
+                        "DTD/entity-expansion DoS."
+                    ),
+                    recommended_fix="Use defusedxml (e.g. defusedxml.ElementTree.fromstring) when parsing untrusted XML.",
+                    metadata={"call": resolved_call},
                 )
 
         # PY-JWT-001: JWT verification disabled or alg=none
@@ -653,7 +743,7 @@ class _PythonSecurityVisitor(ast.NodeVisitor):
                 for k_n, v_n in zip(q_arg.keys, q_arg.values, strict=False):
                     if isinstance(k_n, ast.Constant) and k_n.value == "$where" and _is_dynamic_expr(v_n):
                         has_where = True
-            nosql_src = taint.is_tainted(q_arg, "nosql", require_http=True) if taint is not None else None
+            nosql_src = taint.is_tainted(q_arg, "nosql", require_http=True, at_node=node) if taint is not None else None
             if has_where or (nosql_src and isinstance(q_arg, (ast.Name, ast.Attribute, ast.Call))):
                 self._add(
                     rule_id="PY-NOSQL-001",
@@ -673,7 +763,7 @@ class _PythonSecurityVisitor(ast.NodeVisitor):
             and node.args
             and not isinstance(node.args[0], ast.Constant)
         ):
-            redir_src = taint.is_tainted(node.args[0], "redirect", require_http=True)
+            redir_src = taint.is_tainted(node.args[0], "redirect", require_http=True, at_node=node)
             if redir_src:
                 self._add(
                     rule_id="PY-REDIR-001",
